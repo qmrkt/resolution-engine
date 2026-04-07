@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.*
+
+# Go
+resolution-engine/resolution-engine
+resolution-engine/data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Blueprint state
+.blueprint-state/
+
+# Node
+node_modules/
