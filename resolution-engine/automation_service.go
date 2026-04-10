@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -210,8 +211,21 @@ func (s *MarketAutomationService) processPending(ctx context.Context, market Mar
 		return err
 	}
 
+	slog.Info("pending run produced resolution candidate",
+		"component", "automation",
+		slog.Int("app_id", market.AppID),
+		slog.Int("outcome", outcome),
+		slog.String("evidence_hash", hex.EncodeToString(evidenceHash)),
+	)
+
 	txID, err := s.submitter.ProposeResolution(ctx, state, outcome, evidenceHash)
 	if err != nil {
+		slog.Error("propose resolution submission failed",
+			"component", "automation",
+			slog.Int("app_id", market.AppID),
+			slog.Int("outcome", outcome),
+			"error", err,
+		)
 		return err
 	}
 
@@ -460,7 +474,7 @@ func extractResolutionOutcome(run *dag.RunState) (int, []byte, error) {
 }
 
 func buildMarketInputs(market MarketInfo, nowTS int64) map[string]string {
-	outcomes := parseMarketOutcomes(market.Outcomes)
+	outcomes := parseMarketOutcomes(string(market.Outcomes))
 	indexed := make([]string, 0, len(outcomes))
 	for index, outcome := range outcomes {
 		indexed = append(indexed, fmt.Sprintf("%d: %s", index, outcome))

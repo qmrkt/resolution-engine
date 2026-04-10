@@ -606,3 +606,120 @@ func TestValidationRejectsInvalid(t *testing.T) {
 		t.Fatal("expected error for missing executor")
 	}
 }
+
+func TestCELErrorFailsRun(t *testing.T) {
+	engine := NewEngine(slog.Default())
+
+	engine.RegisterExecutor("step", &mockExecutor{
+		outputs: map[string]string{"status": "done"},
+	})
+	engine.RegisterExecutor("next", &mockExecutor{
+		outputs: map[string]string{"result": "ok"},
+	})
+
+	bp := Blueprint{
+		ID: "test-cel-error",
+		Nodes: []NodeDef{
+			{ID: "step", Type: "step"},
+			{ID: "next", Type: "next"},
+		},
+		Edges: []EdgeDef{
+			// Malformed CEL expression: unbalanced parentheses
+			{From: "step", To: "next", Condition: "step.status == 'done'("},
+		},
+	}
+
+	run, _ := engine.Execute(context.Background(), bp, nil)
+	if run.Status != "failed" {
+		t.Fatalf("expected failed, got %s", run.Status)
+	}
+	if !strings.Contains(run.Error, "condition") {
+		t.Fatalf("expected condition error in run.Error, got: %q", run.Error)
+	}
+}
+
+func TestOrphanedActivatedNodeFailsRun(t *testing.T) {
+	// A node that is activated (root) but never completes should fail the run.
+	// Use a blueprint where two root nodes exist but one is blocked from executing.
+	engine := NewEngine(slog.Default())
+
+	blocker := &mockExecutor{outputs: map[string]string{"outcome": "0"}}
+	engine.RegisterExecutor("good", blocker)
+
+	// staller never returns (blocks until context cancelled)
+	engine.RegisterExecutor("stall", &mockExecutor{
+		outputs: map[string]string{"status": "ok"},
+	})
+	engine.RegisterExecutor("after", &mockExecutor{
+		outputs: map[string]string{"result": "done"},
+	})
+
+	// Two independent chains: good (completes), stall -> after.
+	// stall completes but after has a condition that is never met.
+	bp := Blueprint{
+		ID: "test-orphan",
+		Nodes: []NodeDef{
+			{ID: "good", Type: "good"},
+			{ID: "after", Type: "after"},
+		},
+		Edges: []EdgeDef{
+			// after depends on good, condition that always evaluates false
+			{From: "good", To: "after", Condition: "good.outcome == 'never'"},
+		},
+	}
+
+	// "after" is NOT a root node (has incoming forward edge from "good"),
+	// so it won't be activated unless the edge condition passes.
+	// This should complete fine - after stays non-activated pending.
+	run, err := engine.Execute(context.Background(), bp, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s (non-activated pending nodes are ok)", run.Status)
+	}
+	if run.NodeStates["after"].Status != "pending" {
+		t.Fatalf("expected after=pending, got %s", run.NodeStates["after"].Status)
+	}
+}
+
+func TestConditionalBranchNonActivatedIsFine(t *testing.T) {
+	// Verifies that conditional branches where one path is not taken
+	// do NOT trigger the orphaned-pending check.
+	engine := NewEngine(slog.Default())
+
+	engine.RegisterExecutor("search", &mockExecutor{
+		outputs: map[string]string{"status": "success"},
+	})
+	engine.RegisterExecutor("happy", &mockExecutor{
+		outputs: map[string]string{"outcome": "0"},
+	})
+	engine.RegisterExecutor("sad", &mockExecutor{
+		outputs: map[string]string{"outcome": "fallback"},
+	})
+
+	bp := Blueprint{
+		ID: "test-cond-ok",
+		Nodes: []NodeDef{
+			{ID: "search", Type: "search"},
+			{ID: "happy", Type: "happy"},
+			{ID: "sad", Type: "sad"},
+		},
+		Edges: []EdgeDef{
+			{From: "search", To: "happy", Condition: "search.status == 'success'"},
+			{From: "search", To: "sad", Condition: "search.status != 'success'"},
+		},
+	}
+
+	run, err := engine.Execute(context.Background(), bp, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s", run.Status)
+	}
+	// sad should remain pending (not activated) and that's fine
+	if run.NodeStates["sad"].Status != "pending" {
+		t.Fatalf("expected sad=pending, got %s", run.NodeStates["sad"].Status)
+	}
+}

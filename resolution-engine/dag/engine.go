@@ -312,7 +312,20 @@ func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunStat
 			delete(startedAt, nr.nodeID)
 
 			// Evaluate outgoing edges and activate targets
-			edges := scheduler.EvaluateEdges(nr.nodeID, execCtx)
+			edges, evalErr := scheduler.EvaluateEdges(nr.nodeID, execCtx)
+			if evalErr != nil {
+				e.logger.Error("edge condition error", "node", nr.nodeID, "error", evalErr)
+				state := run.NodeStates[nr.nodeID]
+				state.Status = "failed"
+				state.Error = evalErr.Error()
+				run.NodeStates[nr.nodeID] = state
+				delete(completed, nr.nodeID)
+				if node.OnError == "continue" {
+					completed[nr.nodeID] = struct{}{}
+				} else {
+					failed[nr.nodeID] = struct{}{}
+				}
+			}
 			for _, edge := range edges {
 				scheduler.TrackTraversal(edge.From, edge.To)
 				run.EdgeTraversals = scheduler.TraversalSnapshot()
@@ -337,6 +350,23 @@ func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunStat
 	run.Context = execCtx.Snapshot()
 	if syncSkippedNodeStates(run, scheduler, time.Now().UTC().Format(time.RFC3339)) {
 		notifyObserver(observer, run)
+	}
+
+	// Detect orphaned pending nodes: activated but never completed/failed/skipped.
+	// Only check when no hard failures occurred (those already cause a failed run).
+	if len(failed) == 0 {
+		var orphaned []string
+		for _, node := range bp.Nodes {
+			ns := run.NodeStates[node.ID]
+			if ns.Status == "pending" {
+				if _, wasActivated := activated[node.ID]; wasActivated {
+					orphaned = append(orphaned, node.ID)
+				}
+			}
+		}
+		if len(orphaned) > 0 {
+			return fmt.Errorf("orphaned pending nodes: %v", orphaned)
+		}
 	}
 
 	return nil

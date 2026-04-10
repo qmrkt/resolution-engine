@@ -22,22 +22,52 @@ const (
 	StatusDisputed           = 6
 )
 
+// OutcomePayload accepts either a legacy JSON-string-encoded outcome list
+// or the current direct JSON array returned by the indexer.
+type OutcomePayload string
+
+func (o *OutcomePayload) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*o = ""
+		return nil
+	}
+
+	var direct []string
+	if err := json.Unmarshal(data, &direct); err == nil {
+		canonical, err := json.Marshal(direct)
+		if err != nil {
+			return err
+		}
+		*o = OutcomePayload(canonical)
+		return nil
+	}
+
+	var legacy string
+	if err := json.Unmarshal(data, &legacy); err == nil {
+		*o = OutcomePayload(strings.TrimSpace(legacy))
+		return nil
+	}
+
+	return fmt.Errorf("unsupported outcomes payload: %s", trimmed)
+}
+
 // MarketInfo is the market state from the indexer API.
 type MarketInfo struct {
-	AppID                  int    `json:"appId"`
-	Status                 int    `json:"status"`
-	Creator                string `json:"creator"`
-	Question               string `json:"question"`
-	Outcomes               string `json:"outcomes"`
-	Deadline               int    `json:"deadline"`
-	ResolutionPendingSince int64  `json:"resolutionPendingSince,omitempty"`
-	ProposedOutcome        int    `json:"proposedOutcome,omitempty"`
-	ProposalTimestamp      int    `json:"proposalTimestamp,omitempty"`
-	ChallengeWindowSecs    int    `json:"challengeWindowSecs,omitempty"`
-	Challenger             string `json:"challenger,omitempty"`
-	ChallengeReasonCode    int    `json:"challengeReasonCode,omitempty"`
-	MarketAdmin            string `json:"marketAdmin,omitempty"`
-	ResolutionAuthority    string `json:"resolutionAuthority,omitempty"`
+	AppID                  int            `json:"appId"`
+	Status                 int            `json:"status"`
+	Creator                string         `json:"creator"`
+	Question               string         `json:"question"`
+	Outcomes               OutcomePayload `json:"outcomes"`
+	Deadline               int            `json:"deadline"`
+	ResolutionPendingSince int64          `json:"resolutionPendingSince,omitempty"`
+	ProposedOutcome        int            `json:"proposedOutcome,omitempty"`
+	ProposalTimestamp      int            `json:"proposalTimestamp,omitempty"`
+	ChallengeWindowSecs    int            `json:"challengeWindowSecs,omitempty"`
+	Challenger             string         `json:"challenger,omitempty"`
+	ChallengeReasonCode    int            `json:"challengeReasonCode,omitempty"`
+	MarketAdmin            string         `json:"marketAdmin,omitempty"`
+	ResolutionAuthority    string         `json:"resolutionAuthority,omitempty"`
 }
 
 // WatcherStats holds observable state for the health endpoint.

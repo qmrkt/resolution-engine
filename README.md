@@ -1,27 +1,17 @@
-# question.market blueprint engine
+# question.market resolution engine
 
-Resolution blueprint engine for [question.market](https://question.market). Executes DAG-based resolution logic to determine prediction market outcomes.
+Resolution engine for [question.market](https://question.market). Executes DAG-based resolution logic to determine prediction market outcomes on Algorand.
 
 ## Architecture
 
-The engine has two layers:
-
-**Resolution engine** (`resolution-engine/`) -- a Go service that:
+A Go service (`resolution-engine/`) that:
 - Watches for markets entering resolution via an indexer
 - Executes resolution blueprints as DAGs with conditional branching
 - Supports multiple executor types: LLM judge, API fetch, human judge, market evidence, creator/admin input
 - Submits resolution proposals and dispute rulings on-chain
 - Emits structured execution traces for observability
 
-**Blueprints** (`blueprints/`) -- JSON blueprint definitions and supporting scripts for:
-- Sequential plan execution
-- Security hardening campaigns
-- Simplify/refactor workflows
-- Task-level execution with validation gates
-
 ## Quick start
-
-### Resolution engine
 
 ```bash
 cd resolution-engine
@@ -42,15 +32,6 @@ go run .
 
 # Tests
 go test ./...
-```
-
-### Blueprints
-
-Blueprints are JSON DAG definitions consumed by the engine. See `blueprints/README.md` for the full specification.
-
-```bash
-# Run blueprint tests
-cd blueprints && python -m pytest tests/ -v
 ```
 
 ## DAG engine

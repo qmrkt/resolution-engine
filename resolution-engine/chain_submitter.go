@@ -21,10 +21,9 @@ import (
 )
 
 const (
-	boxKeyMainBlueprint    = "main_blueprint"
-	boxKeyDisputeBlueprint = "dispute_blueprint"
+	boxKeyMainBlueprint    = "mb"
+	boxKeyDisputeBlueprint = "db"
 
-	methodSigNoop                   = "noop()void"
 	methodSigProposeEarlyResolution = "propose_early_resolution(uint64,byte[],axfer)void"
 	methodSigProposeResolution      = "propose_resolution(uint64,byte[],axfer)void"
 	methodSigAbortEarlyResolution   = "abort_early_resolution(byte[])void"
@@ -91,26 +90,32 @@ func (c *AlgodMarketClient) ReadMarketState(ctx context.Context, appID int) (*Ma
 	}
 
 	state := decodeGlobalState(app.Params.GlobalState)
-	numOutcomes := int(getUint64State(state, "num_outcomes"))
+	numOutcomes := int(getUint64StateAny(state, "no", "num_outcomes"))
 	if numOutcomes <= 0 {
 		numOutcomes = 2
 	}
 
 	return &MarketChainState{
 		AppID:               appID,
-		Status:              int(getUint64State(state, "status")),
-		Deadline:            getUint64State(state, "deadline"),
+		Status:              int(getUint64StateAny(state, "st", "status")),
+		Deadline:            getUint64StateAny(state, "dl", "deadline"),
 		NumOutcomes:         numOutcomes,
-		CurrencyASA:         getUint64State(state, "currency_asa"),
-		ProposalBond:        getUint64State(state, "proposal_bond"),
-		ChallengeWindowSecs: getUint64State(state, "challenge_window_secs"),
+		CurrencyASA:         getUint64StateAny(state, "ca", "currency_asa"),
+		ProposalBond: requiredBondFromState(
+			getUint64StateAny(state, "prb", "proposal_bond"),
+			getUint64StateAny(state, "pbb", "proposal_bond_bps"),
+			getUint64StateAny(state, "pbc", "proposal_bond_cap"),
+			getUint64StateAny(state, "pb", "pool_balance"),
+			getUint64StateAny(state, "bd", "bootstrap_deposit"),
+		),
+		ChallengeWindowSecs: getUint64StateAny(state, "cws", "challenge_window_secs"),
 		ProposalTimestamp:   getUint64StateAny(state, "pts", "proposal_timestamp"),
-		ProposedOutcome:     getUint64State(state, "proposed_outcome"),
-		Proposer:            getAddressState(state, "proposer"),
-		Challenger:          getAddressState(state, "challenger"),
-		Creator:             getAddressState(state, "creator"),
-		MarketAdmin:         getAddressState(state, "market_admin"),
-		ResolutionAuthority: getAddressState(state, "resolution_authority"),
+		ProposedOutcome:     getUint64StateAny(state, "po", "proposed_outcome"),
+		Proposer:            getAddressStateAny(state, "pr", "proposer"),
+		Challenger:          getAddressStateAny(state, "ch", "challenger"),
+		Creator:             getAddressStateAny(state, "cr", "creator"),
+		MarketAdmin:         getAddressStateAny(state, "ma", "market_admin"),
+		ResolutionAuthority: getAddressStateAny(state, "ra", "resolution_authority"),
 	}, nil
 }
 
@@ -204,6 +209,42 @@ func getAddressState(state map[string]interface{}, key string) string {
 	return address
 }
 
+func getAddressStateAny(state map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if address := getAddressState(state, key); address != "" {
+			return address
+		}
+	}
+	return ""
+}
+
+func ceilDivUint64(numerator, denominator uint64) uint64 {
+	if denominator == 0 {
+		return 0
+	}
+	return (numerator + denominator - 1) / denominator
+}
+
+func requiredBondFromState(minimum, bps, cap, poolBalance, bootstrapDeposit uint64) uint64 {
+	effectiveCap := cap
+	if effectiveCap == 0 {
+		effectiveCap = minimum
+	}
+	scaleBase := poolBalance
+	if bootstrapDeposit > scaleBase {
+		scaleBase = bootstrapDeposit
+	}
+	proportional := ceilDivUint64(scaleBase*bps, 10_000)
+	required := proportional
+	if required < minimum {
+		required = minimum
+	}
+	if required > effectiveCap {
+		required = effectiveCap
+	}
+	return required
+}
+
 type ResolutionSubmitter interface {
 	ProposeEarlyResolution(ctx context.Context, state *MarketChainState, outcome int, evidenceHash []byte) (string, error)
 	ProposeResolution(ctx context.Context, state *MarketChainState, outcome int, evidenceHash []byte) (string, error)
@@ -227,9 +268,8 @@ func NewAuthoritySubmitter(client *AlgodMarketClient, privateKeyB64 string, mnem
 		return nil, err
 	}
 
-	methods := make(map[string]algoabi.Method, 7)
+	methods := make(map[string]algoabi.Method, 6)
 	for _, sig := range []string{
-		methodSigNoop,
 		methodSigProposeEarlyResolution,
 		methodSigProposeResolution,
 		methodSigAbortEarlyResolution,
@@ -269,7 +309,7 @@ func (s *AuthoritySubmitter) ProposeEarlyResolution(ctx context.Context, state *
 	paymentTxn, err := algotxn.MakeAssetTransferTxn(
 		s.Address(),
 		algocrypto.GetApplicationAddress(uint64(state.AppID)).String(),
-		state.ProposalBond,
+		0,
 		nil,
 		sp,
 		"",
@@ -305,7 +345,7 @@ func (s *AuthoritySubmitter) ProposeResolution(ctx context.Context, state *Marke
 	paymentTxn, err := algotxn.MakeAssetTransferTxn(
 		s.Address(),
 		algocrypto.GetApplicationAddress(uint64(state.AppID)).String(),
-		state.ProposalBond,
+		0,
 		nil,
 		sp,
 		"",
@@ -451,7 +491,6 @@ func (s *AuthoritySubmitter) executeCall(
 		effectiveNoops = needed
 	}
 
-	noopMethod := s.methods["noop"]
 	for i := 0; i < effectiveNoops; i++ {
 		start := i * maxRefsPerTxn
 		end := start + maxRefsPerTxn
@@ -459,21 +498,29 @@ func (s *AuthoritySubmitter) executeCall(
 			end = len(allBoxes)
 		}
 
-		params := algotxn.AddMethodCallParams{
-			AppID:           uint64(state.AppID),
-			Method:          noopMethod,
-			MethodArgs:      []interface{}{},
-			Sender:          s.account.Address,
-			SuggestedParams: sp,
-			OnComplete:      algotypes.NoOpOC,
-			Signer:          s.signer,
-			Note:            []byte(fmt.Sprintf("n%s%d", methodName, i)),
-		}
+		var chunk []algotypes.AppBoxReference
 		if end > start {
-			params.BoxReferences = append([]algotypes.AppBoxReference(nil), allBoxes[start:end]...)
+			chunk = append([]algotypes.AppBoxReference(nil), allBoxes[start:end]...)
 		}
-		if err := atc.AddMethodCall(params); err != nil {
-			return "", fmt.Errorf("add noop for %s: %w", methodName, err)
+		noopTxn, err := algotxn.MakeApplicationNoOpTxWithBoxes(
+			uint64(state.AppID),
+			nil,
+			nil,
+			nil,
+			nil,
+			chunk,
+			sp,
+			s.account.Address,
+			[]byte(fmt.Sprintf("n%s%d", methodName, i)),
+			algotypes.Digest{},
+			[32]byte{},
+			algotypes.Address{},
+		)
+		if err != nil {
+			return "", fmt.Errorf("make bare noop for %s: %w", methodName, err)
+		}
+		if err := atc.AddTransaction(algotxn.TransactionWithSigner{Txn: noopTxn, Signer: s.signer}); err != nil {
+			return "", fmt.Errorf("add bare noop for %s: %w", methodName, err)
 		}
 	}
 
@@ -556,13 +603,17 @@ func qBoxReferences(appID uint64, numOutcomes int) []algotypes.AppBoxReference {
 	if numOutcomes <= 0 {
 		numOutcomes = 2
 	}
-	refs := make([]algotypes.AppBoxReference, 0, numOutcomes)
+	refs := make([]algotypes.AppBoxReference, 0, numOutcomes+1)
 	for i := 0; i < numOutcomes; i++ {
 		refs = append(refs, algotypes.AppBoxReference{
 			AppID: appID,
 			Name:  boxNameForUint64("q", uint64(i)),
 		})
 	}
+	refs = append(refs, algotypes.AppBoxReference{
+		AppID: appID,
+		Name:  []byte("tus"),
+	})
 	return refs
 }
 
@@ -598,7 +649,7 @@ func pendingPayoutBoxReferences(appID uint64, accounts ...string) []algotypes.Ap
 	seen := make(map[string]struct{}, len(accounts))
 	refs := make([]algotypes.AppBoxReference, 0, len(accounts))
 	for _, account := range accounts {
-		name := boxNameForAddress("pending_payouts:", account)
+		name := boxNameForAddress("pp:", account)
 		if len(name) == 0 {
 			continue
 		}

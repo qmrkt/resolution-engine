@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/question-market/resolution-engine/dag"
 )
@@ -32,13 +33,31 @@ func (e *SubmitResultExecutor) Execute(ctx context.Context, node dag.NodeDef, ex
 		outcome = execCtx.Get(cfg.OutcomeKey)
 	}
 
-	// Auto-detect: look for any *.outcome key
+	// Auto-detect: collect all *.outcome keys, reject if they disagree
 	if outcome == "" {
 		snap := execCtx.Snapshot()
+		type candidate struct {
+			key, value string
+		}
+		var candidates []candidate
 		for k, v := range snap {
 			if len(k) > 8 && k[len(k)-8:] == ".outcome" && v != "" && v != "inconclusive" {
-				outcome = v
-				break
+				candidates = append(candidates, candidate{k, v})
+			}
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].key < candidates[j].key
+		})
+		if len(candidates) > 0 {
+			outcome = candidates[0].value
+			for _, c := range candidates[1:] {
+				if c.value != outcome {
+					keys := make([]string, len(candidates))
+					for i, cc := range candidates {
+						keys[i] = fmt.Sprintf("%s=%s", cc.key, cc.value)
+					}
+					return dag.ExecutorResult{}, fmt.Errorf("ambiguous outcome: upstream nodes disagree: %v", keys)
+				}
 			}
 		}
 	}

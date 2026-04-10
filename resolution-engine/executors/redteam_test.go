@@ -51,6 +51,81 @@ func TestAPIFetchSSRFBlocked(t *testing.T) {
 	}
 }
 
+func TestAPIFetchRedirectToLocalhostBlocked(t *testing.T) {
+	// A server that redirects to localhost should be blocked by CheckRedirect
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"secret":"leaked"}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:"+strings.TrimPrefix(target.URL, "http://127.0.0.1:"), http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	exec := NewAPIFetchExecutor() // uses safe client, AllowLocal=false
+	// Override client to allow initial connection to test server but keep CheckRedirect
+	exec.Client.Transport = http.DefaultTransport
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]interface{}{
+			"url":       redirector.URL,
+			"json_path": "secret",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "failed" {
+		t.Fatalf("redirect to localhost should be blocked, got status=%s", result.Outputs["status"])
+	}
+	if !strings.Contains(result.Outputs["error"], "redirect blocked") && !strings.Contains(result.Outputs["error"], "blocked") {
+		t.Fatalf("expected redirect blocked error, got: %s", result.Outputs["error"])
+	}
+}
+
+func TestAPIFetchResponseBodyLimit(t *testing.T) {
+	// A server returning more than 10 MB should be rejected
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Write just over 10 MB
+		w.Write([]byte(`{"data":"`))
+		chunk := make([]byte, 1024*1024) // 1 MB of 'x'
+		for i := range chunk {
+			chunk[i] = 'x'
+		}
+		for i := 0; i < 11; i++ {
+			w.Write(chunk)
+		}
+		w.Write([]byte(`"}`))
+	}))
+	defer server.Close()
+
+	exec := &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true}
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]interface{}{
+			"url":       server.URL,
+			"json_path": "data",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "failed" {
+		t.Fatalf("expected failed for oversized response, got %s", result.Outputs["status"])
+	}
+	if !strings.Contains(result.Outputs["error"], "10 MB") {
+		t.Fatalf("expected body limit error, got: %s", result.Outputs["error"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Malformed executor configs
 // ---------------------------------------------------------------------------
@@ -194,22 +269,37 @@ func TestSubmitResultWithInconclusiveOutcome(t *testing.T) {
 	}
 }
 
-func TestSubmitResultWithMultipleOutcomes(t *testing.T) {
-	// If multiple nodes set *.outcome, submit should pick one (non-deterministic but not crash)
+func TestSubmitResultWithMultipleConflictingOutcomes(t *testing.T) {
+	// Conflicting outcomes from multiple upstream nodes must be rejected
 	exec := NewSubmitResultExecutor()
 	ctx := dag.NewContext(nil)
 	ctx.Set("judge1.outcome", "0")
 	ctx.Set("judge2.outcome", "1")
 
 	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
+	_, err := exec.Execute(context.Background(), node, ctx)
+	if err == nil {
+		t.Fatal("expected error for conflicting outcomes")
+	}
+	if !strings.Contains(err.Error(), "ambiguous outcome") {
+		t.Fatalf("expected ambiguous outcome error, got: %v", err)
+	}
+}
+
+func TestSubmitResultWithMultipleAgreeingOutcomes(t *testing.T) {
+	// Multiple upstream nodes agreeing on the same outcome should succeed
+	exec := NewSubmitResultExecutor()
+	ctx := dag.NewContext(nil)
+	ctx.Set("judge1.outcome", "0")
+	ctx.Set("judge2.outcome", "0")
+
+	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
 	result, err := exec.Execute(context.Background(), node, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Should pick one — either is acceptable, just shouldn't crash
-	outcome := result.Outputs["outcome"]
-	if outcome != "0" && outcome != "1" {
-		t.Fatalf("expected 0 or 1, got %q", outcome)
+	if result.Outputs["outcome"] != "0" {
+		t.Fatalf("expected outcome=0, got %q", result.Outputs["outcome"])
 	}
 }
 

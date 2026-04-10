@@ -2,7 +2,10 @@ package dag
 
 // Scheduler computes topology and evaluates DAG traversal rules.
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	colorWhite = 0
@@ -149,10 +152,10 @@ func (s *Scheduler) ReadyNodes(completed, failed, running map[string]struct{}) [
 }
 
 // EvaluateEdges returns outgoing edges whose conditions pass.
-func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) []EdgeDef {
+func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) ([]EdgeDef, error) {
 	outgoing := s.outgoing[nodeID]
 	if len(outgoing) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	type backCandidate struct {
@@ -164,7 +167,11 @@ func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) []EdgeDef {
 	forwardCandidates := make([]EdgeDef, 0)
 
 	for _, edge := range outgoing {
-		if !s.edgeConditionMet(edge, ctx) {
+		met, err := s.edgeConditionMet(edge, ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !met {
 			continue
 		}
 
@@ -193,14 +200,14 @@ func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) []EdgeDef {
 		}
 
 		if len(activeBack) > 0 {
-			return activeBack
+			return activeBack, nil
 		}
 		if allExhausted {
-			return forwardCandidates
+			return forwardCandidates, nil
 		}
 	}
 
-	return forwardCandidates
+	return forwardCandidates, nil
 }
 
 // TrackTraversal increments the traversal counter for an edge.
@@ -208,15 +215,15 @@ func (s *Scheduler) TrackTraversal(from, to string) {
 	s.edgeTraversals[edgeKey(from, to)]++
 }
 
-func (s *Scheduler) edgeConditionMet(edge EdgeDef, ctx *Context) bool {
+func (s *Scheduler) edgeConditionMet(edge EdgeDef, ctx *Context) (bool, error) {
 	if strings.TrimSpace(edge.Condition) == "" {
-		return true
+		return true, nil
 	}
 	ok, err := EvalCondition(edge.Condition, ctx)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("condition %q on edge %s->%s: %w", edge.Condition, edge.From, edge.To, err)
 	}
-	return ok
+	return ok, nil
 }
 
 func (s *Scheduler) edgeTraversalExhausted(edge EdgeDef) bool {

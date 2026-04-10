@@ -30,10 +30,58 @@ type APIFetchExecutor struct {
 	AllowLocal  bool // For testing only — allows localhost URLs
 }
 
+const maxResponseBytes int64 = 10 << 20 // 10 MB
+
 func NewAPIFetchExecutor() *APIFetchExecutor {
 	return &APIFetchExecutor{
-		Client: &http.Client{Timeout: 30 * time.Second},
+		Client: newSafeClient(),
 	}
+}
+
+func newSafeClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: safeDialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if err := validateURLSafety(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect blocked: %w", err)
+			}
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+}
+
+// safeDialContext rejects connections to private/loopback/link-local IPs at connect time,
+// preventing DNS rebinding attacks that bypass pre-request URL validation.
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
+	}
+
+	for _, ipAddr := range ips {
+		if isBlockedIP(ipAddr.IP) {
+			continue
+		}
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ipAddr.IP.String(), port))
+		if err != nil {
+			continue
+		}
+		return conn, nil
+	}
+
+	return nil, fmt.Errorf("no safe IP addresses for %q", host)
 }
 
 func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
@@ -74,15 +122,25 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 		req.Header.Set(k, execCtx.Interpolate(v))
 	}
 
-	resp, err := e.Client.Do(req)
+	client := e.Client
+	if e.AllowLocal {
+		client = &http.Client{Timeout: timeout}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{"status": "failed", "error": err.Error()}}, nil
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{"status": "failed", "error": err.Error()}}, nil
+	}
+	if int64(len(body)) > maxResponseBytes {
+		return dag.ExecutorResult{Outputs: map[string]string{
+			"status": "failed",
+			"error":  "response body exceeded 10 MB limit",
+		}}, nil
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -119,6 +177,20 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	}}, nil
 }
 
+// isBlockedIP returns true for loopback, private, link-local, and metadata IPs.
+func isBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	if ip.Equal(net.ParseIP("169.254.169.254")) {
+		return true
+	}
+	return false
+}
+
 // validateURLSafety blocks requests to private, loopback, and link-local addresses.
 func validateURLSafety(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
@@ -139,21 +211,14 @@ func validateURLSafety(rawURL string) error {
 	// Resolve and check IP
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// Try resolving hostname
 		ips, err := net.LookupIP(host)
 		if err == nil && len(ips) > 0 {
 			ip = ips[0]
 		}
 	}
 
-	if ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return fmt.Errorf("blocked private/loopback address: %s", ip)
-		}
-		// Block AWS metadata endpoint
-		if ip.Equal(net.ParseIP("169.254.169.254")) {
-			return fmt.Errorf("blocked metadata endpoint")
-		}
+	if isBlockedIP(ip) {
+		return fmt.Errorf("blocked private/loopback address: %s", ip)
 	}
 
 	return nil
