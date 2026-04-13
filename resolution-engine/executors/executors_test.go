@@ -503,7 +503,7 @@ func TestLLMJudgeWithMockServer(t *testing.T) {
 	defer server.Close()
 
 	exec := NewLLMJudgeExecutor("test-key")
-	exec.BaseURL = server.URL
+	exec.AnthropicBaseURL = server.URL
 
 	node := dag.NodeDef{
 		ID:   "judge",
@@ -528,6 +528,179 @@ func TestLLMJudgeWithMockServer(t *testing.T) {
 	}
 	if result.Usage.InputTokens != 150 {
 		t.Fatalf("expected 150 input tokens, got %d", result.Usage.InputTokens)
+	}
+}
+
+func TestLLMJudgeOpenAIProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer openai-key" {
+			w.WriteHeader(401)
+			return
+		}
+
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload["model"] != "gpt-5.4" {
+			t.Fatalf("expected gpt-5.4 model, got %#v", payload["model"])
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]string{
+						"content": `{"outcome_index":1,"confidence":"medium","reasoning":"Public filings support outcome 1.","citations":["https://example.com/report"]}`,
+					},
+				},
+			},
+			"usage": map[string]int{
+				"prompt_tokens":     80,
+				"completion_tokens": 24,
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+		OpenAIAPIKey:  "openai-key",
+		OpenAIBaseURL: server.URL,
+	})
+
+	node := dag.NodeDef{
+		ID:   "judge",
+		Type: "llm_judge",
+		Config: map[string]any{
+			"provider":          "openai",
+			"model":             "gpt-5.4",
+			"prompt":            "Judge this evidence.",
+			"require_citations": true,
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["outcome"] != "1" {
+		t.Fatalf("expected outcome=1, got %q", result.Outputs["outcome"])
+	}
+	if result.Outputs["citations_count"] != "1" {
+		t.Fatalf("expected one citation, got %#v", result.Outputs["citations_count"])
+	}
+	if result.Usage.OutputTokens != 24 {
+		t.Fatalf("expected 24 output tokens, got %d", result.Usage.OutputTokens)
+	}
+}
+
+func TestLLMJudgeGoogleProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.RawQuery, "key=google-key") {
+			w.WriteHeader(401)
+			return
+		}
+
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		generationConfig, ok := payload["generationConfig"].(map[string]any)
+		if !ok || generationConfig["responseMimeType"] != "application/json" {
+			t.Fatalf("expected structured JSON response config, got %#v", payload["generationConfig"])
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []map[string]any{
+				{
+					"content": map[string]any{
+						"parts": []map[string]string{
+							{"text": `{"outcome_index":0,"confidence":"high","reasoning":"Primary source confirms outcome 0.","citations":["newswire"]}`},
+						},
+					},
+				},
+			},
+			"usageMetadata": map[string]int{
+				"promptTokenCount":     90,
+				"candidatesTokenCount": 32,
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+		GoogleAPIKey:  "google-key",
+		GoogleBaseURL: server.URL,
+	})
+
+	node := dag.NodeDef{
+		ID:   "judge",
+		Type: "llm_judge",
+		Config: map[string]any{
+			"provider":          "google",
+			"model":             "gemini-3.1-pro-preview",
+			"prompt":            "Judge this evidence.",
+			"require_citations": true,
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["outcome"] != "0" {
+		t.Fatalf("expected outcome=0, got %q", result.Outputs["outcome"])
+	}
+	if result.Outputs["citations_json"] != `["newswire"]` {
+		t.Fatalf("unexpected citations_json: %q", result.Outputs["citations_json"])
+	}
+	if result.Usage.InputTokens != 90 {
+		t.Fatalf("expected 90 input tokens, got %d", result.Usage.InputTokens)
+	}
+}
+
+func TestLLMJudgeCitationsRequired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]string{
+						"content": `{"outcome_index":1,"confidence":"low","reasoning":"No citation included."}`,
+					},
+				},
+			},
+			"usage": map[string]int{
+				"prompt_tokens":     12,
+				"completion_tokens": 8,
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+		OpenAIAPIKey:  "openai-key",
+		OpenAIBaseURL: server.URL,
+	})
+
+	node := dag.NodeDef{
+		ID:   "judge",
+		Type: "llm_judge",
+		Config: map[string]any{
+			"provider":          "openai",
+			"model":             "gpt-5.4",
+			"prompt":            "Judge this evidence.",
+			"require_citations": true,
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "failed" {
+		t.Fatalf("expected failed status when citations are required, got %q", result.Outputs["status"])
+	}
+	if result.Outputs["error"] != "citations required but missing" {
+		t.Fatalf("unexpected error: %q", result.Outputs["error"])
 	}
 }
 

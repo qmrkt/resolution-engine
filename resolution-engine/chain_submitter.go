@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	algoabi "github.com/algorand/go-algorand-sdk/v2/abi"
@@ -21,9 +22,6 @@ import (
 )
 
 const (
-	boxKeyMainBlueprint    = "mb"
-	boxKeyDisputeBlueprint = "db"
-
 	methodSigProposeEarlyResolution = "propose_early_resolution(uint64,byte[],axfer)void"
 	methodSigProposeResolution      = "propose_resolution(uint64,byte[],axfer)void"
 	methodSigAbortEarlyResolution   = "abort_early_resolution(byte[])void"
@@ -57,10 +55,12 @@ type MarketChainReader interface {
 }
 
 type AlgodMarketClient struct {
-	algod *algod.Client
+	algod      *algod.Client
+	httpClient *http.Client
+	indexerURL string
 }
 
-func NewAlgodMarketClient(server, port, token string) (*AlgodMarketClient, error) {
+func NewAlgodMarketClient(indexerURL, server, port, token string) (*AlgodMarketClient, error) {
 	address := strings.TrimRight(server, "/")
 	if port != "" && port != "80" && port != "443" && !strings.Contains(address, "://") {
 		address += ":" + port
@@ -72,15 +72,33 @@ func NewAlgodMarketClient(server, port, token string) (*AlgodMarketClient, error
 	if err != nil {
 		return nil, fmt.Errorf("make algod client: %w", err)
 	}
-	return &AlgodMarketClient{algod: client}, nil
+	return &AlgodMarketClient{
+		algod:      client,
+		httpClient: &http.Client{},
+		indexerURL: strings.TrimRight(indexerURL, "/"),
+	}, nil
 }
 
 func (c *AlgodMarketClient) ReadMainBlueprint(ctx context.Context, appID int) ([]byte, error) {
-	return c.readBox(ctx, appID, []byte(boxKeyMainBlueprint))
+	meta, err := c.readMarketMeta(ctx, appID)
+	if err != nil {
+		return nil, err
+	}
+	if len(meta.MainBlueprint) == 0 {
+		return nil, fmt.Errorf("market %d is missing main blueprint metadata", appID)
+	}
+	return append([]byte(nil), meta.MainBlueprint...), nil
 }
 
 func (c *AlgodMarketClient) ReadDisputeBlueprint(ctx context.Context, appID int) ([]byte, error) {
-	return c.readBox(ctx, appID, []byte(boxKeyDisputeBlueprint))
+	meta, err := c.readMarketMeta(ctx, appID)
+	if err != nil {
+		return nil, err
+	}
+	if len(meta.DisputeBlueprint) == 0 {
+		return nil, fmt.Errorf("market %d is missing dispute blueprint metadata", appID)
+	}
+	return append([]byte(nil), meta.DisputeBlueprint...), nil
 }
 
 func (c *AlgodMarketClient) ReadMarketState(ctx context.Context, appID int) (*MarketChainState, error) {
@@ -133,12 +151,37 @@ func (c *AlgodMarketClient) CurrentTimestamp(ctx context.Context) (uint64, error
 	return uint64(block.TimeStamp), nil
 }
 
-func (c *AlgodMarketClient) readBox(ctx context.Context, appID int, name []byte) ([]byte, error) {
-	box, err := c.algod.GetApplicationBoxByName(uint64(appID), name).Do(ctx)
+type marketMetaEnvelope struct {
+	MainBlueprint    json.RawMessage `json:"mainBlueprint"`
+	DisputeBlueprint json.RawMessage `json:"disputeBlueprint"`
+}
+
+func (c *AlgodMarketClient) readMarketMeta(ctx context.Context, appID int) (*marketMetaEnvelope, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("%s/markets/%d/meta", c.indexerURL, appID),
+		nil,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("read box %q for app %d: %w", string(name), appID, err)
+		return nil, fmt.Errorf("build market meta request: %w", err)
 	}
-	return box.Value, nil
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch market %d metadata: %w", appID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch market %d metadata: status %d", appID, resp.StatusCode)
+	}
+
+	var meta marketMetaEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, fmt.Errorf("decode market %d metadata: %w", appID, err)
+	}
+	return &meta, nil
 }
 
 func decodeGlobalState(values []algomodels.TealKeyValue) map[string]interface{} {

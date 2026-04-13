@@ -15,6 +15,7 @@ type mockExecutor struct {
 	outputs map[string]string
 	err     error
 	delay   time.Duration
+	usage   TokenUsage
 }
 
 func (m *mockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
@@ -24,7 +25,7 @@ func (m *mockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Conte
 	if m.err != nil {
 		return ExecutorResult{}, m.err
 	}
-	return ExecutorResult{Outputs: m.outputs}, nil
+	return ExecutorResult{Outputs: m.outputs, Usage: m.usage}, nil
 }
 
 // contextAwareExecutor reads context during execution.
@@ -721,5 +722,43 @@ func TestConditionalBranchNonActivatedIsFine(t *testing.T) {
 	// sad should remain pending (not activated) and that's fine
 	if run.NodeStates["sad"].Status != "pending" {
 		t.Fatalf("expected sad=pending, got %s", run.NodeStates["sad"].Status)
+	}
+}
+
+func TestTokenBudgetExceededFailsRun(t *testing.T) {
+	engine := NewEngine(slog.Default())
+	engine.RegisterExecutor("llm", &mockExecutor{
+		outputs: map[string]string{"outcome": "0"},
+		usage: TokenUsage{
+			InputTokens:  80,
+			OutputTokens: 35,
+		},
+	})
+
+	bp := Blueprint{
+		ID: "token-budget-fail",
+		Nodes: []NodeDef{
+			{ID: "judge", Type: "llm"},
+		},
+		Budget: &Budget{
+			MaxTotalTokens: 100,
+		},
+	}
+
+	run, err := engine.Execute(context.Background(), bp, nil)
+	if err == nil {
+		t.Fatal("expected token budget error")
+	}
+	if !strings.Contains(err.Error(), "token budget exceeded") {
+		t.Fatalf("expected token budget exceeded error, got %v", err)
+	}
+	if run.Status != "failed" {
+		t.Fatalf("expected failed run, got %s", run.Status)
+	}
+	if run.Usage.InputTokens != 80 || run.Usage.OutputTokens != 35 {
+		t.Fatalf("unexpected recorded usage: %+v", run.Usage)
+	}
+	if run.NodeStates["judge"].Status != "failed" {
+		t.Fatalf("expected judge failed, got %s", run.NodeStates["judge"].Status)
 	}
 }

@@ -231,7 +231,9 @@ func newTestRunner(anthropicKey, indexerURL, dataDir string) *Runner {
 	apiFetchExec.AllowLocal = true
 
 	engine.RegisterExecutor("api_fetch", apiFetchExec)
-	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutor(anthropicKey))
+	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutorWithConfig(executors.LLMJudgeExecutorConfig{
+		AnthropicAPIKey: anthropicKey,
+	}))
 	engine.RegisterExecutor("human_judge", hjExec)
 	engine.RegisterExecutor("ask_creator", acExec)
 	engine.RegisterExecutor("ask_market_admin", amaExec)
@@ -609,7 +611,7 @@ func TestE2ELLMJudgeResolution(t *testing.T) {
 
 	// Override the LLM executor's BaseURL to point to our mock
 	llmExec := executors.NewLLMJudgeExecutor("test-key")
-	llmExec.BaseURL = anthropicServer.URL
+	llmExec.AnthropicBaseURL = anthropicServer.URL
 	runner.engine.RegisterExecutor("llm_judge", llmExec)
 
 	bp := buildLLMJudgeBlueprint()

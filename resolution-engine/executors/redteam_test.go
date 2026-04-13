@@ -218,7 +218,7 @@ func TestLLMJudgeUnparseableResponse(t *testing.T) {
 	defer server.Close()
 
 	exec := NewLLMJudgeExecutor("test-key")
-	exec.BaseURL = server.URL
+	exec.AnthropicBaseURL = server.URL
 
 	node := dag.NodeDef{
 		ID:   "judge",

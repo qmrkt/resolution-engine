@@ -44,13 +44,13 @@ type Runner struct {
 	inFlight  map[int]bool // appID -> running
 }
 
-func NewRunner(anthropicKey string, indexerURL string, dataDir string, traceToken string) *Runner {
+func NewRunner(llmConfig executors.LLMJudgeExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
 	engine := dag.NewEngine(nil)
 
 	// Register all resolution executors
 	engine.RegisterExecutor("api_fetch", executors.NewAPIFetchExecutor())
 	engine.RegisterExecutor("market_evidence", executors.NewMarketEvidenceExecutor(indexerURL))
-	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutor(anthropicKey))
+	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutorWithConfig(llmConfig))
 	engine.RegisterExecutor("human_judge", executors.NewHumanJudgeExecutor(indexerURL))
 	engine.RegisterExecutor("ask_creator", executors.NewAskCreatorExecutor(indexerURL))
 	engine.RegisterExecutor("ask_market_admin", executors.NewAskMarketAdminExecutor(indexerURL))
@@ -408,7 +408,9 @@ func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []by
 	return run, nil
 }
 
-// EvidenceHash computes SHA-256 of run state for on-chain submission.
+// EvidenceHash computes a deterministic SHA-256 over the full run state.
+// This helper is not the current on-chain submission path, which uses the
+// submit_result node's context-derived evidence hash.
 func EvidenceHash(run *dag.RunState) string {
 	data, _ := json.Marshal(run)
 	hash := sha256.Sum256(data)

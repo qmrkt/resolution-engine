@@ -78,6 +78,12 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 		defer cancel()
 	}
 
+	var cancelExecution context.CancelFunc
+	if bp.Budget != nil && bp.Budget.MaxTotalTokens > 0 {
+		ctx, cancelExecution = context.WithCancel(ctx)
+		defer cancelExecution()
+	}
+
 	execCtx := NewContext(inputs)
 	now := time.Now().UTC().Format(time.RFC3339)
 	run := &RunState{
@@ -101,7 +107,7 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 	}
 	notifyObserver(observer, run)
 
-	err := e.runStateMachine(ctx, bp, run, execCtx, observer)
+	err := e.runStateMachine(ctx, bp, run, execCtx, observer, cancelExecution)
 
 	run.Context = execCtx.Snapshot()
 	run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
@@ -135,7 +141,14 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 	return run, nil
 }
 
-func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunState, execCtx *Context, observer RunObserver) error {
+func (e *Engine) runStateMachine(
+	ctx context.Context,
+	bp Blueprint,
+	run *RunState,
+	execCtx *Context,
+	observer RunObserver,
+	cancelExecution context.CancelFunc,
+) error {
 	scheduler := NewScheduler(bp)
 	nodeMap := make(map[string]NodeDef, len(bp.Nodes))
 	for _, node := range bp.Nodes {
@@ -148,6 +161,7 @@ func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunStat
 	completed := make(map[string]struct{})
 	failed := make(map[string]struct{})
 	running := make(map[string]struct{})
+	var budgetErr error
 	// activated tracks nodes that have been reached via edge traversal.
 	// Root nodes (no incoming forward edges) are activated by default.
 	activated := make(map[string]struct{})
@@ -284,32 +298,65 @@ func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunStat
 					completed[nr.nodeID] = struct{}{}
 				}
 			} else {
-				state.Status = "completed"
+				nextInputTokens := run.Usage.InputTokens + nr.result.Usage.InputTokens
+				nextOutputTokens := run.Usage.OutputTokens + nr.result.Usage.OutputTokens
+				nextTotalTokens := nextInputTokens + nextOutputTokens
+				tokenBudgetExceeded := bp.Budget != nil &&
+					bp.Budget.MaxTotalTokens > 0 &&
+					nextTotalTokens > bp.Budget.MaxTotalTokens
 				state.CompletedAt = completedAt
-				state.Error = ""
 				state.Usage = nr.result.Usage
-				run.NodeStates[nr.nodeID] = state
-				trace.Status = "completed"
-				trace.Outputs = cloneStringMap(nr.result.Outputs)
-				trace.Usage = nr.result.Usage
-				run.NodeTraces = append(run.NodeTraces, trace)
 
 				// Merge outputs into context
 				for key, value := range nr.result.Outputs {
 					execCtx.Set(nr.nodeID+"."+key, value)
 				}
-				// Only set engine status if the executor didn't set its own
-				if execCtx.Get(nr.nodeID+".status") == "" {
-					execCtx.Set(nr.nodeID+".status", "completed")
+				run.Usage.InputTokens = nextInputTokens
+				run.Usage.OutputTokens = nextOutputTokens
+
+				if tokenBudgetExceeded {
+					budgetErr = fmt.Errorf(
+						"token budget exceeded: used %d > max %d",
+						nextTotalTokens,
+						bp.Budget.MaxTotalTokens,
+					)
+					state.Status = "failed"
+					state.Error = budgetErr.Error()
+					run.NodeStates[nr.nodeID] = state
+					trace.Status = "failed"
+					trace.Outputs = cloneStringMap(nr.result.Outputs)
+					trace.Error = budgetErr.Error()
+					trace.Usage = nr.result.Usage
+					run.NodeTraces = append(run.NodeTraces, trace)
+					execCtx.Set(nr.nodeID+".status", "failed")
+					execCtx.Set(nr.nodeID+".error", budgetErr.Error())
+					failed[nr.nodeID] = struct{}{}
+					if cancelExecution != nil {
+						cancelExecution()
+					}
+				} else {
+					state.Status = "completed"
+					state.Error = ""
+					run.NodeStates[nr.nodeID] = state
+					trace.Status = "completed"
+					trace.Outputs = cloneStringMap(nr.result.Outputs)
+					trace.Usage = nr.result.Usage
+					run.NodeTraces = append(run.NodeTraces, trace)
+					// Only set engine status if the executor didn't set its own
+					if execCtx.Get(nr.nodeID+".status") == "" {
+						execCtx.Set(nr.nodeID+".status", "completed")
+					}
+
+					completed[nr.nodeID] = struct{}{}
 				}
-
-				run.Usage.InputTokens += nr.result.Usage.InputTokens
-				run.Usage.OutputTokens += nr.result.Usage.OutputTokens
-
-				completed[nr.nodeID] = struct{}{}
 			}
 			delete(inputSnapshots, nr.nodeID)
 			delete(startedAt, nr.nodeID)
+			if budgetErr != nil {
+				run.Context = execCtx.Snapshot()
+				notifyObserver(observer, run)
+				continue
+			}
 
 			// Evaluate outgoing edges and activate targets
 			edges, evalErr := scheduler.EvaluateEdges(nr.nodeID, execCtx)
@@ -345,11 +392,19 @@ func (e *Engine) runStateMachine(ctx context.Context, bp Blueprint, run *RunStat
 			run.Context = execCtx.Snapshot()
 			notifyObserver(observer, run)
 		}
+
+		if budgetErr != nil {
+			break
+		}
 	}
 	run.EdgeTraversals = scheduler.TraversalSnapshot()
 	run.Context = execCtx.Snapshot()
 	if syncSkippedNodeStates(run, scheduler, time.Now().UTC().Format(time.RFC3339)) {
 		notifyObserver(observer, run)
+	}
+
+	if budgetErr != nil {
+		return budgetErr
 	}
 
 	// Detect orphaned pending nodes: activated but never completed/failed/skipped.

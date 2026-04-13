@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/question-market/resolution-engine/executors"
 )
 
 func envOrDefault(key, fallback string) string {
@@ -35,6 +37,11 @@ func main() {
 	algodPort := envOrDefault("ALGOD_PORT", "443")
 	algodToken := envOrDefault("ALGOD_TOKEN", "")
 	anthropicKey := envOrDefault("ANTHROPIC_API_KEY", "")
+	openAIKey := envOrDefault("OPENAI_API_KEY", "")
+	googleKey := envOrDefault("GOOGLE_API_KEY", envOrDefault("GEMINI_API_KEY", ""))
+	anthropicBaseURL := envOrDefault("ANTHROPIC_API_BASE_URL", "")
+	openAIBaseURL := envOrDefault("OPENAI_API_BASE_URL", "")
+	googleBaseURL := envOrDefault("GOOGLE_API_BASE_URL", envOrDefault("GEMINI_API_BASE_URL", ""))
 	dataDir := envOrDefault("RESOLUTION_DATA_DIR", "data")
 	pollIntervalStr := envOrDefault("POLL_INTERVAL", "30000")
 	healthPort := envOrDefault("HEALTH_PORT", "3002")
@@ -44,6 +51,7 @@ func main() {
 		envOrDefault("RESOLUTION_AUTHORITY_PRIVATE_KEY_B64", envOrDefault("AVM_PRIVATE_KEY", "")),
 	)
 	authorityMnemonic := envOrDefault("RESOLUTION_AUTHORITY_MNEMONIC", "")
+	allowLocalAPIFetch := envOrDefault("RESOLUTION_ALLOW_LOCAL_API_FETCH", "") == "1"
 
 	pollIntervalMs, _ := strconv.Atoi(pollIntervalStr)
 
@@ -57,11 +65,18 @@ func main() {
 	)
 	if anthropicKey != "" {
 		slog.Info("Anthropic API key configured", "component", "main")
-	} else {
-		slog.Warn("no ANTHROPIC_API_KEY configured, llm_judge will return inconclusive", "component", "main")
+	}
+	if openAIKey != "" {
+		slog.Info("OpenAI API key configured", "component", "main")
+	}
+	if googleKey != "" {
+		slog.Info("Google API key configured", "component", "main")
+	}
+	if anthropicKey == "" && openAIKey == "" && googleKey == "" {
+		slog.Warn("no llm provider API key configured, llm_judge will return inconclusive", "component", "main")
 	}
 
-	chainClient, err := NewAlgodMarketClient(algodServer, algodPort, algodToken)
+	chainClient, err := NewAlgodMarketClient(indexerURL, algodServer, algodPort, algodToken)
 	if err != nil {
 		slog.Error("failed to create algod client", "component", "main", "error", err)
 		os.Exit(1)
@@ -72,7 +87,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	runner := NewRunner(anthropicKey, indexerURL, dataDir, traceIngestToken)
+	runner := NewRunner(executors.LLMJudgeExecutorConfig{
+		AnthropicAPIKey:  anthropicKey,
+		AnthropicBaseURL: anthropicBaseURL,
+		OpenAIAPIKey:     openAIKey,
+		OpenAIBaseURL:    openAIBaseURL,
+		GoogleAPIKey:     googleKey,
+		GoogleBaseURL:    googleBaseURL,
+	}, indexerURL, dataDir, traceIngestToken)
+	if allowLocalAPIFetch {
+		apiFetch := executors.NewAPIFetchExecutor()
+		apiFetch.AllowLocal = true
+		runner.engine.RegisterExecutor("api_fetch", apiFetch)
+		slog.Warn("local api_fetch is enabled; use only for trusted local smoke tests", "component", "main")
+	}
 	automation := NewMarketAutomationService(runner, chainClient, submitter)
 	watcher := NewWatcher(indexerURL, time.Duration(pollIntervalMs)*time.Millisecond)
 
