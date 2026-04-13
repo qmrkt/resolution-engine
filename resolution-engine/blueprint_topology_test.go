@@ -1092,9 +1092,9 @@ func TestContextInterpolationBlueprint(t *testing.T) {
 			interpolatedURL := execCtx.Interpolate(urlTemplate)
 
 			return map[string]string{
-				"status":           "success",
-				"outcome":          "1",
-				"url_used":         interpolatedURL,
+				"status":            "success",
+				"outcome":           "1",
+				"url_used":          interpolatedURL,
 				"original_template": urlTemplate,
 			}, nil
 		},

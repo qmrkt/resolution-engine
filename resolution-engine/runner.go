@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,37 +16,23 @@ import (
 	"github.com/question-market/resolution-engine/executors"
 )
 
-// ResolutionPath indicates which blueprint produced the final result.
 const (
-	PathMain          = "main"
-	PathDispute       = "dispute"
-	PathAdminFallback = "admin_fallback"
+	PathMain    = "main"
+	PathDispute = "dispute"
 )
 
-// DualPathResult captures the outcome of a dual-path resolution attempt.
-type DualPathResult struct {
-	MainRun      *dag.RunState `json:"main_run"`
-	DisputeRun   *dag.RunState `json:"dispute_run,omitempty"`
-	PathUsed     string        `json:"path_used"`
-	Outcome      string        `json:"outcome,omitempty"`
-	EvidenceHash string        `json:"evidence_hash,omitempty"`
-	Cancelled    bool          `json:"cancelled"`
-	CancelReason string        `json:"cancel_reason,omitempty"`
-}
-
-// Runner executes resolution logic for markets and tracks in-flight runs.
+// Runner executes resolution blueprints and persists evidence/traces.
 type Runner struct {
 	engine    *dag.Engine
 	dataDir   string
 	traceSink traceSink
+	baseCtx   context.Context
 	mu        sync.Mutex
-	inFlight  map[int]bool // appID -> running
 }
 
 func NewRunner(llmConfig executors.LLMJudgeExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
 	engine := dag.NewEngine(nil)
 
-	// Register all resolution executors
 	engine.RegisterExecutor("api_fetch", executors.NewAPIFetchExecutor())
 	engine.RegisterExecutor("market_evidence", executors.NewMarketEvidenceExecutor(indexerURL))
 	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutorWithConfig(llmConfig))
@@ -60,30 +45,32 @@ func NewRunner(llmConfig executors.LLMJudgeExecutorConfig, indexerURL string, da
 	engine.RegisterExecutor("defer_resolution", executors.NewDeferResolutionExecutor())
 	engine.RegisterExecutor("wait", executors.NewWaitExecutor())
 
-	os.MkdirAll(dataDir, 0o755)
+	_ = os.MkdirAll(dataDir, 0o755)
 
 	return &Runner{
 		engine:    engine,
 		dataDir:   dataDir,
 		traceSink: NewTraceEmitter(indexerURL, traceToken, nil),
-		inFlight:  make(map[int]bool),
+		baseCtx:   context.Background(),
 	}
 }
 
-func (r *Runner) TryStart(appID int) bool {
+func (r *Runner) SetContext(ctx context.Context) {
+	if r == nil || ctx == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.inFlight[appID] {
-		return false
-	}
-	r.inFlight[appID] = true
-	return true
+	r.baseCtx = ctx
 }
 
-func (r *Runner) Finish(appID int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.inFlight, appID)
+func (r *Runner) Close() {
+	if r == nil {
+		return
+	}
+	if closer, ok := r.traceSink.(interface{ Close() }); ok {
+		closer.Close()
+	}
 }
 
 func (r *Runner) WriteEvidence(appID int, payload interface{}) (string, error) {
@@ -102,167 +89,6 @@ func (r *Runner) RunBlueprint(appID int, resolutionLogicJSON []byte, inputs map[
 	return r.executeResolutionWithInputs(appID, resolutionLogicJSON, inputs, firstRunOptions(opts...))
 }
 
-// TryResolve attempts to run resolution logic for a market.
-// Returns immediately if the market is already in-flight.
-func (r *Runner) TryResolve(appID int, resolutionLogicJSON []byte) {
-	if !r.TryStart(appID) {
-		return
-	}
-
-	go func() {
-		defer r.Finish(appID)
-
-		slog.Info("starting resolution", "component", "runner", slog.Int("app_id", appID))
-		result, err := r.executeResolutionWithInputs(appID, resolutionLogicJSON, nil, RunOptions{
-			Trace: &TraceMetadata{
-				AppID:         appID,
-				BlueprintPath: PathMain,
-				Initiator:     "runner:manual",
-			},
-		})
-		if err != nil {
-			slog.Error("resolution failed", "component", "runner", slog.Int("app_id", appID), "error", err)
-			return
-		}
-
-		// Save evidence to disk
-		_, writeErr := r.WriteEvidence(appID, result)
-		if writeErr != nil {
-			slog.Error("failed to persist evidence", "component", "runner", slog.Int("app_id", appID), "error", writeErr)
-		}
-
-		slog.Info("resolution complete", "component", "runner", slog.Int("app_id", appID), slog.String("status", result.Status))
-
-		// Check if submit_result produced an outcome
-		if submission, ok := findSubmittedResolution(result); ok {
-			slog.Info("market resolved",
-				"component", "runner",
-				slog.Int("app_id", appID),
-				slog.String("outcome", submission.Outcome),
-				slog.String("evidence_hash", submission.EvidenceHash),
-			)
-		} else if cancellation, ok := findRunAction(result, "cancelled"); ok {
-			slog.Info("resolution cancelled",
-				"component", "runner",
-				slog.Int("app_id", appID),
-				slog.String("reason", cancellation.Reason),
-			)
-		}
-	}()
-}
-
-// TryResolveWithDispute attempts dual-path resolution: main blueprint first,
-// then dispute blueprint if main fails, returns inconclusive, or is invalid.
-// Returns immediately if the market is already in-flight.
-func (r *Runner) TryResolveWithDispute(appID int, mainBlueprintJSON []byte, disputeBlueprintJSON []byte) {
-	if !r.TryStart(appID) {
-		return
-	}
-
-	go func() {
-		defer r.Finish(appID)
-
-		slog.Info("starting dual-path resolution", "component", "runner", slog.Int("app_id", appID))
-		result, err := r.executeDualPath(appID, mainBlueprintJSON, disputeBlueprintJSON)
-		if err != nil {
-			slog.Error("dual-path resolution failed", "component", "runner", slog.Int("app_id", appID), "error", err)
-			return
-		}
-
-		// Save evidence bundle (both runs) to disk
-		_, writeErr := r.WriteEvidence(appID, result)
-		if writeErr != nil {
-			slog.Error("failed to persist dual-path evidence", "component", "runner", slog.Int("app_id", appID), "error", writeErr)
-		}
-
-		slog.Info("dual-path resolution complete",
-			"component", "runner",
-			slog.Int("app_id", appID),
-			slog.String("path", result.PathUsed),
-		)
-
-		if result.Cancelled {
-			slog.Warn("both paths failed, market cancelled",
-				"component", "runner",
-				slog.Int("app_id", appID),
-				slog.String("reason", result.CancelReason),
-			)
-		} else if result.Outcome != "" {
-			slog.Info("market resolved via dual path",
-				"component", "runner",
-				slog.Int("app_id", appID),
-				slog.String("path", result.PathUsed),
-				slog.String("outcome", result.Outcome),
-				slog.String("evidence_hash", result.EvidenceHash),
-			)
-		}
-	}()
-}
-
-// executeDualPath runs main blueprint, then dispute blueprint on failure.
-func (r *Runner) executeDualPath(appID int, mainJSON []byte, disputeJSON []byte) (*DualPathResult, error) {
-	result := &DualPathResult{}
-
-	// Execute main path
-	slog.Info("executing main blueprint", "component", "runner", slog.Int("app_id", appID))
-	mainRun, mainErr := r.executeResolution(appID, mainJSON, RunOptions{
-		Trace: &TraceMetadata{
-			AppID:         appID,
-			BlueprintPath: PathMain,
-			Initiator:     "runner:manual",
-		},
-	})
-	result.MainRun = mainRun
-
-	mainSucceeded := mainErr == nil && mainRun != nil && isResolutionSuccessful(mainRun)
-
-	if mainSucceeded {
-		submission, _ := findSubmittedResolution(mainRun)
-		result.PathUsed = PathMain
-		result.Outcome = submission.Outcome
-		result.EvidenceHash = submission.EvidenceHash
-		return result, nil
-	}
-
-	if mainErr != nil {
-		slog.Error("main path error", "component", "runner", slog.Int("app_id", appID), "error", mainErr)
-	} else {
-		slog.Info("main path inconclusive, falling back to dispute path", "component", "runner", slog.Int("app_id", appID))
-	}
-
-	// Execute dispute path
-	slog.Info("executing dispute blueprint", "component", "runner", slog.Int("app_id", appID))
-	disputeRun, disputeErr := r.executeResolution(appID, disputeJSON, RunOptions{
-		Trace: &TraceMetadata{
-			AppID:         appID,
-			BlueprintPath: PathDispute,
-			Initiator:     "runner:manual",
-		},
-	})
-	result.DisputeRun = disputeRun
-
-	disputeSucceeded := disputeErr == nil && disputeRun != nil && isResolutionSuccessful(disputeRun)
-
-	if disputeSucceeded {
-		submission, _ := findSubmittedResolution(disputeRun)
-		result.PathUsed = PathDispute
-		result.Outcome = submission.Outcome
-		result.EvidenceHash = submission.EvidenceHash
-		return result, nil
-	}
-
-	// Both paths failed
-	result.PathUsed = PathDispute
-	result.Cancelled = true
-	reason := "both main and dispute paths failed to produce an outcome"
-	if disputeErr != nil {
-		reason = fmt.Sprintf("main failed, dispute error: %v", disputeErr)
-	}
-	result.CancelReason = reason
-	return result, nil
-}
-
-// isResolutionSuccessful checks if a run produced a valid outcome via submit_result.
 func isResolutionSuccessful(run *dag.RunState) bool {
 	if run == nil {
 		return false
@@ -382,7 +208,17 @@ func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []by
 		return nil, fmt.Errorf("parse resolution logic: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 7*24*time.Hour)
+	baseCtx := opts.Context
+	if baseCtx == nil {
+		r.mu.Lock()
+		baseCtx = r.baseCtx
+		r.mu.Unlock()
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(baseCtx, 7*24*time.Hour)
 	defer cancel()
 
 	inputs := map[string]string{
@@ -408,9 +244,6 @@ func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []by
 	return run, nil
 }
 
-// EvidenceHash computes a deterministic SHA-256 over the full run state.
-// This helper is not the current on-chain submission path, which uses the
-// submit_result node's context-derived evidence hash.
 func EvidenceHash(run *dag.RunState) string {
 	data, _ := json.Marshal(run)
 	hash := sha256.Sum256(data)

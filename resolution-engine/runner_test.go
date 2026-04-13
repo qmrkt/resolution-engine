@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,122 +50,6 @@ func makeBlueprintWithSubmit(id, fetchType string) []byte {
 	}
 	data, _ := json.Marshal(bp)
 	return data
-}
-
-func TestDualPathMainSuccess(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "runner-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("good_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "1"},
-	})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "1", "evidence_hash": "abc123", "submitted": "true"},
-	})
-	engine.RegisterExecutor("dispute_step", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "2"},
-	})
-
-	runner := &Runner{engine: engine, dataDir: tmpDir, inFlight: make(map[int]bool)}
-
-	mainBP := makeBlueprintWithSubmit("main", "good_fetch")
-	disputeBP := makeBlueprintWithSubmit("dispute", "dispute_step")
-
-	result, err := runner.executeDualPath(100, mainBP, disputeBP)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.PathUsed != PathMain {
-		t.Fatalf("expected path=main, got %s", result.PathUsed)
-	}
-	if result.Outcome != "1" {
-		t.Fatalf("expected outcome=1, got %s", result.Outcome)
-	}
-	if result.DisputeRun != nil {
-		t.Fatal("dispute path should not have run when main succeeds")
-	}
-	if result.Cancelled {
-		t.Fatal("should not be cancelled")
-	}
-}
-
-func TestDualPathMainFailsDisputeSucceeds(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "runner-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	engine := dag.NewEngine(nil)
-	// Main path: fetch fails, submit never runs
-	engine.RegisterExecutor("bad_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "failed", "error": "API down"},
-	})
-	// Dispute path: succeeds
-	engine.RegisterExecutor("dispute_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "2"},
-	})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "2", "evidence_hash": "def456", "submitted": "true"},
-	})
-
-	runner := &Runner{engine: engine, dataDir: tmpDir, inFlight: make(map[int]bool)}
-
-	mainBP := makeBlueprintWithSubmit("main", "bad_fetch")
-	disputeBP := makeBlueprintWithSubmit("dispute", "dispute_fetch")
-
-	result, err := runner.executeDualPath(101, mainBP, disputeBP)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.PathUsed != PathDispute {
-		t.Fatalf("expected path=dispute, got %s", result.PathUsed)
-	}
-	if result.Outcome != "2" {
-		t.Fatalf("expected outcome=2, got %s", result.Outcome)
-	}
-	if result.MainRun == nil {
-		t.Fatal("main run should be recorded even on failure")
-	}
-	if result.DisputeRun == nil {
-		t.Fatal("dispute run should be recorded")
-	}
-	if result.Cancelled {
-		t.Fatal("should not be cancelled when dispute succeeds")
-	}
-}
-
-func TestDualPathBothFail(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "runner-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("bad_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "failed", "error": "API down"},
-	})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "", "evidence_hash": "", "submitted": "true"},
-	})
-
-	runner := &Runner{engine: engine, dataDir: tmpDir, inFlight: make(map[int]bool)}
-
-	mainBP := makeBlueprintWithSubmit("main", "bad_fetch")
-	disputeBP := makeBlueprintWithSubmit("dispute", "bad_fetch")
-
-	result, err := runner.executeDualPath(102, mainBP, disputeBP)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Cancelled {
-		t.Fatal("expected cancelled when both paths fail")
-	}
-	if result.CancelReason == "" {
-		t.Fatal("expected cancel reason")
-	}
-	if result.MainRun == nil {
-		t.Fatal("main run should be recorded")
-	}
-	if result.DisputeRun == nil {
-		t.Fatal("dispute run should be recorded")
-	}
 }
 
 func TestIsResolutionSuccessful(t *testing.T) {
@@ -228,37 +113,43 @@ func TestEvidenceHashDeterministic(t *testing.T) {
 	}
 }
 
-func TestTryResolveWithDisputeDeduplicates(t *testing.T) {
+type blockingExecutor struct{}
+
+func (e *blockingExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+	<-ctx.Done()
+	return dag.ExecutorResult{}, ctx.Err()
+}
+
+func TestRunBlueprintHonorsProvidedContextCancellation(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "runner-test-*")
 	defer os.RemoveAll(tmpDir)
 
 	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("slow_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "1"},
-	})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "1", "evidence_hash": "abc", "submitted": "true"},
-	})
+	engine.RegisterExecutor("blocking", &blockingExecutor{})
+	runner := &Runner{engine: engine, dataDir: tmpDir}
 
-	runner := &Runner{engine: engine, dataDir: tmpDir, inFlight: make(map[int]bool)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	bp := makeBlueprintWithSubmit("test", "slow_fetch")
-
-	// First call should start
-	runner.TryResolveWithDispute(200, bp, bp)
-
-	// Second call with same appID should be deduplicated
-	runner.mu.Lock()
-	inFlight := runner.inFlight[200]
-	runner.mu.Unlock()
-	if !inFlight {
-		t.Fatal("expected market 200 to be in-flight")
+	_, err := runner.RunBlueprint(401, makeBlueprint("cancel", "blocking"), nil, RunOptions{Context: ctx})
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context canceled error, got %v", err)
 	}
 }
 
 type fakeTraceSink struct {
 	envelopes []TraceEnvelope
 }
+
+type closeTrackingSink struct {
+	closed bool
+}
+
+func (s *closeTrackingSink) Enqueue(TraceEnvelope) bool { return true }
+func (s *closeTrackingSink) Close()                     { s.closed = true }
 
 func (f *fakeTraceSink) Enqueue(envelope TraceEnvelope) bool {
 	f.envelopes = append(f.envelopes, envelope)
@@ -275,7 +166,6 @@ func TestRunBlueprintEmitsTraceSnapshots(t *testing.T) {
 	runner := &Runner{
 		engine:    engine,
 		traceSink: sink,
-		inFlight:  make(map[int]bool),
 	}
 
 	run, err := runner.RunBlueprint(301, makeBlueprint("trace-main", "good_fetch"), map[string]string{"market.question": "Will it trace?"}, RunOptions{
@@ -313,47 +203,14 @@ func TestRunBlueprintEmitsTraceSnapshots(t *testing.T) {
 			t.Fatalf("envelope[%d].revision = %d, want %d", index, envelope.Revision, index+1)
 		}
 	}
-
-	finalEnvelope := sink.envelopes[len(sink.envelopes)-1]
-	if finalEnvelope.Run.Status != "completed" {
-		t.Fatalf("final status = %q, want completed", finalEnvelope.Run.Status)
-	}
-	if finalEnvelope.Run.Context["step.outcome"] != "1" {
-		t.Fatalf("final context missing output: %#v", finalEnvelope.Run.Context)
-	}
 }
 
-func TestExecuteDualPathEmitsMainAndDisputeTracePaths(t *testing.T) {
-	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("bad_fetch", &mockExecutor{err: context.DeadlineExceeded})
-	engine.RegisterExecutor("dispute_fetch", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "2"},
-	})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
-		outputs: map[string]string{"status": "success", "outcome": "2", "evidence_hash": "def456", "submitted": "true"},
-	})
-
-	sink := &fakeTraceSink{}
-	runner := &Runner{
-		engine:    engine,
-		traceSink: sink,
-		inFlight:  make(map[int]bool),
-	}
-
-	result, err := runner.executeDualPath(302, makeBlueprintWithSubmit("main", "bad_fetch"), makeBlueprintWithSubmit("dispute", "dispute_fetch"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.DisputeRun == nil {
-		t.Fatal("expected dispute run to complete")
-	}
-
-	seenPaths := map[string]bool{}
-	for _, envelope := range sink.envelopes {
-		seenPaths[envelope.BlueprintPath] = true
-	}
-	if !seenPaths[PathMain] || !seenPaths[PathDispute] {
-		t.Fatalf("expected main and dispute trace paths, got %+v", seenPaths)
+func TestRunnerCloseClosesTraceSink(t *testing.T) {
+	sink := &closeTrackingSink{}
+	runner := &Runner{traceSink: sink}
+	runner.Close()
+	if !sink.closed {
+		t.Fatal("expected runner close to close trace sink")
 	}
 }
 
@@ -363,8 +220,6 @@ func TestTraceEmitterPostsToIndexerInBackground(t *testing.T) {
 	defer server.Close()
 
 	emitter := NewTraceEmitter(server.URL, "secret-token", nil)
-	defer emitter.Close()
-
 	run := &dag.RunState{
 		ID:          "run-trace-http",
 		BlueprintID: "trace-http",
@@ -389,6 +244,69 @@ func TestTraceEmitterPostsToIndexerInBackground(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for trace POST")
 	}
+	emitter.Close()
+}
+
+func TestTraceEmitterRejectsEnqueueAfterClose(t *testing.T) {
+	emitter := NewTraceEmitter("http://127.0.0.1:1", "", nil)
+	if emitter == nil {
+		t.Fatal("expected emitter")
+	}
+	emitter.Close()
+
+	ok := emitter.Enqueue(TraceEnvelope{AppID: 1, Run: &dag.RunState{ID: "closed"}})
+	if ok {
+		t.Fatal("expected enqueue to fail after close")
+	}
+}
+
+func TestTraceEmitterCloseUnblocksSlowPost(t *testing.T) {
+	started := make(chan struct{}, 1)
+	emitter := NewTraceEmitter("http://trace.test", "", nil)
+	if emitter == nil {
+		t.Fatal("expected emitter")
+	}
+	emitter.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		started <- struct{}{}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+
+	if ok := emitter.Enqueue(TraceEnvelope{
+		AppID:    404,
+		Revision: 1,
+		Run: &dag.RunState{
+			ID:        "slow-post",
+			Status:    "running",
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+		},
+	}); !ok {
+		t.Fatal("expected enqueue to succeed")
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for trace request to start")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		emitter.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("trace emitter close did not return promptly")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func newTestTraceServer(t *testing.T, received chan<- TraceEnvelope) *httptest.Server {

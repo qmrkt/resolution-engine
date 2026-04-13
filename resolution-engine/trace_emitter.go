@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/question-market/resolution-engine/dag"
@@ -21,7 +22,8 @@ type TraceMetadata struct {
 }
 
 type RunOptions struct {
-	Trace *TraceMetadata
+	Trace   *TraceMetadata
+	Context context.Context
 }
 
 type TraceEnvelope struct {
@@ -42,7 +44,10 @@ type TraceEmitter struct {
 	client     *http.Client
 	logger     *slog.Logger
 	queue      chan TraceEnvelope
-	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closeOnce  sync.Once
+	wg         sync.WaitGroup
 }
 
 func NewTraceEmitter(indexerURL string, token string, logger *slog.Logger) *TraceEmitter {
@@ -54,6 +59,7 @@ func NewTraceEmitter(indexerURL string, token string, logger *slog.Logger) *Trac
 		logger = slog.Default()
 	}
 
+	emitterCtx, cancel := context.WithCancel(context.Background())
 	emitter := &TraceEmitter{
 		indexerURL: indexerURL,
 		token:      strings.TrimSpace(token),
@@ -62,9 +68,11 @@ func NewTraceEmitter(indexerURL string, token string, logger *slog.Logger) *Trac
 		},
 		logger: logger,
 		queue:  make(chan TraceEnvelope, 64),
-		done:   make(chan struct{}),
+		ctx:    emitterCtx,
+		cancel: cancel,
 	}
 
+	emitter.wg.Add(1)
 	go emitter.run()
 	return emitter
 }
@@ -73,12 +81,12 @@ func (e *TraceEmitter) Close() {
 	if e == nil {
 		return
 	}
-	select {
-	case <-e.done:
-		return
-	default:
-		close(e.done)
-	}
+	e.closeOnce.Do(func() {
+		if e.cancel != nil {
+			e.cancel()
+		}
+		e.wg.Wait()
+	})
 }
 
 func (e *TraceEmitter) Enqueue(envelope TraceEnvelope) bool {
@@ -86,7 +94,7 @@ func (e *TraceEmitter) Enqueue(envelope TraceEnvelope) bool {
 		return false
 	}
 	select {
-	case <-e.done:
+	case <-e.ctx.Done():
 		return false
 	default:
 	}
@@ -106,9 +114,10 @@ func (e *TraceEmitter) Enqueue(envelope TraceEnvelope) bool {
 }
 
 func (e *TraceEmitter) run() {
+	defer e.wg.Done()
 	for {
 		select {
-		case <-e.done:
+		case <-e.ctx.Done():
 			return
 		case envelope := <-e.queue:
 			if err := e.postSnapshot(envelope); err != nil {
@@ -135,7 +144,7 @@ func (e *TraceEmitter) postSnapshot(envelope TraceEnvelope) error {
 	}
 
 	url := fmt.Sprintf("%s/markets/%d/blueprint-runs", e.indexerURL, envelope.AppID)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(e.ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build trace ingest request: %w", err)
 	}

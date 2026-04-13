@@ -246,9 +246,8 @@ func newTestRunner(anthropicKey, indexerURL, dataDir string) *Runner {
 	os.MkdirAll(dataDir, 0o755)
 
 	return &Runner{
-		engine:   engine,
-		dataDir:  dataDir,
-		inFlight: make(map[int]bool),
+		engine:  engine,
+		dataDir: dataDir,
 	}
 }
 
@@ -651,89 +650,6 @@ func TestE2ELLMJudgeResolution(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Test 5: Dual-path fallback: main (api_fetch) fails, dispute (human_judge) succeeds
+// Legacy dual-path runner orchestration moved out of this repo.
+// Richer controller/orchestrator fallback tests belong in the monorepo.
 // --------------------------------------------------------------------------
-
-func TestE2EDualPathFallback(t *testing.T) {
-	// API server that always returns 500
-	failingAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
-		w.Write([]byte(`{"error": "internal server error"}`))
-	}))
-	defer failingAPI.Close()
-
-	// Mock indexer for the dispute path
-	mock := newMockIndexer()
-	indexerServer := httptest.NewServer(mock)
-	defer indexerServer.Close()
-
-	tmpDir, err := os.MkdirTemp("", "e2e-dual-path-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	runner := newTestRunner("", indexerServer.URL, tmpDir)
-
-	mainBP := buildAPIFetchBlueprint(failingAPI.URL)
-	disputeBP := buildHumanJudgeBlueprint(10)
-
-	appID := 1005
-
-	type dualResult struct {
-		result *DualPathResult
-		err    error
-	}
-	ch := make(chan dualResult, 1)
-	go func() {
-		res, err := runner.executeDualPath(appID, mainBP, disputeBP)
-		ch <- dualResult{res, err}
-	}()
-
-	// Wait for the dispute path's judgment to appear, then respond
-	jID := mock.waitForJudgment(fmt.Sprintf("%d:", appID), 10*time.Second)
-	if jID == "" {
-		t.Fatal("timed out waiting for dispute judgment to be created")
-	}
-
-	mock.simulateResponse(jID, 0, "Dispute resolution: outcome 0")
-
-	select {
-	case res := <-ch:
-		if res.err != nil {
-			t.Fatalf("execution error: %v", res.err)
-		}
-		dr := res.result
-
-		// Main path should have been attempted
-		if dr.MainRun == nil {
-			t.Fatal("expected main run to be recorded")
-		}
-
-		// Dispute path should have run and succeeded
-		if dr.DisputeRun == nil {
-			t.Fatal("expected dispute run to be recorded")
-		}
-
-		if dr.PathUsed != PathDispute {
-			t.Fatalf("expected PathUsed=dispute, got %s", dr.PathUsed)
-		}
-
-		if dr.Outcome != "0" {
-			t.Fatalf("expected outcome=0, got %q", dr.Outcome)
-		}
-
-		if dr.Cancelled {
-			t.Fatal("should not be cancelled when dispute succeeds")
-		}
-
-		// Verify main path failed (cancel node ran or no submit outcome)
-		mainOutcome := dr.MainRun.Context["submit.outcome"]
-		if mainOutcome != "" {
-			t.Fatalf("main path should not have a submit outcome, got %q", mainOutcome)
-		}
-
-	case <-time.After(15 * time.Second):
-		t.Fatal("dual-path execution timed out")
-	}
-}

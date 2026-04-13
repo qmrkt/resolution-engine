@@ -1,17 +1,33 @@
-# question.market resolution engine
+# question.market blueprint engine
 
-Resolution engine for [question.market](https://question.market). Executes DAG-based resolution logic to determine prediction market outcomes on Algorand.
+Async blueprint execution service for question.market.
+
+This repo is intentionally scoped to execution only:
+- accepts blueprint execution requests over HTTP
+- runs DAG-based resolution logic
+- exposes async run status and cancellation
+- emits structured execution traces for observability
+
+It does not:
+- poll markets
+- decide market lifecycle transitions
+- submit on-chain transactions
+- own durable orchestration state
+
+Those concerns belong to the indexer/orchestrator in the monorepo.
 
 ## Architecture
 
 A Go service (`resolution-engine/`) that:
-- Watches for markets entering resolution via an indexer
-- Executes resolution blueprints as DAGs with conditional branching
-- Supports multiple executor types: LLM judge, API fetch, human judge, market evidence, creator/admin input
-- Submits resolution proposals and dispute rulings on-chain
-- Emits structured execution traces for observability
+- executes resolution blueprints as DAGs with conditional branching
+- supports multiple executor types: LLM judge, API fetch, human judge, market evidence, creator/admin input
+- returns structured terminal results (`propose`, `finalize_dispute`, `cancel_market`, `defer`, `none`)
+- exposes async HTTP endpoints for submit/status/cancel
+- emits trace snapshots to the indexer for observability
 
 ## Quick start
+
+Requires Go 1.23+.
 
 ```bash
 cd resolution-engine
@@ -20,12 +36,16 @@ cd resolution-engine
 go mod download
 
 # Required environment
-export ALGOD_SERVER=http://localhost
-export ALGOD_PORT=4001
-export ALGOD_TOKEN=aaaa...
-export RESOLUTION_AUTHORITY_MNEMONIC="your 25-word mnemonic"
-export ANTHROPIC_API_KEY=sk-...       # optional, for LLM judge
 export INDEXER_URL=http://localhost:3001
+export LISTEN_PORT=3002
+export ANTHROPIC_API_KEY=your_anthropic_api_key   # optional
+export OPENAI_API_KEY=your_openai_api_key         # optional
+export GOOGLE_API_KEY=your_google_api_key         # optional
+
+# Optional auth
+export ENGINE_CONTROL_TOKEN=your_engine_control_token
+export ENGINE_CALLBACK_TOKEN=your_engine_callback_token
+export TRACE_INGEST_TOKEN=your_trace_ingest_token
 
 # Run
 go run .
@@ -34,30 +54,60 @@ go run .
 go test ./...
 ```
 
-## DAG engine
+## HTTP API
 
-The core DAG engine (`resolution-engine/dag/`) supports:
+### POST /run
+Submit a blueprint execution request.
 
-- **Nodes** with typed executors, input/output bindings, and retry policies
-- **CEL expressions** for conditional edges and guard clauses
-- **Parallel execution** with topological scheduling
-- **Context propagation** across nodes via a flat key-value store
-- **Token usage tracking** for LLM-backed executors
+Request body:
+```json
+{
+  "app_id": 123,
+  "blueprint_json": {"id":"bp","nodes":[],"edges":[]},
+  "inputs": {"market_question":"Will BTC hit 150k?"},
+  "blueprint_path": "main",
+  "initiator": "indexer:status-transition",
+  "callback_url": "http://indexer.local/markets/123/resolution-result"
+}
+```
 
-## Executor types
+Response:
+```json
+{
+  "run_id": "...",
+  "app_id": 123,
+  "blueprint_path": "main",
+  "status": "accepted",
+  "action": "none"
+}
+```
 
-| Executor | Description |
-|---|---|
-| `llm_judge` | Sends evidence to Claude for outcome determination |
-| `api_fetch` | Fetches external data sources for evidence gathering |
-| `market_evidence` | Collects on-chain market state and trade history |
-| `human_judge` | Delegates to a designated human arbiter |
-| `ask_creator` | Requests input from the market creator |
-| `ask_market_admin` | Requests input from the market admin |
-| `outcome_terminality` | Checks if an outcome is terminal/final |
-| `defer_resolution` | Defers resolution to a later time |
-| `wait` | Pauses execution for a specified duration |
-| `submit` | Submits the resolution result on-chain |
+### GET /runs/{run_id}
+Returns live/ephemeral run state while the engine still retains the run.
+
+### DELETE /runs/{run_id}
+Requests cancellation of an in-flight run.
+
+### GET /health
+Returns service health and active run count.
+
+## Protocol notes
+
+- Engine run state is in-memory and ephemeral.
+- The indexer is the durable source of truth for orchestration.
+- Traces are observability only, not authoritative control-plane state.
+- Terminal run results are retained only for a bounded TTL.
+
+## Testing
+
+This repo keeps strong execution-service tests:
+- DAG engine tests under `resolution-engine/dag/`
+- executor tests under `resolution-engine/executors/`
+- async run manager tests in `run_manager_test.go`
+- HTTP API tests in `server_test.go`
+- trace lifecycle tests in `runner_test.go`
+
+The richer full-stack lifecycle and orchestration tests belong in the monorepo.
 
 ## License
 
