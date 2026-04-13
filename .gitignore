@@ -2,18 +2,11 @@
 .env
 .env.*
 
-# Go
-resolution-engine/resolution-engine
-resolution-engine/data/
+# Go binary
+resolution-engine
 
-# Python
-__pycache__/
-*.pyc
+# Runtime data
+data/
 
-# Blueprint state
-.blueprint-state/
-
-# Node
-node_modules/
-
+# Misc
 .hermes
