@@ -37,8 +37,6 @@ func NewRunner(llmConfig executors.LLMJudgeExecutorConfig, indexerURL string, da
 	engine.RegisterExecutor("market_evidence", executors.NewMarketEvidenceExecutor(indexerURL))
 	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutorWithConfig(llmConfig))
 	engine.RegisterExecutor("human_judge", executors.NewHumanJudgeExecutor(indexerURL))
-	engine.RegisterExecutor("ask_creator", executors.NewAskCreatorExecutor(indexerURL))
-	engine.RegisterExecutor("ask_market_admin", executors.NewAskMarketAdminExecutor(indexerURL))
 	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
 	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
 	engine.RegisterExecutor("outcome_terminality", executors.NewOutcomeTerminalityExecutor())

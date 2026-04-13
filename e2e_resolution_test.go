@@ -221,12 +221,6 @@ func newTestRunner(anthropicKey, indexerURL, dataDir string) *Runner {
 	hjExec := executors.NewHumanJudgeExecutor(indexerURL)
 	hjExec.PollInterval = 50 * time.Millisecond
 
-	acExec := executors.NewAskCreatorExecutor(indexerURL)
-	acExec.SetPollInterval(50 * time.Millisecond)
-
-	amaExec := executors.NewAskMarketAdminExecutor(indexerURL)
-	amaExec.SetPollInterval(50 * time.Millisecond)
-
 	apiFetchExec := executors.NewAPIFetchExecutor()
 	apiFetchExec.AllowLocal = true
 
@@ -235,8 +229,6 @@ func newTestRunner(anthropicKey, indexerURL, dataDir string) *Runner {
 		AnthropicAPIKey: anthropicKey,
 	}))
 	engine.RegisterExecutor("human_judge", hjExec)
-	engine.RegisterExecutor("ask_creator", acExec)
-	engine.RegisterExecutor("ask_market_admin", amaExec)
 	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
 	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
 	engine.RegisterExecutor("outcome_terminality", executors.NewOutcomeTerminalityExecutor())
