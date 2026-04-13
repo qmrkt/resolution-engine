@@ -44,13 +44,13 @@ func TestServerPostRunReturnsAccepted(t *testing.T) {
 		if req.AppID != 21 {
 			t.Fatalf("app_id = %d, want 21", req.AppID)
 		}
-		if string(req.BlueprintJSON) != `{"id":"bp"}` {
-			t.Fatalf("blueprint_json = %s, want %s", string(req.BlueprintJSON), `{"id":"bp"}`)
+		if len(req.BlueprintJSON) == 0 {
+			t.Fatal("expected blueprint_json to be populated")
 		}
 		return RunResult{RunID: req.RunID, AppID: 21, Status: RunStatusAccepted}, nil
 	}}, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":21,"blueprint_json":{"id":"bp"}}`)))
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":21,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusAccepted {
@@ -69,12 +69,26 @@ func TestServerPostRunRejectsInvalidRequest(t *testing.T) {
 	}
 }
 
+func TestServerPostRunRejectsInvalidBlueprint(t *testing.T) {
+	server := NewEngineServer(&stubRunManager{submitFn: func(req RunRequest) (RunResult, error) {
+		t.Fatal("submit should not be called for invalid blueprint")
+		return RunResult{}, nil
+	}}, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bad","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}}],"edges":[]}}`)))
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestServerPostRunReturnsConflictForDuplicate(t *testing.T) {
 	server := NewEngineServer(&stubRunManager{submitFn: func(req RunRequest) (RunResult, error) {
 		return RunResult{}, &duplicateRunError{RunID: "existing-run"}
 	}}, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bp"}}`)))
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {

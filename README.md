@@ -3,6 +3,7 @@
 Async blueprint execution service for [question.market](https://question.market).
 
 Scoped to execution only:
+
 - accepts blueprint execution requests over HTTP
 - runs DAG-based resolution logic
 - exposes async run status and cancellation
@@ -53,6 +54,8 @@ Submit a blueprint execution request.
 
 Returns `202 Accepted` with a `run_id`. Returns `409 Conflict` if the market already has an active run.
 
+Invalid blueprints are rejected with `400 Bad Request` and a list of validation issues.
+
 ### GET /runs/{run_id}
 
 Returns run state while the engine retains the run (bounded TTL).
@@ -69,27 +72,30 @@ Returns service health and active run count.
 
 The engine executes resolution blueprints as DAGs with conditional branching (CEL expressions). Each node runs a typed executor:
 
-| Executor | Description |
-|---|---|
-| `llm_judge` | Multi-provider LLM evaluation (Anthropic, OpenAI, Google) |
-| `api_fetch` | External data source fetching |
-| `market_evidence` | On-chain market state and trade history |
-| `human_judge` | Delegates to a human arbiter (configurable `allowed_responders`) |
-| `outcome_terminality` | Checks if an outcome is terminal |
-| `defer_resolution` | Defers resolution to a later time |
-| `wait` | Pauses execution for a duration |
-| `submit_result` | Marks the final outcome |
-| `cancel_market` | Marks the market for cancellation |
+
+| Executor              | Description                                                      |
+| --------------------- | ---------------------------------------------------------------- |
+| `llm_judge`           | Multi-provider LLM evaluation (Anthropic, OpenAI, Google)        |
+| `api_fetch`           | External data source fetching                                    |
+| `market_evidence`     | On-chain market state and trade history                          |
+| `human_judge`         | Delegates to a human arbiter (configurable `allowed_responders`) |
+| `outcome_terminality` | Checks if an outcome is terminal                                 |
+| `defer_resolution`    | Defers resolution to a later time                                |
+| `wait`                | Pauses execution for a duration                                  |
+| `submit_result`       | Marks the final outcome                                          |
+| `cancel_market`       | Marks the market for cancellation                                |
+
 
 Terminal results carry an action: `propose`, `finalize_dispute`, `cancel_market`, `defer`, or `none`.
 
-## Blueprint semantics, in human terms
+## Blueprint semantics
 
-A blueprint is a small directed graph of steps. Each step writes values into a shared execution context, and later steps or edges can read those values.
+A blueprint is a directed graph of steps. Each step writes values into a shared execution context, and later steps or edges can read those values.
 
 ### Inputs and context
 
 The engine seeds your request inputs into the context twice:
+
 - as plain keys like `market_question`
 - as `input.*` keys like `input.market_question`
 
@@ -110,6 +116,7 @@ Context at start:
 ```
 
 A node can then emit outputs like:
+
 - `fetch.status = success`
 - `fetch.outcome = 1`
 - `judge.reason = ...`
@@ -118,35 +125,19 @@ A node can then emit outputs like:
 
 Edges can have CEL conditions. A target node only becomes reachable if the edge condition evaluates to true.
 
-```text
-        +-----------------------------+
-        | fetch.status == 'success'   |
-        v                             |
-   [fetch] -----------------------> [submit_result]
-      |
-      | fetch.status != 'success'
-      v
-   [cancel_market]
-```
-
 Typical pattern:
 - success path goes to `submit_result`
 - failure or inconclusive path goes somewhere else (`cancel_market`, `defer_resolution`, another judge, etc.)
 
+Example conditions:
+- `fetch.status == 'success'`
+- `fetch.status != 'success'`
+- `judge.outcome != 'inconclusive' && judge.outcome != ''`
+- `wait.status == 'success'`
+
 ### Back edges and bounded loops
 
 Blueprints can loop by using a back edge. Back edges must be bounded with `max_traversals`, otherwise they are treated as exhausted.
-
-```text
-   [fetch] --success--> [submit]
-      |
-      +--retry_needed--> [wait]
-                           |
-                           | back edge
-                           | max_traversals = 3
-                           v
-                         [fetch]
-```
 
 This gives you patterns like:
 - fetch
@@ -154,90 +145,163 @@ This gives you patterns like:
 - retry fetch up to N times
 - then continue or fail
 
+Loop example from the UI:
+
+![Back edge loop example](docs/assets/back-edge-loop-example.png)
+
 The engine records edge traversal counts, so loops are explicit and inspectable.
-
-### Submit vs cancel
-
-Two terminal-style node patterns matter most:
-
-1. `submit_result`
-- marks the chosen outcome
-- sets `*.submitted = true`
-- produces an evidence hash
-- this becomes an actionable result like `propose` or `finalize_dispute`
-
-```text
-[fetch] -> [submit_result]
-             outcome_key = fetch.outcome
-```
-
-2. `cancel_market`
-- marks the run as asking for market cancellation
-- sets `*.cancelled = true`
-- carries a reason
-
-```text
-[judge] --timeout/failure--> [cancel_market]
-                               reason = "human judgment did not succeed"
-```
-
-In other words:
-- `submit_result` means "we have an outcome"
-- `cancel_market` means "this run wants the orchestrator to cancel the market"
 
 ### A small example
 
-```text
-            +------------------------------+
-            | fetch.status == 'success'    |
-            v                              |
-[start] -> [fetch] --------------------> [submit_result]
-              |
-              | fetch.status != 'success'
-              v
-            [wait]
-              |
-              | retry, max_traversals = 2
-              +---------------------------> [fetch]
+Here is a simpler workflow from the UI:
 
-If all retries fail:
+![Simple workflow example](docs/assets/simple-workflow-example.png)
 
-[fetch] -> [cancel_market]
-```
+A common pattern is:
+- gather some evidence or judgment input
+- if the result is usable, flow into `submit_result`
+- if the result is not usable, flow into `cancel_market`
 
-That should be the main mental model:
-- nodes read inputs/context
+In practice:
+
+- nodes read inputs and context
 - nodes write outputs back into context
 - edges decide where execution goes next
 - back edges allow bounded retry loops
-- `submit_result` and `cancel_market` produce the most important terminal actions
+- `submit_result` and `cancel_market` are the primary terminal actions
 
-### A more realistic example from the UI
+### A more complex example
 
-Below is a more complex blueprint from the visual editor. It combines a timing gate, evidence collection, an LLM-based decision, and multiple terminal branches.
+Below is a more complex blueprint from the visual editor. It combines a timing gate, participant evidence collection, an LLM-based judgment, and multiple terminal branches.
 
 ![Complex workflow example](docs/assets/complex-workflow-example.png)
 
-What is happening semantically:
-- `Evidence Window` is a `wait`-style gate tied to a market lifecycle moment (`43200s from resolution pending` in the screenshot)
-- if the waiting/evidence period is not over yet, the run exits through `Retry Later` using `defer_resolution`
-- once the window has closed, `Participant Evidence` gathers signed participant submissions
-- that evidence is then evaluated by an `LLM Judge`
-- if the judge is confident, the workflow reaches `Submit Result`
-- if the evidence or judgment is inconclusive, the workflow reaches `Cancel Market`
+Execution flow:
 
-The useful thing about this shape is that every branch still ends in a terminal action:
+- `Evidence Window` is a `wait` node configured with:
+  - `duration_seconds: 43200`
+  - `mode: 'defer'`
+  - `start_from: 'resolution_pending_since'`
+- while the evidence window is still open:
+  - `wait.status == 'waiting'` sends execution to `Retry Later`
+  - `wait.status == 'success'` is not yet true, so the graph does not proceed to `Participant Evidence`
+  - rerunning before the waiting period expires produces the same defer outcome rather than advancing deeper into the graph
+- once `wait.status == 'success'`, the workflow proceeds to `Participant Evidence`
+- `Participant Evidence` loads submitted evidence bundles for adjudication rather than relying only on passive market metadata
+- if that evidence bundle is successfully assembled, the workflow proceeds to `LLM Judge`
+- the `LLM Judge` either:
+  - emits a concrete outcome -> `Submit Result`
+  - emits an empty or inconclusive result -> `Cancel Market`
+- if evidence collection itself fails to produce a usable bundle, the workflow can also go directly to `Cancel Market`
+
+Every branch still ends in a terminal action:
+
 - `defer_resolution`
 - `submit_result`
 - `cancel_market`
 
-That makes the graph easy to reason about operationally: every run ends by either deferring, proposing a result, or explicitly cancelling.
+Operationally, each run ends by either deferring, proposing a result, or explicitly cancelling.
 
-You can think of it as a richer version of the smaller examples above:
-- inputs still enter through the shared execution context
-- edges are still conditional
-- terminals are still `submit_result`, `cancel_market`, or `defer_resolution`
-- the only difference is that the graph has more than one decision point
+<details>
+<summary>Show the blueprint JSON for this UI example</summary>
+
+```json
+{
+  "id": "participant-evidence-llm",
+  "name": "Participant Evidence + LLM",
+  "description": "Wait for the evidence window to close, load participant submissions, then judge with an LLM.",
+  "nodes": [
+    {
+      "id": "wait",
+      "type": "wait",
+      "label": "Evidence Window",
+      "config": {
+        "duration_seconds": 43200,
+        "mode": "defer",
+        "start_from": "resolution_pending_since"
+      }
+    },
+    {
+      "id": "defer",
+      "type": "defer_resolution",
+      "label": "Retry Later",
+      "config": {
+        "reason": "Evidence window still open"
+      }
+    },
+    {
+      "id": "evidence",
+      "type": "market_evidence",
+      "label": "Participant Evidence",
+      "config": {}
+    },
+    {
+      "id": "judge",
+      "type": "llm_judge",
+      "label": "LLM Judge",
+      "config": {
+        "prompt": "Question: {{market.question}}\nOutcomes: {{market.outcomes.indexed}}\nParticipant evidence count: {{evidence.count}}\nClaimed outcome summary: {{evidence.claimed_summary}}\n\nParticipant evidence entries JSON:\n{{evidence.entries_json}}\n\nUse the participant evidence bundle to determine the correct outcome index. If the evidence is insufficient or contradictory, return inconclusive.",
+        "model": "claude-sonnet-4-6",
+        "timeout_seconds": 60
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit",
+      "config": {
+        "outcome_key": "judge.outcome"
+      }
+    },
+    {
+      "id": "cancel",
+      "type": "cancel_market",
+      "label": "Cancel",
+      "config": {
+        "reason": "Participant evidence judge was inconclusive"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "wait",
+      "to": "defer",
+      "condition": "wait.status == 'waiting'"
+    },
+    {
+      "from": "wait",
+      "to": "evidence",
+      "condition": "wait.status == 'success'"
+    },
+    {
+      "from": "evidence",
+      "to": "judge",
+      "condition": "evidence.status == 'success'"
+    },
+    {
+      "from": "evidence",
+      "to": "cancel",
+      "condition": "evidence.status != 'success'"
+    },
+    {
+      "from": "judge",
+      "to": "submit",
+      "condition": "judge.outcome != 'inconclusive' && judge.outcome != ''"
+    },
+    {
+      "from": "judge",
+      "to": "cancel",
+      "condition": "judge.outcome == 'inconclusive' || judge.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 172800,
+    "max_total_tokens": 120000
+  }
+}
+```
+
+</details>
 
 ## Design notes
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/question-market/resolution-engine/dag"
 )
 
 type RunManagerAPI interface {
@@ -66,6 +67,18 @@ func (s *EngineServer) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if payload.AppID <= 0 || len(payload.BlueprintJSON) == 0 {
 		http.Error(w, "app_id and blueprint_json are required", http.StatusBadRequest)
+		return
+	}
+	var blueprint dag.Blueprint
+	if err := json.Unmarshal(payload.BlueprintJSON, &blueprint); err != nil {
+		http.Error(w, "blueprint_json must be a valid blueprint object", http.StatusBadRequest)
+		return
+	}
+	validation := ValidateResolutionBlueprint(blueprint, payload.BlueprintJSON)
+	if !validation.Valid {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(validation)
 		return
 	}
 	if payload.Inputs == nil {
