@@ -8,29 +8,45 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/question-market/resolution-engine/dag"
 )
 
+type APIFetchBasicAuth struct {
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 // APIFetchConfig is the node config for api_fetch steps.
 type APIFetchConfig struct {
-	URL             string            `json:"url"`
-	Method          string            `json:"method,omitempty"` // default GET
-	Headers         map[string]string `json:"headers,omitempty"`
-	JSONPath        string            `json:"json_path"`        // dot-notation path to extract value
-	OutcomeMapping  map[string]string `json:"outcome_mapping"`  // extracted_value → outcome_index
-	TimeoutSeconds  int               `json:"timeout_seconds,omitempty"`
+	URL            string             `json:"url"`
+	Method         string             `json:"method,omitempty"` // default GET
+	Headers        map[string]string  `json:"headers,omitempty"`
+	Body           string             `json:"body,omitempty"`
+	BasicAuth      *APIFetchBasicAuth `json:"basic_auth,omitempty"`
+	JSONPath       string             `json:"json_path,omitempty"` // dot-notation path to extract value; empty returns raw body
+	OutcomeMapping map[string]string  `json:"outcome_mapping"`     // extracted_value → outcome_index
+	TimeoutSeconds int                `json:"timeout_seconds,omitempty"`
 }
 
 // APIFetchExecutor fetches a URL, extracts a value via JSONPath, and maps it to an outcome.
 type APIFetchExecutor struct {
-	Client      *http.Client
-	AllowLocal  bool // For testing only — allows localhost URLs
+	Client     *http.Client
+	AllowLocal bool // For testing only — allows localhost URLs
 }
 
 const maxResponseBytes int64 = 10 << 20 // 10 MB
+
+var supportedAPIFetchMethods = map[string]struct{}{
+	http.MethodDelete: {},
+	http.MethodGet:    {},
+	http.MethodPatch:  {},
+	http.MethodPost:   {},
+	http.MethodPut:    {},
+}
 
 func NewAPIFetchExecutor() *APIFetchExecutor {
 	return &APIFetchExecutor{
@@ -54,6 +70,17 @@ func newSafeClient() *http.Client {
 			return nil
 		},
 	}
+}
+
+func NormalizeAPIFetchMethod(method string) (string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(method))
+	if normalized == "" {
+		normalized = http.MethodGet
+	}
+	if _, ok := supportedAPIFetchMethods[normalized]; !ok {
+		return "", fmt.Errorf("unsupported method %q", method)
+	}
+	return normalized, nil
 }
 
 // safeDialContext rejects connections to private/loopback/link-local IPs at connect time,
@@ -91,9 +118,9 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	}
 
 	rawURL := execCtx.Interpolate(cfg.URL)
-	method := cfg.Method
-	if method == "" {
-		method = "GET"
+	method, err := NormalizeAPIFetchMethod(cfg.Method)
+	if err != nil {
+		return dag.ExecutorResult{}, fmt.Errorf("api_fetch config: %w", err)
 	}
 
 	// SSRF prevention: block private/loopback/link-local addresses
@@ -114,9 +141,18 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, nil)
+	requestBody := execCtx.Interpolate(cfg.Body)
+	var bodyReader io.Reader
+	if requestBody != "" {
+		bodyReader = strings.NewReader(requestBody)
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, method, rawURL, bodyReader)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("create request: %w", err)
+	}
+	if cfg.BasicAuth != nil {
+		req.SetBasicAuth(execCtx.Interpolate(cfg.BasicAuth.Username), execCtx.Interpolate(cfg.BasicAuth.Password))
 	}
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, execCtx.Interpolate(v))
@@ -132,11 +168,11 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{"status": "failed", "error": err.Error()}}, nil
 	}
-	if int64(len(body)) > maxResponseBytes {
+	if int64(len(responseBody)) > maxResponseBytes {
 		return dag.ExecutorResult{Outputs: map[string]string{
 			"status": "failed",
 			"error":  "response body exceeded 10 MB limit",
@@ -145,14 +181,17 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return dag.ExecutorResult{Outputs: map[string]string{
-			"status":      "failed",
-			"error":       fmt.Sprintf("HTTP %d", resp.StatusCode),
-			"response":    string(body),
+			"status":       "failed",
+			"error":        fmt.Sprintf("HTTP %d", resp.StatusCode),
+			"status_code":  strconv.Itoa(resp.StatusCode),
+			"content_type": resp.Header.Get("Content-Type"),
+			"response":     string(responseBody),
+			"raw":          string(responseBody),
 		}}, nil
 	}
 
 	// Extract value via dot-notation JSONPath
-	extracted, err := jsonPathExtract(body, cfg.JSONPath)
+	extracted, err := jsonPathExtract(responseBody, cfg.JSONPath)
 	if err != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{
 			"status": "failed",
@@ -170,10 +209,12 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	}
 
 	return dag.ExecutorResult{Outputs: map[string]string{
-		"status":    "success",
-		"extracted": extracted,
-		"outcome":   outcome,
-		"raw":       string(body),
+		"status":       "success",
+		"status_code":  strconv.Itoa(resp.StatusCode),
+		"content_type": resp.Header.Get("Content-Type"),
+		"extracted":    extracted,
+		"outcome":      outcome,
+		"raw":          string(responseBody),
 	}}, nil
 }
 

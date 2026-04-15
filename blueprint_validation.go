@@ -290,8 +290,13 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 				add("API_URL_INVALID", fmt.Sprintf("Node %q needs a valid absolute URL.", displayNode(node)))
 			}
 		}
-		if strings.TrimSpace(cfg.JSONPath) == "" {
-			add("API_JSON_PATH_REQUIRED", fmt.Sprintf("Node %q needs a JSON path.", displayNode(node)))
+		if strings.TrimSpace(cfg.Method) != "" {
+			if _, err := executors.NormalizeAPIFetchMethod(cfg.Method); err != nil {
+				add("API_METHOD_INVALID", fmt.Sprintf("Node %q uses an unsupported HTTP method.", displayNode(node)))
+			}
+		}
+		if cfg.TimeoutSeconds < 0 {
+			add("API_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a non-negative timeout.", displayNode(node)))
 		}
 	case "llm_judge":
 		cfg, err := parseConfigForValidation[executors.LLMJudgeConfig](node.Config)

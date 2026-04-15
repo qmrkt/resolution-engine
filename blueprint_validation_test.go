@@ -133,3 +133,35 @@ func TestValidateResolutionBlueprintAcceptsLLMJudgeAllowedOutcomesKey(t *testing
 		t.Fatalf("expected valid blueprint, got issues: %+v", result.Issues)
 	}
 }
+
+func TestValidateResolutionBlueprintAcceptsAPIFetchWithoutJSONPath(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"api-raw",
+	  "version":1,
+	  "nodes":[
+	    {"id":"fetch","type":"api_fetch","config":{"url":"https://example.com","method":"POST","body":"hello"}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"fetch.outcome"}}
+	  ],
+	  "edges":[{"from":"fetch","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid raw api_fetch blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsUnsupportedAPIFetchMethod(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"api-method-invalid",
+	  "version":1,
+	  "nodes":[
+	    {"id":"fetch","type":"api_fetch","config":{"url":"https://example.com","method":"TRACE"}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"fetch.outcome"}}
+	  ],
+	  "edges":[{"from":"fetch","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected unsupported method blueprint to be invalid")
+	}
+}

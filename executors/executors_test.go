@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -104,6 +105,142 @@ func TestAPIFetchWithInterpolation(t *testing.T) {
 	}
 	if result.Outputs["extracted"] != "yes" {
 		t.Fatalf("expected yes, got %q", result.Outputs["extracted"])
+	}
+}
+
+func TestAPIFetchPostWithHeadersAndBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if r.Header.Get("X-API-Key") != "secret-123" {
+			t.Fatalf("expected X-API-Key header, got %q", r.Header.Get("X-API-Key"))
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("expected application/json content type, got %q", r.Header.Get("Content-Type"))
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if string(body) != `{"question":"Will BTC hit 100k?"}` {
+			t.Fatalf("unexpected body %q", string(body))
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{"result": "ok"})
+	}))
+	defer server.Close()
+
+	exec := &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true}
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]any{
+			"url":       server.URL,
+			"method":    "post",
+			"body":      `{"question":"{{market_question}}"}`,
+			"json_path": "result",
+			"headers": map[string]string{
+				"Content-Type": "application/json",
+				"X-API-Key":    "{{api_key}}",
+			},
+		},
+	}
+
+	ctx := dag.NewContext(map[string]string{
+		"market_question": "Will BTC hit 100k?",
+		"api_key":         "secret-123",
+	})
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("expected success, got %s", result.Outputs["status"])
+	}
+	if result.Outputs["extracted"] != "ok" {
+		t.Fatalf("expected extracted=ok, got %q", result.Outputs["extracted"])
+	}
+	if result.Outputs["status_code"] != "200" {
+		t.Fatalf("expected status_code=200, got %q", result.Outputs["status_code"])
+	}
+}
+
+func TestAPIFetchBasicAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			t.Fatal("expected basic auth credentials")
+		}
+		if username != "resolver" || password != "s3cr3t" {
+			t.Fatalf("unexpected credentials %q / %q", username, password)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"result": "authorized"})
+	}))
+	defer server.Close()
+
+	exec := &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true}
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]any{
+			"url":       server.URL,
+			"json_path": "result",
+			"basic_auth": map[string]string{
+				"username": "{{api_user}}",
+				"password": "{{api_password}}",
+			},
+		},
+	}
+
+	ctx := dag.NewContext(map[string]string{
+		"api_user":     "resolver",
+		"api_password": "s3cr3t",
+	})
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["extracted"] != "authorized" {
+		t.Fatalf("expected authorized, got %q", result.Outputs["extracted"])
+	}
+}
+
+func TestAPIFetchRawTextResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, "Yes")
+	}))
+	defer server.Close()
+
+	exec := &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true}
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]any{
+			"url": server.URL,
+			"outcome_mapping": map[string]string{
+				"Yes": "0",
+			},
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("expected success, got %s", result.Outputs["status"])
+	}
+	if result.Outputs["extracted"] != "Yes" {
+		t.Fatalf("expected raw extracted value, got %q", result.Outputs["extracted"])
+	}
+	if result.Outputs["outcome"] != "0" {
+		t.Fatalf("expected mapped outcome=0, got %q", result.Outputs["outcome"])
+	}
+	if !strings.Contains(result.Outputs["content_type"], "text/plain") {
+		t.Fatalf("expected text/plain content type, got %q", result.Outputs["content_type"])
 	}
 }
 
