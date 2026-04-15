@@ -1,0 +1,54 @@
+{
+  "id": "objective-api-resolution",
+  "name": "Objective API Resolution",
+  "description": "Resolve from one canonical API response and cancel if it does not produce a valid outcome.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "fetch",
+      "type": "api_fetch",
+      "label": "Fetch Canonical Source",
+      "config": {
+        "url": "https://api.example.com/markets/{{market.id}}/resolution",
+        "method": "GET",
+        "json_path": "data.outcome",
+        "outcome_mapping": {
+          "YES": "0",
+          "NO": "1"
+        },
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit Outcome",
+      "config": {
+        "outcome_key": "fetch.outcome"
+      }
+    },
+    {
+      "id": "cancel",
+      "type": "cancel_market",
+      "label": "Cancel",
+      "config": {
+        "reason": "The canonical API did not produce a valid mapped outcome."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "fetch",
+      "to": "submit",
+      "condition": "fetch.status == 'success' && fetch.outcome != ''"
+    },
+    {
+      "from": "fetch",
+      "to": "cancel",
+      "condition": "fetch.status != 'success' || fetch.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 1800
+  }
+}

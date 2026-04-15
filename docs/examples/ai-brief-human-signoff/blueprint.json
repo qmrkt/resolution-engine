@@ -1,0 +1,91 @@
+{
+  "id": "ai-brief-human-signoff",
+  "name": "AI Brief + Human Signoff",
+  "description": "An agent prepares a concise evidence brief, then a human resolver signs the final outcome signal.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "brief",
+      "type": "agent_loop",
+      "label": "Prepare Evidence Brief",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "output_mode": "structured",
+        "max_steps": 7,
+        "max_tool_calls": 10,
+        "prompt": "Prepare a human-reviewable evidence brief for this market.\n\nQuestion: {{market.question}}\nRules: {{market.resolution_rules}}\nOutcomes JSON: {{market.outcomes_json}}\nSuggested sources JSON: {{market.sources_json}}\n\nDo not make the final decision. Summarize evidence, likely outcome, citations, and unresolved issues.",
+        "tools": [
+          { "name": "source_fetch", "kind": "builtin" },
+          { "name": "json_extract", "kind": "builtin" },
+          { "name": "context_get", "kind": "builtin" }
+        ],
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "brief": { "type": "string" },
+              "likely_outcome": { "type": "integer" },
+              "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+              "citations": { "type": "array", "items": { "type": "string" } },
+              "open_questions": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["brief", "likely_outcome", "confidence", "citations", "open_questions"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "human",
+      "type": "await_signal",
+      "label": "Human Signoff",
+      "config": {
+        "signal_type": "human_judgment.responded",
+        "required_payload": ["outcome", "reason"],
+        "default_outputs": {
+          "status": "responded"
+        },
+        "timeout_outputs": {
+          "status": "timeout",
+          "outcome": "inconclusive"
+        },
+        "timeout_seconds": 172800,
+        "reason": "Waiting for human resolver signoff."
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit Human Outcome",
+      "config": {
+        "outcome_key": "human.outcome"
+      }
+    },
+    {
+      "id": "defer",
+      "type": "defer_resolution",
+      "label": "Defer",
+      "config": {
+        "reason": "Human resolver has not signed off yet."
+      }
+    }
+  ],
+  "edges": [
+    { "from": "brief", "to": "human" },
+    {
+      "from": "human",
+      "to": "submit",
+      "condition": "human.status == 'responded' && human.outcome != '' && human.outcome != 'inconclusive'"
+    },
+    {
+      "from": "human",
+      "to": "defer",
+      "condition": "human.status != 'responded' || human.outcome == 'inconclusive' || human.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 259200,
+    "max_total_tokens": 120000
+  }
+}

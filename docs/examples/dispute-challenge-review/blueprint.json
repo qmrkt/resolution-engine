@@ -1,0 +1,122 @@
+{
+  "id": "dispute-challenge-review",
+  "name": "Dispute Challenge Review",
+  "description": "Review a challenged resolution and either reaffirm, cancel, or defer to an admin signal.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "review",
+      "type": "agent_loop",
+      "label": "Challenge Reviewer",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "output_mode": "structured",
+        "reasoning": "medium",
+        "max_steps": 7,
+        "max_tool_calls": 10,
+        "prompt": "Review this market challenge. Decide whether the original proposed resolution should be reaffirmed, the market should be cancelled, or the dispute should be escalated to a human admin.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nProposed outcome: {{dispute.proposed_outcome}}\nProposer evidence: {{dispute.proposer_evidence}}\nChallenge evidence: {{dispute.challenge_evidence}}\n\nUse tools if source verification is needed. Be conservative: escalate if the dispute is credible and cannot be resolved from available evidence.",
+        "tools": [
+          { "name": "source_fetch", "kind": "builtin" },
+          { "name": "json_extract", "kind": "builtin" },
+          { "name": "context_get", "kind": "builtin" }
+        ],
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "decision": { "type": "string", "enum": ["reaffirm", "cancel", "escalate"] },
+              "outcome": { "type": "integer" },
+              "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+              "reasoning": { "type": "string" },
+              "citations": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["decision", "confidence", "reasoning"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "id": "admin",
+      "type": "await_signal",
+      "label": "Admin Fallback",
+      "config": {
+        "signal_type": "market_admin.dispute_ruling",
+        "required_payload": ["outcome", "reason"],
+        "default_outputs": {
+          "status": "responded"
+        },
+        "timeout_outputs": {
+          "status": "timeout",
+          "outcome": "inconclusive"
+        },
+        "timeout_seconds": 604800,
+        "reason": "Waiting for market admin dispute ruling."
+      }
+    },
+    {
+      "id": "submit_review",
+      "type": "submit_result",
+      "label": "Submit Reviewed Outcome",
+      "config": {
+        "outcome_key": "review.output.outcome"
+      }
+    },
+    {
+      "id": "submit_admin",
+      "type": "submit_result",
+      "label": "Submit Admin Outcome",
+      "config": {
+        "outcome_key": "admin.outcome"
+      }
+    },
+    {
+      "id": "cancel_review",
+      "type": "cancel_market",
+      "label": "Cancel From Review",
+      "config": {
+        "reason": "The dispute review found the market unresolved or invalid."
+      }
+    },
+    {
+      "id": "cancel_admin",
+      "type": "cancel_market",
+      "label": "Cancel From Admin Timeout",
+      "config": {
+        "reason": "The admin fallback did not produce a usable dispute ruling."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "review",
+      "to": "submit_review",
+      "condition": "review.output.decision == 'reaffirm'"
+    },
+    {
+      "from": "review",
+      "to": "cancel_review",
+      "condition": "review.output.decision == 'cancel'"
+    },
+    {
+      "from": "review",
+      "to": "admin",
+      "condition": "review.output.decision == 'escalate' || review.status != 'success'"
+    },
+    {
+      "from": "admin",
+      "to": "submit_admin",
+      "condition": "admin.status == 'responded' && admin.outcome != '' && admin.outcome != 'inconclusive'"
+    },
+    {
+      "from": "admin",
+      "to": "cancel_admin",
+      "condition": "admin.status != 'responded' || admin.outcome == 'inconclusive' || admin.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 691200,
+    "max_total_tokens": 120000
+  }
+}

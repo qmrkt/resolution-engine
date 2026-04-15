@@ -1,0 +1,171 @@
+{
+  "id": "verify-official-result",
+  "name": "Verify Official Result",
+  "description": "Resolve a sports or event-result market through a constrained agent-facing tool backed by an official API blueprint.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "resolver",
+      "type": "agent_loop",
+      "label": "Result Resolver",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "output_mode": "resolution",
+        "allowed_outcomes_key": "market.outcomes_json",
+        "max_steps": 5,
+        "max_tool_calls": 4,
+        "prompt": "Resolve this market using the verify_official_result tool. Do not fetch arbitrary sources.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nGame ID: {{market.official_game_id}}\nHome team: {{market.home_team}}\nAway team: {{market.away_team}}\n\nIf the official result is not final, or the tool cannot verify the result, return inconclusive.",
+        "tools": [
+          {
+            "name": "context_get",
+            "kind": "builtin"
+          },
+          {
+            "name": "verify_official_result",
+            "kind": "blueprint",
+            "description": "Verify the final score and winner from the approved official result endpoint for one game.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "game_id": {
+                  "type": "string",
+                  "description": "Official game or event id."
+                }
+              },
+              "required": ["game_id"],
+              "additionalProperties": false
+            },
+            "input_mappings": {
+              "game_id": "$args.game_id"
+            },
+            "output_keys": [
+              "status_check.extracted",
+              "home_score.extracted",
+              "away_score.extracted",
+              "winner.outcome",
+              "winner.extracted",
+              "summary.final",
+              "summary.source_url"
+            ],
+            "timeout_seconds": 30,
+            "inline": {
+              "id": "verify-official-result-tool",
+              "version": 1,
+              "nodes": [
+                {
+                  "id": "status_check",
+                  "type": "api_fetch",
+                  "config": {
+                    "url": "https://api.example.com/official-results/{{game_id}}",
+                    "method": "GET",
+                    "json_path": "data.status",
+                    "timeout_seconds": 20
+                  }
+                },
+                {
+                  "id": "home_score",
+                  "type": "api_fetch",
+                  "config": {
+                    "url": "https://api.example.com/official-results/{{game_id}}",
+                    "method": "GET",
+                    "json_path": "data.home_score",
+                    "timeout_seconds": 20
+                  }
+                },
+                {
+                  "id": "away_score",
+                  "type": "api_fetch",
+                  "config": {
+                    "url": "https://api.example.com/official-results/{{game_id}}",
+                    "method": "GET",
+                    "json_path": "data.away_score",
+                    "timeout_seconds": 20
+                  }
+                },
+                {
+                  "id": "winner",
+                  "type": "api_fetch",
+                  "config": {
+                    "url": "https://api.example.com/official-results/{{game_id}}",
+                    "method": "GET",
+                    "json_path": "data.winner",
+                    "outcome_mapping": {
+                      "HOME": "0",
+                      "AWAY": "1",
+                      "DRAW": "2"
+                    },
+                    "timeout_seconds": 20
+                  }
+                },
+                {
+                  "id": "summary",
+                  "type": "cel_eval",
+                  "config": {
+                    "expressions": {
+                      "final": "status_check.extracted == 'FINAL'",
+                      "source_url": "'https://api.example.com/official-results/' + game_id"
+                    }
+                  }
+                }
+              ],
+              "edges": [
+                {
+                  "from": "status_check",
+                  "to": "summary"
+                },
+                {
+                  "from": "home_score",
+                  "to": "summary"
+                },
+                {
+                  "from": "away_score",
+                  "to": "summary"
+                },
+                {
+                  "from": "winner",
+                  "to": "summary"
+                }
+              ],
+              "budget": {
+                "max_total_time_seconds": 30
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit Official Result",
+      "config": {
+        "outcome_key": "resolver.outcome"
+      }
+    },
+    {
+      "id": "cancel",
+      "type": "cancel_market",
+      "label": "Cancel",
+      "config": {
+        "reason": "The official result tool did not produce a final verified outcome."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "resolver",
+      "to": "submit",
+      "condition": "resolver.status == 'success' && resolver.outcome != 'inconclusive' && resolver.outcome != ''"
+    },
+    {
+      "from": "resolver",
+      "to": "cancel",
+      "condition": "resolver.outcome == 'inconclusive' || resolver.status != 'success'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 1800,
+    "max_total_tokens": 60000
+  }
+}

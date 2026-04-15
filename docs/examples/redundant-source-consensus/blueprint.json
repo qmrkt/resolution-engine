@@ -1,0 +1,110 @@
+{
+  "id": "redundant-source-consensus",
+  "name": "Redundant Source Consensus",
+  "description": "Fetch multiple configured sources, let an agent compare them, and resolve only when the evidence is coherent.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "fetch_sources",
+      "type": "map",
+      "label": "Fetch Sources",
+      "config": {
+        "items_key": "market.sources_json",
+        "batch_size": 1,
+        "max_concurrency": 4,
+        "on_error": "continue",
+        "output_keys": [
+          "fetch.status",
+          "fetch.outcome",
+          "fetch.extracted",
+          "fetch.raw"
+        ],
+        "inline": {
+          "id": "fetch-one-source",
+          "version": 1,
+          "nodes": [
+            {
+              "id": "fetch",
+              "type": "api_fetch",
+              "config": {
+                "url": "{{source_url}}",
+                "method": "GET",
+                "json_path": "data.outcome",
+                "outcome_mapping": {
+                  "YES": "0",
+                  "NO": "1"
+                },
+                "timeout_seconds": 20
+              }
+            }
+          ],
+          "edges": []
+        },
+        "input_mappings": {
+          "source_url": "market.source_url"
+        }
+      }
+    },
+    {
+      "id": "consensus",
+      "type": "agent_loop",
+      "label": "Consensus Judge",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "output_mode": "resolution",
+        "allowed_outcomes_key": "market.outcomes_json",
+        "max_steps": 4,
+        "max_tool_calls": 6,
+        "prompt": "Resolve this prediction market only if the fetched sources are mutually consistent.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nSource fetch results JSON: {{fetch_sources.results_json}}\n\nIf sources conflict, are missing, or do not support any outcome, return inconclusive.",
+        "tools": [
+          {
+            "name": "context_get",
+            "kind": "builtin"
+          },
+          {
+            "name": "json_extract",
+            "kind": "builtin"
+          }
+        ]
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit Consensus",
+      "config": {
+        "outcome_key": "consensus.outcome"
+      }
+    },
+    {
+      "id": "cancel",
+      "type": "cancel_market",
+      "label": "Cancel",
+      "config": {
+        "reason": "Configured sources did not reach a coherent outcome."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "fetch_sources",
+      "to": "consensus",
+      "condition": "fetch_sources.status == 'success'"
+    },
+    {
+      "from": "consensus",
+      "to": "submit",
+      "condition": "consensus.status == 'success' && consensus.outcome != 'inconclusive' && consensus.outcome != ''"
+    },
+    {
+      "from": "consensus",
+      "to": "cancel",
+      "condition": "consensus.outcome == 'inconclusive' || consensus.status != 'success'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 2400,
+    "max_total_tokens": 80000
+  }
+}

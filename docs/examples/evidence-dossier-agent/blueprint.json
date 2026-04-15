@@ -1,0 +1,74 @@
+{
+  "id": "evidence-dossier-agent",
+  "name": "Evidence Dossier Agent",
+  "description": "A tool-using agent gathers public evidence, extracts relevant facts, and records a structured market resolution.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "resolver",
+      "type": "agent_loop",
+      "label": "Evidence Resolver",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "output_mode": "resolution",
+        "allowed_outcomes_key": "market.outcomes_json",
+        "reasoning": "medium",
+        "max_steps": 8,
+        "max_tool_calls": 14,
+        "max_tool_result_bytes": 12000,
+        "prompt": "Resolve the prediction market using primary or high-quality public evidence.\n\nQuestion: {{market.question}}\nResolution rules: {{market.resolution_rules}}\nOutcomes JSON: {{market.outcomes_json}}\nSuggested sources JSON: {{market.sources_json}}\n\nUse tools to inspect context and fetch suggested sources. Prefer primary sources. If evidence is insufficient or conflicting, return inconclusive.",
+        "tools": [
+          {
+            "name": "context_get",
+            "kind": "builtin"
+          },
+          {
+            "name": "context_list",
+            "kind": "builtin"
+          },
+          {
+            "name": "source_fetch",
+            "kind": "builtin"
+          },
+          {
+            "name": "json_extract",
+            "kind": "builtin"
+          }
+        ]
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "label": "Submit Resolution",
+      "config": {
+        "outcome_key": "resolver.outcome"
+      }
+    },
+    {
+      "id": "cancel",
+      "type": "cancel_market",
+      "label": "Cancel",
+      "config": {
+        "reason": "The evidence resolver was inconclusive."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "resolver",
+      "to": "submit",
+      "condition": "resolver.status == 'success' && resolver.outcome != 'inconclusive' && resolver.outcome != ''"
+    },
+    {
+      "from": "resolver",
+      "to": "cancel",
+      "condition": "resolver.outcome == 'inconclusive' || resolver.status != 'success'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 1800,
+    "max_total_tokens": 120000
+  }
+}
