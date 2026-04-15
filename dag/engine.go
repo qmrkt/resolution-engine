@@ -378,8 +378,10 @@ func (e *Engine) runStateMachine(
 				run.EdgeTraversals = scheduler.TraversalSnapshot()
 				activated[edge.To] = struct{}{}
 
-				// If target was already completed (back-edge), reset it
+				// If target was already completed (back-edge), snapshot its
+				// outputs into _runs history before resetting.
 				if _, wasCompleted := completed[edge.To]; wasCompleted {
+					execCtx.AppendNodeHistory(edge.To)
 					delete(completed, edge.To)
 					state := run.NodeStates[edge.To]
 					state.Status = "pending"

@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 )
@@ -63,6 +64,56 @@ func (c *Context) Snapshot() map[string]string {
 // ValuesForEval returns a copy for expression evaluation.
 func (c *Context) ValuesForEval() map[string]string {
 	return c.Snapshot()
+}
+
+// SnapshotNode returns all output keys for a node as a flat map.
+// Keys are returned without the node ID prefix (e.g. "status", not "fetch.status").
+func (c *Context) SnapshotNode(nodeID string) map[string]string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	prefix := nodeID + "."
+	snap := make(map[string]string)
+	for k, v := range c.values {
+		if strings.HasPrefix(k, prefix) {
+			field := strings.TrimPrefix(k, prefix)
+			if field == "_runs" {
+				continue
+			}
+			snap[field] = v
+		}
+	}
+	return snap
+}
+
+// AppendNodeHistory snapshots the current outputs for nodeID and appends
+// them to the nodeID._runs context key as a JSON array. Each entry is
+// the output map from one execution of the node.
+func (c *Context) AppendNodeHistory(nodeID string) {
+	if c == nil {
+		return
+	}
+	snap := c.SnapshotNode(nodeID)
+	if len(snap) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	runsKey := nodeID + "._runs"
+	var history []map[string]string
+	if existing := c.values[runsKey]; existing != "" {
+		_ = json.Unmarshal([]byte(existing), &history)
+	}
+	history = append(history, snap)
+	encoded, err := json.Marshal(history)
+	if err != nil {
+		return
+	}
+	c.values[runsKey] = string(encoded)
 }
 
 // Interpolate replaces {{key}} placeholders with context values.

@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,6 +11,9 @@ import (
 )
 
 // EvalCondition evaluates a CEL expression against context values.
+// String values that are valid JSON arrays, objects, numbers, or booleans
+// are passed to CEL with their native types so expressions like
+// fetch._runs.size() or fetch._runs[0].status work naturally.
 func EvalCondition(expression string, ctx *Context) (bool, error) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" {
@@ -18,15 +22,26 @@ func EvalCondition(expression string, ctx *Context) (bool, error) {
 
 	values := ctx.ValuesForEval()
 
+	// Parse string values into native types where possible.
+	activation := make(map[string]any, len(values))
+	for k, v := range values {
+		activation[k] = inferTypedValue(v)
+	}
+
 	varDecls := make([]cel.EnvOption, 0, len(values)+8)
-	for k := range values {
-		varDecls = append(varDecls, cel.Variable(k, cel.StringType))
+	for k, v := range activation {
+		varDecls = append(varDecls, cel.Variable(k, inferCELType(v)))
 	}
 
 	// Declare identifiers in the expression that aren't in values.
+	// Skip identifiers that are sub-paths of an existing map or list variable
+	// (e.g. don't declare "judge.details.outcome" when "judge.details" is a map).
 	for _, ident := range extractIdentifiers(expression, values) {
+		if isSubpathOfStructuredVar(ident, activation) {
+			continue
+		}
 		varDecls = append(varDecls, cel.Variable(ident, cel.StringType))
-		values[ident] = ""
+		activation[ident] = ""
 	}
 
 	env, err := cel.NewEnv(varDecls...)
@@ -44,17 +59,52 @@ func EvalCondition(expression string, ctx *Context) (bool, error) {
 		return false, fmt.Errorf("cel program: %w", err)
 	}
 
-	activation := make(map[string]any, len(values))
-	for k, v := range values {
-		activation[k] = v
-	}
-
 	out, _, err := prog.Eval(activation)
 	if err != nil {
 		return false, fmt.Errorf("cel eval: %w", err)
 	}
 
 	return celToBool(out), nil
+}
+
+// inferTypedValue attempts to parse a string as a JSON array or object.
+// Scalars (numbers, booleans) are left as strings because executor outputs
+// are map[string]string and values like "0" or "true" are intended as
+// string comparands in edge conditions.
+func inferTypedValue(s string) any {
+	if s == "" {
+		return s
+	}
+	first := s[0]
+	if first != '[' && first != '{' {
+		return s
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+		return s
+	}
+	switch parsed.(type) {
+	case []any, map[string]any:
+		return parsed
+	default:
+		return s
+	}
+}
+
+// inferCELType returns the CEL type declaration for a Go value.
+func inferCELType(v any) *cel.Type {
+	switch v.(type) {
+	case []any:
+		return cel.ListType(cel.DynType)
+	case map[string]any:
+		return cel.MapType(cel.StringType, cel.DynType)
+	case float64:
+		return cel.DoubleType
+	case bool:
+		return cel.BoolType
+	default:
+		return cel.StringType
+	}
 }
 
 func celToBool(val ref.Val) bool {
@@ -119,6 +169,27 @@ func extractIdentifiers(expression string, known map[string]string) []string {
 	}
 
 	return result
+}
+
+// isSubpathOfStructuredVar returns true if ident is a dotted extension of
+// an existing activation key whose value is a map or list. For example,
+// "judge.details.outcome" is a sub-path of "judge.details" if that key
+// holds a map. In that case CEL should resolve .outcome as field access
+// rather than treating the whole thing as a variable name.
+func isSubpathOfStructuredVar(ident string, activation map[string]any) bool {
+	for i := len(ident) - 1; i > 0; i-- {
+		if ident[i] != '.' {
+			continue
+		}
+		prefix := ident[:i]
+		if v, ok := activation[prefix]; ok {
+			switch v.(type) {
+			case map[string]any, []any:
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isReserved(token string) bool {

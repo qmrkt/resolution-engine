@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -760,5 +761,137 @@ func TestTokenBudgetExceededFailsRun(t *testing.T) {
 	}
 	if run.NodeStates["judge"].Status != "failed" {
 		t.Fatalf("expected judge failed, got %s", run.NodeStates["judge"].Status)
+	}
+}
+
+func TestBackEdgeSnapshotsNodeHistory(t *testing.T) {
+	engine := NewEngine(slog.Default())
+	counter := &loopCountingExecutor{}
+	engine.RegisterExecutor("step", counter)
+
+	bp := Blueprint{
+		ID: "test-history",
+		Nodes: []NodeDef{
+			{ID: "a", Type: "step"},
+			{ID: "b", Type: "step"},
+		},
+		Edges: []EdgeDef{
+			{From: "a", To: "b"},
+			{From: "b", To: "a", MaxTraversals: 2},
+		},
+	}
+
+	run, err := engine.Execute(context.Background(), bp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("expected completed, got %s", run.Status)
+	}
+
+	// "a" is reset twice via back-edge, so a._runs should have 2 entries
+	// (snapshots from iterations 1 and 2; iteration 3 is the final value).
+	runsJSON := run.Context["a._runs"]
+	if runsJSON == "" {
+		t.Fatal("expected a._runs in context")
+	}
+	var history []map[string]string
+	if err := json.Unmarshal([]byte(runsJSON), &history); err != nil {
+		t.Fatalf("failed to parse a._runs: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("expected 2 history entries for a, got %d: %s", len(history), runsJSON)
+	}
+	if history[0]["count"] != "1" {
+		t.Fatalf("expected first history count=1, got %q", history[0]["count"])
+	}
+	if history[1]["count"] != "3" {
+		t.Fatalf("expected second history count=3, got %q", history[1]["count"])
+	}
+	// Final value should be the last execution
+	if run.Context["a.count"] != "5" {
+		t.Fatalf("expected final a.count=5, got %q", run.Context["a.count"])
+	}
+}
+
+func TestTypedCELEvaluation(t *testing.T) {
+	ctx := NewContext(nil)
+	ctx.Set("fetch.status", "success")
+	ctx.Set("fetch.count", "42")
+	ctx.Set("fetch.active", "true")
+
+	// Scalar values stay as strings (executor outputs are map[string]string)
+	ok, err := EvalCondition("fetch.count == '42'", ctx)
+	if err != nil {
+		t.Fatalf("string number eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected fetch.count == '42' to be true")
+	}
+
+	ok, err = EvalCondition("fetch.active == 'true'", ctx)
+	if err != nil {
+		t.Fatalf("string bool eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected fetch.active == 'true' to be true")
+	}
+
+	// String comparison works as before
+	ok, err = EvalCondition("fetch.status == 'success'", ctx)
+	if err != nil {
+		t.Fatalf("string eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected string comparison to work")
+	}
+}
+
+func TestTypedCELListAccess(t *testing.T) {
+	ctx := NewContext(nil)
+	history := []map[string]string{
+		{"status": "waiting", "count": "1"},
+		{"status": "success", "count": "2"},
+	}
+	encoded, _ := json.Marshal(history)
+	ctx.Set("fetch._runs", string(encoded))
+
+	ok, err := EvalCondition("fetch._runs.size() == 2", ctx)
+	if err != nil {
+		t.Fatalf("list size eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected fetch._runs.size() == 2")
+	}
+
+	ok, err = EvalCondition("fetch._runs.size() > 0", ctx)
+	if err != nil {
+		t.Fatalf("list > 0 eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected fetch._runs.size() > 0")
+	}
+}
+
+func TestTypedCELMapAccess(t *testing.T) {
+	ctx := NewContext(nil)
+	obj := map[string]any{"outcome": "0", "confidence": 0.95}
+	encoded, _ := json.Marshal(obj)
+	ctx.Set("judge.details", string(encoded))
+
+	ok, err := EvalCondition("judge.details.outcome == '0'", ctx)
+	if err != nil {
+		t.Fatalf("map field eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected judge.details.outcome == '0'")
+	}
+
+	ok, err = EvalCondition("judge.details.confidence > 0.5", ctx)
+	if err != nil {
+		t.Fatalf("map number eval error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected judge.details.confidence > 0.5")
 	}
 }

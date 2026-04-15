@@ -121,19 +121,39 @@ A node can then emit outputs like:
 - `fetch.outcome = 1`
 - `judge.reason = ...`
 
-### Conditional edges
+### Conditional edges (CEL)
 
-Edges can have CEL conditions. A target node only becomes reachable if the edge condition evaluates to true.
+Edges can have conditions written in [CEL (Common Expression Language)](https://cel.dev). A target node only becomes reachable if the edge condition evaluates to true. See the [CEL language spec](https://github.com/google/cel-spec/blob/master/doc/langdef.md) for the full reference.
+
+Context values are available as CEL variables using the dotted key convention (`nodeId.field`). Scalar values from executor outputs are strings. JSON arrays and objects stored in context (such as `_runs` history) are passed to CEL as native lists and maps, so standard operators work on them:
+
+```cel
+fetch.status == 'success'
+fetch.status != 'success'
+judge.outcome != 'inconclusive' && judge.outcome != ''
+wait.status == 'success'
+
+// List operations on node history (see below)
+fetch._runs.size() > 0
+fetch._runs.exists(r, r.status == 'success')
+
+// Map field access on structured values
+judge.details.confidence > 0.5
+```
 
 Typical pattern:
 - success path goes to `submit_result`
 - failure or inconclusive path goes somewhere else (`cancel_market`, `defer_resolution`, another judge, etc.)
 
-Example conditions:
-- `fetch.status == 'success'`
-- `fetch.status != 'success'`
-- `judge.outcome != 'inconclusive' && judge.outcome != ''`
-- `wait.status == 'success'`
+### Node history (`_runs`)
+
+When a node is re-executed via a back-edge loop, the engine snapshots its outputs before resetting. These snapshots accumulate in `nodeId._runs` as a JSON array, giving downstream nodes and edge conditions forensic access to all prior executions.
+
+`nodeId.field` always holds the latest value (last-write-wins). `nodeId._runs` holds the history of all previous iterations (not including the current one).
+
+Example: a node `fetch` is looped 3 times. After the run completes:
+- `fetch.status` = output from iteration 3 (latest)
+- `fetch._runs` = `[{iteration 1 outputs}, {iteration 2 outputs}]`
 
 ### Back edges and bounded loops
 
