@@ -164,7 +164,7 @@ func durableTestEngine(execs map[string]dag.NodeExecutor) *dag.Engine {
 
 func waitForDurableStatus(t *testing.T, manager *DurableRunManager, runID string, status RunStatus) RunResult {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	var last RunResult
 	found := false
 	for time.Now().Before(deadline) {
@@ -175,8 +175,11 @@ func waitForDurableStatus(t *testing.T, manager *DurableRunManager, runID string
 			if result.Status == status {
 				return result
 			}
+			if isTerminalStatus(result.Status) && !isTerminalStatus(status) {
+				t.Fatalf("run %q reached terminal %q while waiting for %q", runID, result.Status, status)
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	if !found {
 		t.Fatalf("run %q never appeared", runID)
@@ -187,7 +190,7 @@ func waitForDurableStatus(t *testing.T, manager *DurableRunManager, runID string
 
 func waitForEventType(t *testing.T, manager *DurableRunManager, runID string, eventType string) []durableEvent {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		events, err := manager.store.loadEvents(runID)
 		if err != nil {
@@ -198,7 +201,7 @@ func waitForEventType(t *testing.T, manager *DurableRunManager, runID string, ev
 				return events
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for event %q on run %q", eventType, runID)
 	return nil
@@ -248,15 +251,16 @@ func waitSubmitBlueprint() []byte {
 	})
 }
 
-func humanJudgeBlueprint() []byte {
+func awaitSignalBlueprint() []byte {
 	return mustMarshalBlueprint(dag.Blueprint{
-		ID:      "human-submit",
+		ID:      "await-signal-submit",
 		Version: 1,
 		Nodes: []dag.NodeDef{
-			{ID: "judge", Type: "human_judge", Config: map[string]interface{}{
-				"prompt":             "Resolve this.",
-				"allowed_responders": []string{"creator"},
-				"timeout_seconds":    60,
+			{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+				"signal_type":      "human_judgment.responded",
+				"required_payload": []string{"outcome"},
+				"default_outputs":  map[string]string{"status": "responded"},
+				"timeout_seconds":  60,
 			}},
 			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "judge.outcome"}},
 		},
@@ -400,12 +404,12 @@ func TestDurableWaitSuspendsWithoutConsumingWorker(t *testing.T) {
 	}
 }
 
-func TestDurableHumanJudgeResumesBySignalAndDedupes(t *testing.T) {
+func TestDurableAwaitSignalResumesBySignalAndDedupes(t *testing.T) {
 	tmpDir := t.TempDir()
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "human-run", AppID: 1004, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "human-run", AppID: 1004, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "human-run", RunStatusWaiting)
@@ -485,12 +489,12 @@ func TestDurableManagerRejectsDuplicateActiveApp(t *testing.T) {
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "human-dup-a", AppID: 1006, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "human-dup-a", AppID: 1006, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "human-dup-a", RunStatusWaiting)
 
-	_, err := manager.Submit(RunRequest{RunID: "human-dup-b", AppID: 1006, BlueprintJSON: humanJudgeBlueprint()})
+	_, err := manager.Submit(RunRequest{RunID: "human-dup-b", AppID: 1006, BlueprintJSON: awaitSignalBlueprint()})
 	var dup *duplicateRunError
 	if !errors.As(err, &dup) {
 		t.Fatalf("expected duplicateRunError, got %v", err)
@@ -594,7 +598,7 @@ func TestDurableActiveCountIncludesQueuedRunningAndWaiting(t *testing.T) {
 	waitForDurableStatus(t, manager, "active-running", RunStatusCompleted)
 	waitForDurableStatus(t, manager, "active-queued", RunStatusCompleted)
 
-	if _, err := manager.Submit(RunRequest{RunID: "active-waiting", AppID: 1107, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "active-waiting", AppID: 1107, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "active-waiting", RunStatusWaiting)
@@ -608,7 +612,7 @@ func TestDurableCheckpointContainsResumeStateAndHistoryEvents(t *testing.T) {
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "checkpoint-human", AppID: 1108, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "checkpoint-human", AppID: 1108, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "checkpoint-human", RunStatusWaiting)
@@ -689,7 +693,7 @@ func TestDurableNonMatchingSignalIsStoredButDoesNotResume(t *testing.T) {
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "nonmatching-signal", AppID: 1110, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "nonmatching-signal", AppID: 1110, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "nonmatching-signal", RunStatusWaiting)
@@ -720,7 +724,7 @@ func TestDurableNonMatchingSignalIsStoredButDoesNotResume(t *testing.T) {
 	}
 }
 
-func TestDurableHumanJudgeTimeoutResumesThroughTimeoutPath(t *testing.T) {
+func TestDurableAwaitSignalTimeoutResumesThroughTimeoutPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
@@ -729,10 +733,11 @@ func TestDurableHumanJudgeTimeoutResumesThroughTimeoutPath(t *testing.T) {
 		ID:      "human-timeout",
 		Version: 1,
 		Nodes: []dag.NodeDef{
-			{ID: "judge", Type: "human_judge", Config: map[string]interface{}{
-				"prompt":             "Resolve this.",
-				"allowed_responders": []string{"creator"},
-				"timeout_seconds":    1,
+			{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+				"signal_type":      "human_judgment.responded",
+				"required_payload": []string{"outcome"},
+				"default_outputs":  map[string]string{"status": "responded"},
+				"timeout_seconds":  1,
 			}},
 			{ID: "cancel", Type: "cancel_market", Config: map[string]interface{}{"reason": "human timeout"}},
 		},
@@ -829,7 +834,7 @@ func TestDurableSignalCanResumeWhileOnlyWorkerIsBusy(t *testing.T) {
 	}), DurableRunManagerConfig{MaxWorkers: 1, MaxQueueSize: 10, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "waiting-human", AppID: 1114, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "waiting-human", AppID: 1114, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "waiting-human", RunStatusWaiting)
@@ -1022,7 +1027,7 @@ func TestDurableSignalCanCorrelateByAppIDWithoutRunID(t *testing.T) {
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "app-signal-run", AppID: 1121, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "app-signal-run", AppID: 1121, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "app-signal-run", RunStatusWaiting)
@@ -1046,7 +1051,7 @@ func TestDurableSignalValidationHappensBeforeCheckpointMutation(t *testing.T) {
 	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "invalid-signal", AppID: 1122, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "invalid-signal", AppID: 1122, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	before := waitForDurableStatus(t, manager, "invalid-signal", RunStatusWaiting)

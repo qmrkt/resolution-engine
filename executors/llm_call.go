@@ -27,18 +27,18 @@ const (
 	defaultGoogleBaseURL    = "https://generativelanguage.googleapis.com/v1beta/models"
 )
 
-// LLMJudgeConfig is the node config for llm_judge steps.
-type LLMJudgeConfig struct {
-	Provider           string `json:"provider,omitempty"`             // anthropic | openai | google
-	Model              string `json:"model,omitempty"`                // e.g. "claude-sonnet-4-6"
-	Prompt             string `json:"prompt"`                         // template with {{evidence}}, {{market.question}}
+// LLMCallConfig is the node config for llm_call steps.
+type LLMCallConfig struct {
+	Provider           string `json:"provider,omitempty"` // anthropic | openai | google
+	Model              string `json:"model,omitempty"`    // e.g. "claude-sonnet-4-6"
+	Prompt             string `json:"prompt"`             // template with {{evidence}}, {{market.question}}
 	TimeoutSeconds     int    `json:"timeout_seconds,omitempty"`
 	WebSearch          bool   `json:"web_search,omitempty"`           // enable Anthropic server-side web search
 	AllowedOutcomesKey string `json:"allowed_outcomes_key,omitempty"` // context key holding a JSON array of valid outcomes
 }
 
-// LLMJudgeExecutorConfig configures API access for supported model providers.
-type LLMJudgeExecutorConfig struct {
+// LLMCallExecutorConfig configures API access for supported model providers.
+type LLMCallExecutorConfig struct {
 	AnthropicAPIKey  string
 	AnthropicBaseURL string
 	OpenAIAPIKey     string
@@ -48,8 +48,8 @@ type LLMJudgeExecutorConfig struct {
 	HTTPClient       *http.Client
 }
 
-// LLMJudgeExecutor calls an LLM to evaluate evidence and determine an outcome.
-type LLMJudgeExecutor struct {
+// LLMCallExecutor calls an LLM to evaluate evidence and determine an outcome.
+type LLMCallExecutor struct {
 	AnthropicAPIKey  string
 	AnthropicBaseURL string
 	OpenAIAPIKey     string
@@ -74,14 +74,14 @@ func (j llmJudgment) ConfidenceString() string {
 	return s
 }
 
-func NewLLMJudgeExecutor(apiKey string) *LLMJudgeExecutor {
-	return NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+func NewLLMCallExecutor(apiKey string) *LLMCallExecutor {
+	return NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		AnthropicAPIKey: apiKey,
 	})
 }
 
-func NewLLMJudgeExecutorWithConfig(cfg LLMJudgeExecutorConfig) *LLMJudgeExecutor {
-	return &LLMJudgeExecutor{
+func NewLLMCallExecutorWithConfig(cfg LLMCallExecutorConfig) *LLMCallExecutor {
+	return &LLMCallExecutor{
 		AnthropicAPIKey:  cfg.AnthropicAPIKey,
 		AnthropicBaseURL: defaultString(cfg.AnthropicBaseURL, defaultAnthropicBaseURL),
 		OpenAIAPIKey:     cfg.OpenAIAPIKey,
@@ -92,10 +92,10 @@ func NewLLMJudgeExecutorWithConfig(cfg LLMJudgeExecutorConfig) *LLMJudgeExecutor
 	}
 }
 
-func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, err := parseConfig[LLMJudgeConfig](node.Config)
+func (e *LLMCallExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+	cfg, err := parseConfig[LLMCallConfig](node.Config)
 	if err != nil {
-		return dag.ExecutorResult{}, fmt.Errorf("llm_judge config: %w", err)
+		return dag.ExecutorResult{}, fmt.Errorf("llm_call config: %w", err)
 	}
 
 	prompt := execCtx.Interpolate(cfg.Prompt)
@@ -146,14 +146,14 @@ func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	return parseJudgmentResult(text, usage, allowedOutcomes), nil
 }
 
-func (e *LLMJudgeExecutor) httpClient() *http.Client {
+func (e *LLMCallExecutor) httpClient() *http.Client {
 	if e.HTTPClient != nil {
 		return e.HTTPClient
 	}
 	return http.DefaultClient
 }
 
-func (e *LLMJudgeExecutor) resolveProvider(provider string, model string) (string, string, error) {
+func (e *LLMCallExecutor) resolveProvider(provider string, model string) (string, string, error) {
 	switch provider {
 	case LLMProviderAnthropic:
 		return e.AnthropicAPIKey, e.AnthropicBaseURL, nil
@@ -167,7 +167,7 @@ func (e *LLMJudgeExecutor) resolveProvider(provider string, model string) (strin
 	}
 }
 
-func (e *LLMJudgeExecutor) callAnthropic(
+func (e *LLMCallExecutor) callAnthropic(
 	ctx context.Context,
 	endpoint string,
 	apiKey string,
@@ -228,7 +228,7 @@ func (e *LLMJudgeExecutor) callAnthropic(
 	}, nil
 }
 
-func (e *LLMJudgeExecutor) callOpenAI(
+func (e *LLMCallExecutor) callOpenAI(
 	ctx context.Context,
 	endpoint string,
 	apiKey string,
@@ -282,7 +282,7 @@ func (e *LLMJudgeExecutor) callOpenAI(
 	}, nil
 }
 
-func (e *LLMJudgeExecutor) callGoogle(
+func (e *LLMCallExecutor) callGoogle(
 	ctx context.Context,
 	endpoint string,
 	_ string,

@@ -57,7 +57,7 @@ func TestServerPostRunReturnsAccepted(t *testing.T) {
 		return RunResult{RunID: req.RunID, AppID: 21, Status: RunStatusAccepted}, nil
 	}}, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":21,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":21,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusAccepted {
@@ -82,7 +82,7 @@ func TestServerPostRunRejectsInvalidBlueprint(t *testing.T) {
 		return RunResult{}, nil
 	}}, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bad","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}}],"edges":[]}}`)))
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bad","version":1,"nodes":[{"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}}],"edges":[]}}`)))
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -95,7 +95,7 @@ func TestServerPostRunReturnsConflictForDuplicate(t *testing.T) {
 		return RunResult{}, &duplicateRunError{RunID: "existing-run"}
 	}}, "")
 
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader([]byte(`{"app_id":22,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)))
 	w := httptest.NewRecorder()
 	server.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {

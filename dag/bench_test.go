@@ -21,7 +21,7 @@ func smallBlueprint() Blueprint {
 		ID: "bench-small",
 		Nodes: []NodeDef{
 			{ID: "fetch", Type: "api_fetch"},
-			{ID: "judge", Type: "llm_judge"},
+			{ID: "judge", Type: "llm_call"},
 			{ID: "submit", Type: "submit_result"},
 		},
 		Edges: []EdgeDef{
@@ -141,8 +141,8 @@ func BenchmarkEvalCondition_Simple(b *testing.B) {
 
 func BenchmarkEvalCondition_Complex(b *testing.B) {
 	ctx := NewContext(map[string]string{
-		"fetch.status":  "success",
-		"judge.outcome": "0",
+		"fetch.status":     "success",
+		"judge.outcome":    "0",
 		"judge.confidence": "high",
 	})
 	b.ResetTimer()
@@ -221,11 +221,11 @@ func BenchmarkContextInterpolate_Multi(b *testing.B) {
 func BenchmarkCloneRunState_Small(b *testing.B) {
 	bp := smallBlueprint()
 	run := &RunState{
-		ID:          "bench",
-		Definition:  bp,
-		NodeStates:  make(map[string]NodeState, 3),
-		Context:     make(map[string]string, 20),
-		Inputs:      make(map[string]string, 5),
+		ID:             "bench",
+		Definition:     bp,
+		NodeStates:     make(map[string]NodeState, 3),
+		Context:        make(map[string]string, 20),
+		Inputs:         make(map[string]string, 5),
 		EdgeTraversals: make(map[string]int, 2),
 	}
 	for _, n := range bp.Nodes {
@@ -299,7 +299,7 @@ func (e *noopExecutor) Execute(_ context.Context, _ NodeDef, _ *Context) (Execut
 func BenchmarkEngineExecute_3Nodes(b *testing.B) {
 	engine := NewEngine(slog.New(slog.NewTextHandler(nopWriter{}, nil)))
 	engine.RegisterExecutor("api_fetch", &noopExecutor{})
-	engine.RegisterExecutor("llm_judge", &noopExecutor{})
+	engine.RegisterExecutor("llm_call", &noopExecutor{})
 	engine.RegisterExecutor("submit_result", &noopExecutor{})
 	bp := smallBlueprint()
 	ctx := context.Background()

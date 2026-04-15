@@ -48,7 +48,7 @@ func main() {
 		"indexer_url", indexerURL,
 	)
 
-	runner := NewRunner(executors.LLMJudgeExecutorConfig{
+	runner := NewRunner(executors.LLMCallExecutorConfig{
 		AnthropicAPIKey:  anthropicKey,
 		AnthropicBaseURL: anthropicBaseURL,
 		OpenAIAPIKey:     openAIKey,

@@ -29,18 +29,17 @@ type Runner struct {
 	mu        sync.Mutex
 }
 
-func NewRunner(llmConfig executors.LLMJudgeExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
+func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
 	engine := dag.NewEngine(nil)
 
 	engine.RegisterExecutor("api_fetch", executors.NewAPIFetchExecutor())
-	engine.RegisterExecutor("market_evidence", executors.NewMarketEvidenceExecutor(indexerURL))
-	engine.RegisterExecutor("llm_judge", executors.NewLLMJudgeExecutorWithConfig(llmConfig))
-	engine.RegisterExecutor("human_judge", executors.NewHumanJudgeExecutor(indexerURL))
+	engine.RegisterExecutor("llm_call", executors.NewLLMCallExecutorWithConfig(llmConfig))
 	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
 	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
-	engine.RegisterExecutor("outcome_terminality", executors.NewOutcomeTerminalityExecutor())
 	engine.RegisterExecutor("defer_resolution", executors.NewDeferResolutionExecutor())
 	engine.RegisterExecutor("wait", executors.NewWaitExecutor())
+	engine.RegisterExecutor("cel_eval", executors.NewCelEvalExecutor())
+	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
 
 	_ = os.MkdirAll(dataDir, 0o755)
 

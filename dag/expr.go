@@ -10,28 +10,42 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/ext"
 )
 
 // celCache stores compiled CEL programs keyed on (expression + variable type
-// signature). Cache entries are immutable and safe for concurrent use.
-var celCache sync.Map // string → *celCachedProgram
+// signature). Entries are immutable and safe for concurrent use. The cache is
+// unbounded but naturally plateaus — expressions come from blueprint edge
+// conditions and cel_eval configs, which are finite per blueprint.
+var celCache sync.Map // string → cel.Program
 
-type celCachedProgram struct {
-	prog cel.Program
+// EvalCondition evaluates a CEL expression against context values and returns
+// the result as a boolean.
+func EvalCondition(expression string, ctx *Context) (bool, error) {
+	val, err := evalCEL(expression, ctx)
+	if err != nil {
+		return false, err
+	}
+	return celToBool(val), nil
 }
 
-// EvalCondition evaluates a CEL expression against context values.
-// String values that are valid JSON arrays, objects, numbers, or booleans
-// are passed to CEL with their native types so expressions like
-// fetch._runs.size() or fetch._runs[0].status work naturally.
-//
-// Compiled CEL programs are cached keyed on (expression, referenced variable
-// type signature) so repeated evaluations of the same edge condition skip
-// environment creation, parsing, and compilation.
-func EvalCondition(expression string, ctx *Context) (bool, error) {
+// EvalExpression evaluates a CEL expression against context values and returns
+// the result as a string.
+func EvalExpression(expression string, ctx *Context) (string, error) {
+	val, err := evalCEL(expression, ctx)
+	if err != nil {
+		return "", err
+	}
+	return celToString(val), nil
+}
+
+// evalCEL is the shared CEL evaluation core. It parses context values into
+// native types, resolves referenced variables, and evaluates the expression.
+// Compiled programs are cached keyed on (expression, variable type signature).
+func evalCEL(expression string, ctx *Context) (ref.Val, error) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" {
-		return false, fmt.Errorf("empty expression")
+		return nil, fmt.Errorf("empty expression")
 	}
 
 	values := ctx.ValuesForEval()
@@ -48,36 +62,36 @@ func EvalCondition(expression string, ctx *Context) (bool, error) {
 
 	cacheKey := expression + "\x00" + varSig
 	if cached, ok := celCache.Load(cacheKey); ok {
-		out, _, err := cached.(*celCachedProgram).prog.Eval(activation)
+		out, _, err := cached.(cel.Program).Eval(activation)
 		if err != nil {
-			return false, fmt.Errorf("cel eval: %w", err)
+			return nil, fmt.Errorf("cel eval: %w", err)
 		}
-		return celToBool(out), nil
+		return out, nil
 	}
 
-	env, err := cel.NewEnv(varDecls...)
+	env, err := cel.NewEnv(append(varDecls, ext.Strings())...)
 	if err != nil {
-		return false, fmt.Errorf("cel env: %w", err)
+		return nil, fmt.Errorf("cel env: %w", err)
 	}
 
 	ast, issues := env.Compile(expression)
 	if issues != nil && issues.Err() != nil {
-		return false, fmt.Errorf("cel compile: %w", issues.Err())
+		return nil, fmt.Errorf("cel compile: %w", issues.Err())
 	}
 
 	prog, err := env.Program(ast)
 	if err != nil {
-		return false, fmt.Errorf("cel program: %w", err)
+		return nil, fmt.Errorf("cel program: %w", err)
 	}
 
-	celCache.Store(cacheKey, &celCachedProgram{prog: prog})
+	celCache.Store(cacheKey, prog)
 
 	out, _, err := prog.Eval(activation)
 	if err != nil {
-		return false, fmt.Errorf("cel eval: %w", err)
+		return nil, fmt.Errorf("cel eval: %w", err)
 	}
 
-	return celToBool(out), nil
+	return out, nil
 }
 
 // resolveExpressionVars builds CEL variable declarations and a minimal
@@ -206,6 +220,34 @@ func celToBool(val ref.Val) bool {
 	}
 }
 
+func celToString(val ref.Val) string {
+	if val == nil || val == types.NullValue {
+		return ""
+	}
+	switch v := val.Value().(type) {
+	case string:
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case uint64:
+		return fmt.Sprintf("%d", v)
+	case float64:
+		return fmt.Sprintf("%g", v)
+	default:
+		// Lists, maps, and other complex types → JSON.
+		data, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(data)
+	}
+}
+
 func extractIdentifiers(expression string, known map[string]string) []string {
 	var result []string
 	seen := make(map[string]bool)
@@ -245,6 +287,16 @@ func extractIdentifiers(expression string, known map[string]string) []string {
 			if isReserved(token) || (token[0] >= '0' && token[0] <= '9') || strings.HasPrefix(token, ".") {
 				continue
 			}
+			// Strip trailing CEL method name from dotted identifiers.
+			// e.g. "fetch.value.split" → "fetch.value"
+			if dot := strings.LastIndexByte(token, '.'); dot > 0 {
+				if isCELMethod(token[dot+1:]) {
+					token = token[:dot]
+				}
+			}
+			if token == "" {
+				continue
+			}
 			if _, ok := known[token]; !ok && !seen[token] {
 				seen[token] = true
 				result = append(result, token)
@@ -255,32 +307,27 @@ func extractIdentifiers(expression string, known map[string]string) []string {
 	return result
 }
 
-// isSubpathOfStructuredVar returns true if ident is a dotted extension of
-// an existing activation key whose value is a map or list. For example,
-// "judge.details.outcome" is a sub-path of "judge.details" if that key
-// holds a map. In that case CEL should resolve .outcome as field access
-// rather than treating the whole thing as a variable name.
-func isSubpathOfStructuredVar(ident string, activation map[string]any) bool {
-	for i := len(ident) - 1; i > 0; i-- {
-		if ident[i] != '.' {
-			continue
-		}
-		prefix := ident[:i]
-		if v, ok := activation[prefix]; ok {
-			switch v.(type) {
-			case map[string]any, []any:
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func isReserved(token string) bool {
 	switch token {
 	case "true", "false", "null", "in", "int", "uint", "double", "bool", "string",
 		"bytes", "list", "map", "type", "has", "size", "contains", "startsWith",
 		"endsWith", "matches", "exists", "all", "filter", "timestamp", "duration":
+		return true
+	}
+	return false
+}
+
+// isCELMethod returns true for CEL built-in and ext.Strings() method names.
+// Used to strip trailing method calls from dotted identifier tokens so that
+// "fetch.value.split" is treated as variable "fetch.value" + method "split".
+func isCELMethod(name string) bool {
+	switch name {
+	// built-in receiver methods
+	case "contains", "startsWith", "endsWith", "matches", "exists", "all",
+		"filter", "size", "has",
+		// ext.Strings() methods
+		"charAt", "format", "indexOf", "lastIndexOf", "lowerAscii", "replace",
+		"split", "substring", "trim", "upperAscii", "reverse", "join":
 		return true
 	}
 	return false

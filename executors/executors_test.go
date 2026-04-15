@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -352,87 +351,6 @@ func TestCancelMarketExecutor(t *testing.T) {
 	}
 }
 
-func TestOutcomeTerminalityExecutorUniqueWinner(t *testing.T) {
-	exec := NewOutcomeTerminalityExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("fetch.status", "success")
-	ctx.Set("fetch.extracted", "2026-04-01")
-
-	node := dag.NodeDef{
-		ID:   "term",
-		Type: "outcome_terminality",
-		Config: map[string]interface{}{
-			"outcomes": []map[string]interface{}{
-				{
-					"index":       0,
-					"winner_when": "fetch.status == 'success' && fetch.extracted != ''",
-				},
-				{
-					"index":           1,
-					"eliminated_when": "fetch.status == 'success' && fetch.extracted != ''",
-				},
-			},
-		},
-	}
-
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["outcome_0_state"] != "winner" {
-		t.Fatalf("expected outcome 0 winner, got %q", result.Outputs["outcome_0_state"])
-	}
-	if result.Outputs["outcome_1_state"] != "eliminated" {
-		t.Fatalf("expected outcome 1 eliminated, got %q", result.Outputs["outcome_1_state"])
-	}
-	if result.Outputs["unique_winner"] != "true" || result.Outputs["winning_outcome"] != "0" {
-		t.Fatalf("expected unique winner 0, got unique=%q winning=%q", result.Outputs["unique_winner"], result.Outputs["winning_outcome"])
-	}
-}
-
-func TestOutcomeTerminalityExecutorConflictingStateFails(t *testing.T) {
-	exec := NewOutcomeTerminalityExecutor()
-	ctx := dag.NewContext(map[string]string{"fetch.status": "success"})
-
-	node := dag.NodeDef{
-		ID:   "term",
-		Type: "outcome_terminality",
-		Config: map[string]interface{}{
-			"outcomes": []map[string]interface{}{
-				{
-					"index":           0,
-					"winner_when":     "fetch.status == 'success'",
-					"eliminated_when": "fetch.status == 'success'",
-				},
-			},
-		},
-	}
-
-	if _, err := exec.Execute(context.Background(), node, ctx); err == nil {
-		t.Fatal("expected conflicting winner/eliminated rule to fail")
-	}
-}
-
-func TestOutcomeTerminalityExecutorMultipleWinnersFail(t *testing.T) {
-	exec := NewOutcomeTerminalityExecutor()
-	ctx := dag.NewContext(map[string]string{"flag": "yes"})
-
-	node := dag.NodeDef{
-		ID:   "term",
-		Type: "outcome_terminality",
-		Config: map[string]interface{}{
-			"outcomes": []map[string]interface{}{
-				{"index": 0, "winner_when": "flag == 'yes'"},
-				{"index": 1, "winner_when": "flag == 'yes'"},
-			},
-		},
-	}
-
-	if _, err := exec.Execute(context.Background(), node, ctx); err == nil {
-		t.Fatal("expected multiple winners to fail")
-	}
-}
-
 func TestDeferResolutionExecutor(t *testing.T) {
 	exec := NewDeferResolutionExecutor()
 	result, err := exec.Execute(context.Background(), dag.NodeDef{
@@ -558,54 +476,11 @@ func TestWaitExecutorDeferModeWaiting(t *testing.T) {
 	}
 }
 
-func TestMarketEvidenceExecutor(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/markets/44/evidence" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"appId":                  44,
-			"question":               "Did it happen?",
-			"outcomes":               []string{"Yes", "No"},
-			"submissionCount":        2,
-			"claimedOutcomeSummary":  map[string]int{"0": 1, "unspecified": 1},
-			"entries":                []map[string]any{{"submitterAddress": "A"}, {"submitterAddress": "B"}},
-			"resolutionPendingSince": 1712340000,
-		})
-	}))
-	defer server.Close()
-
-	exec := NewMarketEvidenceExecutor(server.URL)
-	node := dag.NodeDef{
-		ID:     "evidence",
-		Type:   "market_evidence",
-		Config: map[string]interface{}{},
-	}
-
-	ctx := dag.NewContext(map[string]string{"market_app_id": "44"})
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["status"] != "success" {
-		t.Fatalf("expected success, got %#v", result.Outputs)
-	}
-	if result.Outputs["count"] != "2" {
-		t.Fatalf("count = %q, want 2", result.Outputs["count"])
-	}
-	if !strings.Contains(result.Outputs["entries_json"], "\"submitterAddress\":\"A\"") {
-		t.Fatalf("entries_json = %q", result.Outputs["entries_json"])
-	}
-	if result.Outputs["claimed_summary"] != "{\"0\":1,\"unspecified\":1}" {
-		t.Fatalf("claimed_summary = %q", result.Outputs["claimed_summary"])
-	}
-}
-
-func TestLLMJudgeNoAPIKey(t *testing.T) {
-	exec := NewLLMJudgeExecutor("") // no API key
+func TestLLMCallNoAPIKey(t *testing.T) {
+	exec := NewLLMCallExecutor("") // no API key
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]interface{}{
 			"prompt": "What is the outcome?",
 		},
@@ -621,7 +496,7 @@ func TestLLMJudgeNoAPIKey(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeWithMockServer(t *testing.T) {
+func TestLLMCallWithMockServer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") != "test-key" {
 			w.WriteHeader(401)
@@ -639,12 +514,12 @@ func TestLLMJudgeWithMockServer(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutor("test-key")
+	exec := NewLLMCallExecutor("test-key")
 	exec.AnthropicBaseURL = server.URL
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]interface{}{
 			"prompt": "Evidence: {{search.evidence}}\nQuestion: {{market_question}}",
 		},
@@ -668,7 +543,7 @@ func TestLLMJudgeWithMockServer(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeOpenAIProvider(t *testing.T) {
+func TestLLMCallOpenAIProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer openai-key" {
 			w.WriteHeader(401)
@@ -699,14 +574,14 @@ func TestLLMJudgeOpenAIProvider(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider": "openai",
 			"model":    "gpt-5.4",
@@ -729,7 +604,7 @@ func TestLLMJudgeOpenAIProvider(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeGoogleProvider(t *testing.T) {
+func TestLLMCallGoogleProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.URL.RawQuery, "key=google-key") {
 			w.WriteHeader(401)
@@ -763,14 +638,14 @@ func TestLLMJudgeGoogleProvider(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		GoogleAPIKey:  "google-key",
 		GoogleBaseURL: server.URL,
 	})
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider": "google",
 			"model":    "gemini-3.1-pro-preview",
@@ -793,7 +668,7 @@ func TestLLMJudgeGoogleProvider(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeSucceedsWithoutCitations(t *testing.T) {
+func TestLLMCallSucceedsWithoutCitations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{
@@ -811,14 +686,14 @@ func TestLLMJudgeSucceedsWithoutCitations(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider": "openai",
 			"model":    "gpt-5.4",
@@ -841,7 +716,7 @@ func TestLLMJudgeSucceedsWithoutCitations(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeAcceptsOutcomeWithinAllowedRange(t *testing.T) {
+func TestLLMCallAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{
@@ -859,7 +734,7 @@ func TestLLMJudgeAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
@@ -869,7 +744,7 @@ func TestLLMJudgeAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider":             "openai",
 			"model":                "gpt-5.4",
@@ -890,7 +765,7 @@ func TestLLMJudgeAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeRejectsOutcomeOutsideAllowedRange(t *testing.T) {
+func TestLLMCallRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{
@@ -908,7 +783,7 @@ func TestLLMJudgeRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
@@ -918,7 +793,7 @@ func TestLLMJudgeRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider":             "openai",
 			"model":                "gpt-5.4",
@@ -942,15 +817,15 @@ func TestLLMJudgeRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeFailsWhenAllowedOutcomesKeyMissing(t *testing.T) {
-	exec := NewLLMJudgeExecutorWithConfig(LLMJudgeExecutorConfig{
+func TestLLMCallFailsWhenAllowedOutcomesKeyMissing(t *testing.T) {
+	exec := NewLLMCallExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: "https://example.invalid",
 	})
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]any{
 			"provider":             "openai",
 			"model":                "gpt-5.4",
@@ -968,181 +843,6 @@ func TestLLMJudgeFailsWhenAllowedOutcomesKeyMissing(t *testing.T) {
 	}
 	if !strings.Contains(result.Outputs["error"], `allowed outcomes key "market.outcomes.json" not found in context`) {
 		t.Fatalf("unexpected error: %q", result.Outputs["error"])
-	}
-}
-
-func TestHumanJudgeExecutorResponded(t *testing.T) {
-	var (
-		mu        sync.Mutex
-		judgments = map[string]humanJudgmentRecord{}
-	)
-	const runID = "run-77"
-	const judgmentID = "77:run-77:judge"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			var body struct {
-				JudgmentID        string   `json:"judgmentId"`
-				RunID             string   `json:"runId"`
-				NodeID            string   `json:"nodeId"`
-				Prompt            string   `json:"prompt"`
-				AllowedResponders []string `json:"allowedResponders"`
-				TimeoutAt         int64    `json:"timeoutAt"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-
-			judgment := humanJudgmentRecord{
-				JudgmentID:        body.JudgmentID,
-				AppID:             77,
-				RunID:             body.RunID,
-				NodeID:            body.NodeID,
-				Status:            "pending",
-				Prompt:            body.Prompt,
-				AllowedResponders: body.AllowedResponders,
-				TimeoutAt:         body.TimeoutAt,
-			}
-
-			mu.Lock()
-			judgments[body.JudgmentID] = judgment
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgment": judgment})
-		case http.MethodGet:
-			mu.Lock()
-			list := make([]humanJudgmentRecord, 0, len(judgments))
-			for _, judgment := range judgments {
-				list = append(list, judgment)
-			}
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgments": list})
-		default:
-			http.Error(w, "method not allowed", 405)
-		}
-	}))
-	defer server.Close()
-
-	exec := NewHumanJudgeExecutor(server.URL)
-	exec.PollInterval = 20 * time.Millisecond
-
-	go func() {
-		time.Sleep(80 * time.Millisecond)
-		mu.Lock()
-		judgment := judgments[judgmentID]
-		judgment.Status = "responded"
-		judgment.ResponseOutcome = 1
-		judgment.ResponseReason = "Creator resolved it"
-		judgment.ResponderAddress = "CREATORADDR"
-		judgment.ResponderRole = "creator"
-		judgment.ResponseHash = "hash123"
-		judgment.ResponseSubmittedAt = time.Now().UnixMilli()
-		judgments[judgmentID] = judgment
-		mu.Unlock()
-	}()
-
-	result, err := exec.Execute(context.Background(), dag.NodeDef{
-		ID:   "judge",
-		Type: "human_judge",
-		Config: map[string]interface{}{
-			"prompt":             "Resolve this market.",
-			"allowed_responders": []string{"creator"},
-			"timeout_seconds":    2,
-		},
-	}, dag.NewContext(map[string]string{"market_app_id": "77", "resolution_run_id": runID}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["status"] != "responded" {
-		t.Fatalf("expected responded, got %q", result.Outputs["status"])
-	}
-	if result.Outputs["outcome"] != "1" {
-		t.Fatalf("expected outcome=1, got %q", result.Outputs["outcome"])
-	}
-	if result.Outputs["responder_role"] != "creator" {
-		t.Fatalf("expected responder_role=creator, got %q", result.Outputs["responder_role"])
-	}
-}
-
-func TestHumanJudgeExecutorTimeout(t *testing.T) {
-	var (
-		mu        sync.Mutex
-		judgments = map[string]humanJudgmentRecord{}
-	)
-	const runID = "run-78"
-	const judgmentID = "78:run-78:judge"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			var body struct {
-				JudgmentID        string   `json:"judgmentId"`
-				RunID             string   `json:"runId"`
-				NodeID            string   `json:"nodeId"`
-				Prompt            string   `json:"prompt"`
-				AllowedResponders []string `json:"allowedResponders"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-
-			judgment := humanJudgmentRecord{
-				JudgmentID:        body.JudgmentID,
-				AppID:             78,
-				RunID:             body.RunID,
-				NodeID:            body.NodeID,
-				Status:            "pending",
-				Prompt:            body.Prompt,
-				AllowedResponders: body.AllowedResponders,
-				TimeoutAt:         time.Now().Add(75 * time.Millisecond).UnixMilli(),
-			}
-
-			mu.Lock()
-			judgments[body.JudgmentID] = judgment
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgment": judgment})
-		case http.MethodGet:
-			mu.Lock()
-			judgment := judgments[judgmentID]
-			if judgment.Status == "pending" && judgment.TimeoutAt <= time.Now().UnixMilli() {
-				judgment.Status = "timeout"
-				judgments[judgmentID] = judgment
-			}
-			list := make([]humanJudgmentRecord, 0, len(judgments))
-			for _, stored := range judgments {
-				list = append(list, stored)
-			}
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgments": list})
-		default:
-			http.Error(w, "method not allowed", 405)
-		}
-	}))
-	defer server.Close()
-
-	exec := NewHumanJudgeExecutor(server.URL)
-	exec.PollInterval = 20 * time.Millisecond
-
-	result, err := exec.Execute(context.Background(), dag.NodeDef{
-		ID:   "judge",
-		Type: "human_judge",
-		Config: map[string]interface{}{
-			"prompt":             "Resolve this market.",
-			"allowed_responders": []string{"creator"},
-			"timeout_seconds":    1,
-		},
-	}, dag.NewContext(map[string]string{"market_app_id": "78", "resolution_run_id": runID}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["status"] != "timeout" {
-		t.Fatalf("expected timeout, got %q", result.Outputs["status"])
 	}
 }
 
@@ -1223,116 +923,379 @@ func TestFullResolutionDAGWithExecutors(t *testing.T) {
 	fmt.Printf("Resolution complete: outcome=%s evidence=%s\n", outcome, evidenceHash[:16]+"...")
 }
 
-func TestHumanJudgeExecutorDesignatedAddress(t *testing.T) {
-	var (
-		mu                 sync.Mutex
-		judgments          = map[string]humanJudgmentRecord{}
-		capturedDesignated string
-	)
-	const runID = "run-90"
-	const judgmentID = "90:run-90:judge"
-	const designatedAddr = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV"
+// --- cel_eval tests ---
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			var body struct {
-				JudgmentID        string   `json:"judgmentId"`
-				RunID             string   `json:"runId"`
-				NodeID            string   `json:"nodeId"`
-				Prompt            string   `json:"prompt"`
-				AllowedResponders []string `json:"allowedResponders"`
-				DesignatedAddress string   `json:"designatedAddress"`
-				TimeoutAt         int64    `json:"timeoutAt"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
+func TestCelEvalBasicExpressions(t *testing.T) {
+	exec := NewCelEvalExecutor()
+	ctx := dag.NewContext(map[string]string{"name": "world"})
 
-			mu.Lock()
-			capturedDesignated = body.DesignatedAddress
-			mu.Unlock()
-
-			judgment := humanJudgmentRecord{
-				JudgmentID:        body.JudgmentID,
-				AppID:             90,
-				RunID:             body.RunID,
-				NodeID:            body.NodeID,
-				Status:            "pending",
-				Prompt:            body.Prompt,
-				AllowedResponders: body.AllowedResponders,
-				DesignatedAddress: body.DesignatedAddress,
-				TimeoutAt:         body.TimeoutAt,
-			}
-
-			mu.Lock()
-			judgments[body.JudgmentID] = judgment
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgment": judgment})
-		case http.MethodGet:
-			mu.Lock()
-			list := make([]humanJudgmentRecord, 0, len(judgments))
-			for _, judgment := range judgments {
-				list = append(list, judgment)
-			}
-			mu.Unlock()
-
-			json.NewEncoder(w).Encode(map[string]any{"judgments": list})
-		default:
-			http.Error(w, "method not allowed", 405)
-		}
-	}))
-	defer server.Close()
-
-	exec := NewHumanJudgeExecutor(server.URL)
-	exec.PollInterval = 20 * time.Millisecond
-
-	go func() {
-		time.Sleep(80 * time.Millisecond)
-		mu.Lock()
-		judgment := judgments[judgmentID]
-		judgment.Status = "responded"
-		judgment.ResponseOutcome = 0
-		judgment.ResponseReason = "Designated judge resolved"
-		judgment.ResponderAddress = designatedAddr
-		judgment.ResponderRole = "designated"
-		judgment.ResponseHash = "hash-designated"
-		judgment.ResponseSubmittedAt = time.Now().UnixMilli()
-		judgments[judgmentID] = judgment
-		mu.Unlock()
-	}()
-
-	result, err := exec.Execute(context.Background(), dag.NodeDef{
-		ID:   "judge",
-		Type: "human_judge",
+	node := dag.NodeDef{
+		ID:   "eval",
+		Type: "cel_eval",
 		Config: map[string]interface{}{
-			"prompt":             "Resolve this market.",
-			"allowed_responders": []string{"designated"},
-			"designated_address": designatedAddr,
-			"timeout_seconds":    2,
+			"expressions": map[string]interface{}{
+				"greeting":  "'hello ' + name",
+				"is_world":  "name == 'world'",
+				"math_test": "1 + 2",
+			},
 		},
-	}, dag.NewContext(map[string]string{"market_app_id": "90", "resolution_run_id": runID}))
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["status"] != "responded" {
-		t.Fatalf("expected responded, got %q", result.Outputs["status"])
+	if result.Outputs["greeting"] != "hello world" {
+		t.Fatalf("greeting = %q, want 'hello world'", result.Outputs["greeting"])
 	}
-	if result.Outputs["outcome"] != "0" {
-		t.Fatalf("expected outcome=0, got %q", result.Outputs["outcome"])
+	if result.Outputs["is_world"] != "true" {
+		t.Fatalf("is_world = %q, want 'true'", result.Outputs["is_world"])
 	}
-	if result.Outputs["responder_role"] != "designated" {
-		t.Fatalf("expected responder_role=designated, got %q", result.Outputs["responder_role"])
+	if result.Outputs["math_test"] != "3" {
+		t.Fatalf("math_test = %q, want '3'", result.Outputs["math_test"])
 	}
-	if result.Outputs["responder_address"] != designatedAddr {
-		t.Fatalf("expected responder_address=%s, got %q", designatedAddr, result.Outputs["responder_address"])
+}
+
+func TestCelEvalStringFunctions(t *testing.T) {
+	exec := NewCelEvalExecutor()
+	ctx := dag.NewContext(map[string]string{"value": "  Hello, World  "})
+
+	node := dag.NodeDef{
+		ID:   "eval",
+		Type: "cel_eval",
+		Config: map[string]interface{}{
+			"expressions": map[string]interface{}{
+				"trimmed": "value.trim()",
+				"lower":   "value.trim().lowerAscii()",
+			},
+		},
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if capturedDesignated != designatedAddr {
-		t.Fatalf("expected designatedAddress in API payload to be %q, got %q", designatedAddr, capturedDesignated)
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["trimmed"] != "Hello, World" {
+		t.Fatalf("trimmed = %q, want 'Hello, World'", result.Outputs["trimmed"])
+	}
+	if result.Outputs["lower"] != "hello, world" {
+		t.Fatalf("lower = %q, want 'hello, world'", result.Outputs["lower"])
+	}
+}
+
+func TestCelEvalEmptyExpressionsFails(t *testing.T) {
+	exec := NewCelEvalExecutor()
+	node := dag.NodeDef{
+		ID:   "eval",
+		Type: "cel_eval",
+		Config: map[string]interface{}{
+			"expressions": map[string]interface{}{},
+		},
+	}
+	_, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err == nil {
+		t.Fatal("expected error for empty expressions")
+	}
+}
+
+func TestCelEvalInvalidExpressionFails(t *testing.T) {
+	exec := NewCelEvalExecutor()
+	node := dag.NodeDef{
+		ID:   "eval",
+		Type: "cel_eval",
+		Config: map[string]interface{}{
+			"expressions": map[string]interface{}{
+				"bad": "(((",
+			},
+		},
+	}
+	_, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err == nil {
+		t.Fatal("expected error for invalid expression")
+	}
+}
+
+// --- map executor tests ---
+
+type mapTestExecutor struct {
+	outputs map[string]string
+	failOn  int // item index to fail on, -1 = never
+}
+
+func (e *mapTestExecutor) Execute(_ context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+	if e.failOn >= 0 {
+		idx := execCtx.Get("item_index")
+		if idx == fmt.Sprintf("%d", e.failOn) {
+			return dag.ExecutorResult{}, fmt.Errorf("deliberate failure on item %s", idx)
+		}
+	}
+	outputs := make(map[string]string, len(e.outputs)+2)
+	for k, v := range e.outputs {
+		outputs[k] = v
+	}
+	outputs["item_echo"] = execCtx.Get("item")
+	outputs["status"] = "success"
+	return dag.ExecutorResult{Outputs: outputs}, nil
+}
+
+func newMapTestEngine(failOn int) *dag.Engine {
+	engine := dag.NewEngine(nil)
+	engine.RegisterExecutor("step", &mapTestExecutor{
+		outputs: map[string]string{"processed": "true"},
+		failOn:  failOn,
+	})
+	return engine
+}
+
+func simpleInlineBlueprint() *dag.Blueprint {
+	return &dag.Blueprint{
+		Nodes: []dag.NodeDef{
+			{ID: "step", Type: "step", Config: map[string]interface{}{}},
+		},
+	}
+}
+
+func TestMapExecutorParallel(t *testing.T) {
+	engine := newMapTestEngine(-1)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `["apple","banana","cherry"]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"mode":      "parallel",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("status = %q, want success", result.Outputs["status"])
+	}
+	if result.Outputs["completed_count"] != "3" {
+		t.Fatalf("completed_count = %q, want 3", result.Outputs["completed_count"])
+	}
+	if result.Outputs["total_count"] != "3" {
+		t.Fatalf("total_count = %q, want 3", result.Outputs["total_count"])
+	}
+
+	var results []mapItemResult
+	if err := json.Unmarshal([]byte(result.Outputs["results"]), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Status != "completed" {
+			t.Fatalf("item %d status = %q, want completed", r.Index, r.Status)
+		}
+	}
+}
+
+func TestMapExecutorSequential(t *testing.T) {
+	engine := newMapTestEngine(-1)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `[1, 2, 3]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"mode":      "sequential",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["completed_count"] != "3" {
+		t.Fatalf("completed_count = %q, want 3", result.Outputs["completed_count"])
+	}
+}
+
+func TestMapExecutorMaxItems(t *testing.T) {
+	engine := newMapTestEngine(-1)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	items := make([]int, 200)
+	for i := range items {
+		items[i] = i
+	}
+	data, _ := json.Marshal(items)
+	ctx.Set("items", string(data))
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"max_items": 5,
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), node, ctx)
+	if err == nil {
+		t.Fatal("expected error for exceeding max_items")
+	}
+	if !strings.Contains(err.Error(), "exceeds max_items") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMapExecutorOnErrorFail(t *testing.T) {
+	engine := newMapTestEngine(1) // fail on item index 1
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `["a","b","c"]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"mode":      "sequential",
+			"on_error":  "fail",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["failed_count"] == "0" {
+		t.Fatal("expected at least one failure")
+	}
+	if result.Outputs["first_error"] == "" {
+		t.Fatal("expected first_error to be set")
+	}
+}
+
+func TestMapExecutorOnErrorContinue(t *testing.T) {
+	engine := newMapTestEngine(1) // fail on item index 1
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `["a","b","c"]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"mode":      "sequential",
+			"on_error":  "continue",
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["completed_count"] != "2" {
+		t.Fatalf("completed_count = %q, want 2", result.Outputs["completed_count"])
+	}
+	if result.Outputs["failed_count"] != "1" {
+		t.Fatalf("failed_count = %q, want 1", result.Outputs["failed_count"])
+	}
+	if result.Outputs["status"] != "partial" {
+		t.Fatalf("status = %q, want partial", result.Outputs["status"])
+	}
+}
+
+func TestMapExecutorEmptyArray(t *testing.T) {
+	engine := newMapTestEngine(-1)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `[]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["total_count"] != "0" {
+		t.Fatalf("total_count = %q, want 0", result.Outputs["total_count"])
+	}
+}
+
+func TestMapExecutorInputMappings(t *testing.T) {
+	engine := dag.NewEngine(nil)
+	engine.RegisterExecutor("step", &mapTestExecutor{outputs: map[string]string{}, failOn: -1})
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(map[string]string{"shared_config": "abc123"})
+	ctx.Set("items", `["x"]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline":    simpleInlineBlueprint(),
+			"input_mappings": map[string]interface{}{
+				"config": "shared_config",
+			},
+			"output_keys": []interface{}{"step.item_echo", "step.status"},
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []mapItemResult
+	if err := json.Unmarshal([]byte(result.Outputs["results"]), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "completed" {
+		t.Fatalf("expected 1 completed result, got %+v", results)
+	}
+}
+
+func TestMapExecutorRejectsNestedMap(t *testing.T) {
+	engine := dag.NewEngine(nil)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `[1]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key": "items",
+			"inline": &dag.Blueprint{
+				Nodes: []dag.NodeDef{
+					{ID: "nested", Type: "map", Config: map[string]interface{}{}},
+				},
+			},
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), node, ctx)
+	if err == nil {
+		t.Fatal("expected error for nested map node")
+	}
+	if !strings.Contains(err.Error(), "must not contain map nodes") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

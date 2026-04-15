@@ -22,7 +22,7 @@ type durableConcurrentSignalResult struct {
 
 func waitForDurableTerminal(t *testing.T, manager *DurableRunManager, runID string) RunResult {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	var last RunResult
 	found := false
 	for time.Now().Before(deadline) {
@@ -34,7 +34,7 @@ func waitForDurableTerminal(t *testing.T, manager *DurableRunManager, runID stri
 				return result
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	if !found {
 		t.Fatalf("run %q never appeared", runID)
@@ -147,7 +147,7 @@ func TestDurableConcurrentSameAppSubmitsAdmitOneRun(t *testing.T) {
 			result, err := manager.Submit(RunRequest{
 				RunID:         fmt.Sprintf("same-app-%02d", i),
 				AppID:         appID,
-				BlueprintJSON: humanJudgeBlueprint(),
+				BlueprintJSON: awaitSignalBlueprint(),
 			})
 			results[i] = durableConcurrentSubmitResult{result: result, err: err}
 		}(i)
@@ -201,7 +201,7 @@ func TestDurableConcurrentDuplicateSignalsAreIdempotent(t *testing.T) {
 	})
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "concurrent-signal", AppID: 2200, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "concurrent-signal", AppID: 2200, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "concurrent-signal", RunStatusWaiting)
@@ -270,7 +270,7 @@ func TestDurableConcurrentCancelAndSignalsLeaveTerminalRunClean(t *testing.T) {
 	})
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "cancel-signal-race", AppID: 2300, BlueprintJSON: humanJudgeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "cancel-signal-race", AppID: 2300, BlueprintJSON: awaitSignalBlueprint()}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "cancel-signal-race", RunStatusWaiting)

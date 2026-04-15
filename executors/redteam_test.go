@@ -205,7 +205,7 @@ func TestAPIFetchTimeout(t *testing.T) {
 // LLM Judge abuse
 // ---------------------------------------------------------------------------
 
-func TestLLMJudgeUnparseableResponse(t *testing.T) {
+func TestLLMCallUnparseableResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return valid API response but non-JSON content
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -217,12 +217,12 @@ func TestLLMJudgeUnparseableResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewLLMJudgeExecutor("test-key")
+	exec := NewLLMCallExecutor("test-key")
 	exec.AnthropicBaseURL = server.URL
 
 	node := dag.NodeDef{
 		ID:   "judge",
-		Type: "llm_judge",
+		Type: "llm_call",
 		Config: map[string]interface{}{
 			"prompt": "What is the outcome?",
 		},
@@ -238,7 +238,7 @@ func TestLLMJudgeUnparseableResponse(t *testing.T) {
 	}
 }
 
-func TestLLMJudgeInjectionViaPrompt(t *testing.T) {
+func TestLLMCallInjectionViaPrompt(t *testing.T) {
 	// Verify that template interpolation doesn't allow code injection
 	ctx := dag.NewContext(map[string]string{
 		"market_question": `"; DROP TABLE markets; --`,

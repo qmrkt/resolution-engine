@@ -71,7 +71,7 @@ Cancels an in-flight run.
 ### POST /signals
 
 Persist an idempotent resume signal from the indexer or another trusted caller.
-Matching signals resume waiting workflow nodes such as `human_judge` and
+Matching signals resume waiting workflow nodes such as `await_signal` and
 `defer_resolution`.
 
 ```json
@@ -91,21 +91,19 @@ Returns service health and active run count.
 
 ## Architecture
 
-The engine executes resolution blueprints as DAGs with conditional branching (CEL expressions). Each node runs a typed executor:
-
+The engine executes resolution blueprints as DAGs with conditional branching (CEL expressions). Node types are handled by typed executors or durable suspension handlers:
 
 | Executor              | Description                                                      |
 | --------------------- | ---------------------------------------------------------------- |
-| `llm_judge`           | Multi-provider LLM evaluation (Anthropic, OpenAI, Google)        |
+| `llm_call`            | Multi-provider LLM call (Anthropic, OpenAI, Google)              |
 | `api_fetch`           | External data source fetching                                    |
-| `market_evidence`     | On-chain market state and trade history                          |
-| `human_judge`         | Delegates to a human arbiter (configurable `allowed_responders`) |
-| `outcome_terminality` | Checks if an outcome is terminal                                 |
+| `await_signal`        | Suspends until a correlated signal or timeout                    |
+| `cel_eval`            | Evaluates CEL expressions into context outputs                   |
+| `map`                 | Runs an inline child blueprint over a JSON array                 |
 | `defer_resolution`    | Defers resolution to a later time                                |
 | `wait`                | Pauses execution for a duration                                  |
 | `submit_result`       | Marks the final outcome                                          |
 | `cancel_market`       | Marks the market for cancellation                                |
-
 
 Terminal results carry an action: `propose`, `finalize_dispute`, `cancel_market`, `defer`, or `none`.
 
@@ -211,144 +209,10 @@ In practice:
 - back edges allow bounded retry loops
 - `submit_result` and `cancel_market` are the primary terminal actions
 
-### A more complex example
-
-Below is a more complex blueprint from the visual editor. It combines a timing gate, participant evidence collection, an LLM-based judgment, and multiple terminal branches.
-
-![Complex workflow example](docs/assets/complex-workflow-example.png)
-
-Execution flow:
-
-- `Evidence Window` is a `wait` node configured with:
-  - `duration_seconds: 43200`
-  - `mode: 'defer'`
-  - `start_from: 'resolution_pending_since'`
-- while the evidence window is still open:
-  - `wait.status == 'waiting'` sends execution to `Retry Later`
-  - `wait.status == 'success'` is not yet true, so the graph does not proceed to `Participant Evidence`
-  - rerunning before the waiting period expires produces the same defer outcome rather than advancing deeper into the graph
-- once `wait.status == 'success'`, the workflow proceeds to `Participant Evidence`
-- `Participant Evidence` loads submitted evidence bundles for adjudication rather than relying only on passive market metadata
-- if that evidence bundle is successfully assembled, the workflow proceeds to `LLM Judge`
-- the `LLM Judge` either:
-  - emits a concrete outcome -> `Submit Result`
-  - emits an empty or inconclusive result -> `Cancel Market`
-- if evidence collection itself fails to produce a usable bundle, the workflow can also go directly to `Cancel Market`
-
-Every branch still ends in a terminal action:
-
-- `defer_resolution`
-- `submit_result`
-- `cancel_market`
-
-Operationally, each run ends by either deferring, proposing a result, or explicitly cancelling.
-
-<details>
-<summary>Show the blueprint JSON for this UI example</summary>
-
-```json
-{
-  "id": "participant-evidence-llm",
-  "name": "Participant Evidence + LLM",
-  "description": "Wait for the evidence window to close, load participant submissions, then judge with an LLM.",
-  "nodes": [
-    {
-      "id": "wait",
-      "type": "wait",
-      "label": "Evidence Window",
-      "config": {
-        "duration_seconds": 43200,
-        "mode": "defer",
-        "start_from": "resolution_pending_since"
-      }
-    },
-    {
-      "id": "defer",
-      "type": "defer_resolution",
-      "label": "Retry Later",
-      "config": {
-        "reason": "Evidence window still open"
-      }
-    },
-    {
-      "id": "evidence",
-      "type": "market_evidence",
-      "label": "Participant Evidence",
-      "config": {}
-    },
-    {
-      "id": "judge",
-      "type": "llm_judge",
-      "label": "LLM Judge",
-      "config": {
-        "prompt": "Question: {{market.question}}\nOutcomes: {{market.outcomes.indexed}}\nParticipant evidence count: {{evidence.count}}\nClaimed outcome summary: {{evidence.claimed_summary}}\n\nParticipant evidence entries JSON:\n{{evidence.entries_json}}\n\nUse the participant evidence bundle to determine the correct outcome index. If the evidence is insufficient or contradictory, return inconclusive.",
-        "model": "claude-sonnet-4-6",
-        "timeout_seconds": 60,
-        "allowed_outcomes_key": "market.outcomes.json"
-      }
-    },
-    {
-      "id": "submit",
-      "type": "submit_result",
-      "label": "Submit",
-      "config": {
-        "outcome_key": "judge.outcome"
-      }
-    },
-    {
-      "id": "cancel",
-      "type": "cancel_market",
-      "label": "Cancel",
-      "config": {
-        "reason": "Participant evidence judge was inconclusive"
-      }
-    }
-  ],
-  "edges": [
-    {
-      "from": "wait",
-      "to": "defer",
-      "condition": "wait.status == 'waiting'"
-    },
-    {
-      "from": "wait",
-      "to": "evidence",
-      "condition": "wait.status == 'success'"
-    },
-    {
-      "from": "evidence",
-      "to": "judge",
-      "condition": "evidence.status == 'success'"
-    },
-    {
-      "from": "evidence",
-      "to": "cancel",
-      "condition": "evidence.status != 'success'"
-    },
-    {
-      "from": "judge",
-      "to": "submit",
-      "condition": "judge.outcome != 'inconclusive' && judge.outcome != ''"
-    },
-    {
-      "from": "judge",
-      "to": "cancel",
-      "condition": "judge.outcome == 'inconclusive' || judge.outcome == ''"
-    }
-  ],
-  "budget": {
-    "max_total_time_seconds": 172800,
-    "max_total_tokens": 120000
-  }
-}
-```
-
-</details>
-
 ## Design notes
 
 - Run state is durably persisted in the local data directory for single-node operation.
-- `wait`, `human_judge`, and `defer_resolution` suspend runs instead of occupying workers.
+- `wait`, `await_signal`, and `defer_resolution` suspend runs instead of occupying workers.
 - Resume signals are idempotent and correlated by run, app, or explicit key.
 - Callback URLs are delivered through a durable retrying outbox.
 - Traces are observability, not control-plane state.
@@ -365,6 +229,7 @@ go test ./...
 - `durable_manager_integration_test.go` -- durable queue, suspend/resume, signals, timers, restart recovery, outbox retry
 - `server_test.go` -- HTTP API
 - `runner_test.go` -- trace lifecycle, evidence persistence
+- `dag/fuzz_test.go`, `executors/fuzz_test.go`, and `blueprint_fuzz_test.go` -- fuzz targets and property tests for CEL evaluation, interpolation, blueprint validation, scheduling, JSON extraction, JSON paths, and judgment parsing
 
 Optional local TLA+ model checks live in `tla/`:
 
@@ -376,6 +241,14 @@ They model the single-node durable execution state machine and DAG frontier
 bookkeeping: queueing, workers, suspension, timer/signal resume, cancellation,
 restart recovery, callback delivery, back-edge reactivation, and duplicate-run
 prevention for terminal DAG nodes.
+
+For active fuzzing beyond the seed corpus run by `go test`, run one target at
+a time:
+
+```bash
+go test ./dag -run '^$' -fuzz='^FuzzEvalCondition$' -fuzztime=30s
+go test ./executors -run '^$' -fuzz='^FuzzExtractJSON$' -fuzztime=30s
+```
 
 ## License
 

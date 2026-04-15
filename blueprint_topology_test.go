@@ -94,14 +94,14 @@ func (e *retryAwareExecutor) Execute(ctx context.Context, node dag.NodeDef, exec
 }
 
 // ---------------------------------------------------------------------------
-// 1. TestPresetHumanJudge
+// 1. TestPresetAwaitSignal
 // ---------------------------------------------------------------------------
 
-func TestPresetHumanJudge(t *testing.T) {
+func TestPresetAwaitSignal(t *testing.T) {
 	t.Run("success_path", func(t *testing.T) {
 		engine := dag.NewEngine(slog.Default())
 
-		engine.RegisterExecutor("human_judge", &mockExecutor{
+		engine.RegisterExecutor("await_signal", &mockExecutor{
 			outputs: map[string]string{"status": "success", "outcome": "1", "reason": "Judge confirmed outcome"},
 		})
 		engine.RegisterExecutor("submit_result", &mockExecutor{
@@ -112,12 +112,14 @@ func TestPresetHumanJudge(t *testing.T) {
 		})
 
 		bp := dag.Blueprint{
-			ID:   "human-judge-preset",
-			Name: "Human Judge",
+			ID:   "await-signal-preset",
+			Name: "Await Signal",
 			Nodes: []dag.NodeDef{
-				{ID: "judge", Type: "human_judge", Config: map[string]interface{}{
-					"prompt":          "Review the market and provide your judgment",
-					"timeout_seconds": 3600,
+				{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+					"signal_type":      "human_judgment.responded",
+					"required_payload": []string{"outcome"},
+					"default_outputs":  map[string]string{"status": "success"},
+					"timeout_seconds":  3600,
 				}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
 				{ID: "cancel", Type: "cancel_market", Config: map[string]interface{}{}},
@@ -152,7 +154,7 @@ func TestPresetHumanJudge(t *testing.T) {
 	t.Run("timeout_cancel_path", func(t *testing.T) {
 		engine := dag.NewEngine(slog.Default())
 
-		engine.RegisterExecutor("human_judge", &mockExecutor{
+		engine.RegisterExecutor("await_signal", &mockExecutor{
 			outputs: map[string]string{"status": "cancelled", "reason": "Judge timed out"},
 		})
 		engine.RegisterExecutor("submit_result", &mockExecutor{
@@ -163,10 +165,15 @@ func TestPresetHumanJudge(t *testing.T) {
 		})
 
 		bp := dag.Blueprint{
-			ID:   "human-judge-preset-cancel",
-			Name: "Human Judge Cancel",
+			ID:   "await-signal-preset-cancel",
+			Name: "Await Signal Cancel",
 			Nodes: []dag.NodeDef{
-				{ID: "judge", Type: "human_judge", Config: map[string]interface{}{}},
+				{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+					"signal_type":      "human_judgment.responded",
+					"required_payload": []string{"outcome"},
+					"default_outputs":  map[string]string{"status": "cancelled"},
+					"timeout_seconds":  3600,
+				}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
 				{ID: "cancel", Type: "cancel_market", Config: map[string]interface{}{}},
 			},
@@ -301,14 +308,14 @@ func TestPresetAPIFetch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. TestPresetLLMJudge
+// 3. TestPresetLLMCall
 // ---------------------------------------------------------------------------
 
-func TestPresetLLMJudge(t *testing.T) {
+func TestPresetLLMCall(t *testing.T) {
 	t.Run("success_outcome", func(t *testing.T) {
 		engine := dag.NewEngine(slog.Default())
 
-		engine.RegisterExecutor("llm_judge", &mockExecutor{
+		engine.RegisterExecutor("llm_call", &mockExecutor{
 			outputs: map[string]string{
 				"status":    "success",
 				"outcome":   "1",
@@ -323,10 +330,10 @@ func TestPresetLLMJudge(t *testing.T) {
 		})
 
 		bp := dag.Blueprint{
-			ID:   "llm-judge-preset",
+			ID:   "llm-call-preset",
 			Name: "LLM Judge",
 			Nodes: []dag.NodeDef{
-				{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{
+				{ID: "judge", Type: "llm_call", Config: map[string]interface{}{
 					"model":  "gpt-4o",
 					"prompt": "Analyze the evidence and determine the outcome",
 				}},
@@ -360,7 +367,7 @@ func TestPresetLLMJudge(t *testing.T) {
 	t.Run("inconclusive_cancels", func(t *testing.T) {
 		engine := dag.NewEngine(slog.Default())
 
-		engine.RegisterExecutor("llm_judge", &mockExecutor{
+		engine.RegisterExecutor("llm_call", &mockExecutor{
 			outputs: map[string]string{
 				"status":    "inconclusive",
 				"outcome":   "inconclusive",
@@ -375,10 +382,10 @@ func TestPresetLLMJudge(t *testing.T) {
 		})
 
 		bp := dag.Blueprint{
-			ID:   "llm-judge-inconclusive",
+			ID:   "llm-call-inconclusive",
 			Name: "LLM Judge Inconclusive",
 			Nodes: []dag.NodeDef{
-				{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{
+				{ID: "judge", Type: "llm_call", Config: map[string]interface{}{
 					"model": "gpt-4o",
 				}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
@@ -414,11 +421,11 @@ func TestPresetLLMJudge(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPresetAPIFetchLLM(t *testing.T) {
-	// Two-stage pipeline: api_fetch -> llm_judge -> submit
+	// Two-stage pipeline: api_fetch -> llm_call -> submit
 	// Each stage has its own cancel node to avoid multi-incoming-edge
 	// blocking when an upstream stage is never activated.
 
-	t.Run("api_success_llm_judges", func(t *testing.T) {
+	t.Run("api_success_llm_calls", func(t *testing.T) {
 		engine := dag.NewEngine(slog.Default())
 
 		engine.RegisterExecutor("api_fetch", &mockExecutor{
@@ -427,7 +434,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 				"data":   `{"price": 105000, "timestamp": "2025-01-15T00:00:00Z"}`,
 			},
 		})
-		engine.RegisterExecutor("llm_judge", &configAwareExecutor{
+		engine.RegisterExecutor("llm_call", &configAwareExecutor{
 			handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
 				// LLM sees the fetched data in context
 				data := execCtx.Get("fetch.data")
@@ -455,7 +462,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 				{ID: "fetch", Type: "api_fetch", Config: map[string]interface{}{
 					"url": "https://api.coingecko.com/api/v3/simple/price",
 				}},
-				{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{
+				{ID: "judge", Type: "llm_call", Config: map[string]interface{}{
 					"model": "gpt-4o",
 				}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
@@ -511,7 +518,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 				"data":   `{"price": null, "error": "no data available"}`,
 			},
 		})
-		engine.RegisterExecutor("llm_judge", &mockExecutor{
+		engine.RegisterExecutor("llm_call", &mockExecutor{
 			outputs: map[string]string{
 				"status":    "failed",
 				"reasoning": "Cannot determine outcome from null price data",
@@ -529,7 +536,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 			Name: "API Fetch LLM Fails",
 			Nodes: []dag.NodeDef{
 				{ID: "fetch", Type: "api_fetch", Config: map[string]interface{}{}},
-				{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{}},
+				{ID: "judge", Type: "llm_call", Config: map[string]interface{}{}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
 				{ID: "cancel_fetch", Type: "cancel_market", Config: map[string]interface{}{}},
 				{ID: "cancel_judge", Type: "cancel_market", Config: map[string]interface{}{}},
@@ -577,7 +584,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 				"error":  "connection timeout",
 			},
 		})
-		engine.RegisterExecutor("llm_judge", tracker)
+		engine.RegisterExecutor("llm_call", tracker)
 		engine.RegisterExecutor("submit_result", tracker)
 		engine.RegisterExecutor("cancel_market", &mockExecutor{
 			outputs: map[string]string{"cancelled": "true"},
@@ -588,7 +595,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 			Name: "API Fails, LLM Skipped",
 			Nodes: []dag.NodeDef{
 				{ID: "fetch", Type: "api_fetch", Config: map[string]interface{}{}},
-				{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{}},
+				{ID: "judge", Type: "llm_call", Config: map[string]interface{}{}},
 				{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
 				{ID: "cancel_fetch", Type: "cancel_market", Config: map[string]interface{}{}},
 				{ID: "cancel_judge", Type: "cancel_market", Config: map[string]interface{}{}},
@@ -617,7 +624,7 @@ func TestPresetAPIFetchLLM(t *testing.T) {
 			t.Fatalf("expected judge pending (never activated), got %s", run.NodeStates["judge"].Status)
 		}
 		if tracker.didRun("judge") {
-			t.Fatal("LLM judge should not have executed when API failed")
+			t.Fatal("LLM call should not have executed when API failed")
 		}
 		if tracker.didRun("submit") {
 			t.Fatal("submit should not have executed when API failed")
@@ -1010,7 +1017,7 @@ func TestErrorContinueChain(t *testing.T) {
 	engine.RegisterExecutor("api_fetch", &mockExecutor{
 		err: fmt.Errorf("DNS resolution failed"),
 	})
-	engine.RegisterExecutor("llm_judge", &configAwareExecutor{
+	engine.RegisterExecutor("llm_call", &configAwareExecutor{
 		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
 			// Judge runs even though fetch failed (on_error=continue)
 			fetchStatus := execCtx.Get("fetch.status")
@@ -1033,7 +1040,7 @@ func TestErrorContinueChain(t *testing.T) {
 		Name: "Error with Continue",
 		Nodes: []dag.NodeDef{
 			{ID: "fetch", Type: "api_fetch", OnError: "continue", Config: map[string]interface{}{}},
-			{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{}},
+			{ID: "judge", Type: "llm_call", Config: map[string]interface{}{}},
 			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
 		},
 		Edges: []dag.EdgeDef{
@@ -1179,7 +1186,7 @@ func TestContextInterpolationChained(t *testing.T) {
 			}, nil
 		},
 	})
-	engine.RegisterExecutor("llm_judge", &configAwareExecutor{
+	engine.RegisterExecutor("llm_call", &configAwareExecutor{
 		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
 			promptTemplate, _ := config["prompt"].(string)
 			interpolatedPrompt := execCtx.Interpolate(promptTemplate)
@@ -1198,7 +1205,7 @@ func TestContextInterpolationChained(t *testing.T) {
 			{ID: "fetch", Type: "api_fetch", Config: map[string]interface{}{
 				"url": "https://api.example.com/price?q={{market_question}}",
 			}},
-			{ID: "judge", Type: "llm_judge", Config: map[string]interface{}{
+			{ID: "judge", Type: "llm_call", Config: map[string]interface{}{
 				"prompt": "The price is {{fetch.price}}. Did BTC hit 100k? Question: {{market_question}}",
 			}},
 		},

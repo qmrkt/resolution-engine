@@ -22,7 +22,7 @@ func TestValidateResolutionBlueprintAcceptsValidBlueprint(t *testing.T) {
 	  "id":"valid",
 	  "version":1,
 	  "nodes":[
-	    {"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},
+	    {"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},
 	    {"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}
 	  ],
 	  "edges":[{"from":"judge","to":"submit"}]
@@ -38,7 +38,7 @@ func TestValidateResolutionBlueprintRejectsDuplicateNodeID(t *testing.T) {
 	  "id":"dup",
 	  "version":1,
 	  "nodes":[
-	    {"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},
+	    {"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},
 	    {"id":"judge","type":"submit_result","config":{"outcome_key":"judge.outcome"}}
 	  ],
 	  "edges":[]
@@ -75,8 +75,8 @@ func TestValidateResolutionBlueprintRejectsNoTerminalPath(t *testing.T) {
 	  "id":"noterminal",
 	  "version":1,
 	  "nodes":[
-	    {"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["creator"],"timeout_seconds":3600}},
-	    {"id":"other","type":"llm_judge","config":{"prompt":"Judge this."}}
+	    {"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},
+	    {"id":"other","type":"llm_call","config":{"prompt":"Judge this."}}
 	  ],
 	  "edges":[{"from":"judge","to":"other"}]
 	}`)
@@ -86,19 +86,19 @@ func TestValidateResolutionBlueprintRejectsNoTerminalPath(t *testing.T) {
 	}
 }
 
-func TestValidateResolutionBlueprintRejectsHumanJudgeMissingDesignatedAddress(t *testing.T) {
+func TestValidateResolutionBlueprintRejectsAwaitSignalMissingSignalType(t *testing.T) {
 	bp, raw := mustBlueprint(t, `{
-	  "id":"human",
+	  "id":"await",
 	  "version":1,
 	  "nodes":[
-	    {"id":"judge","type":"human_judge","config":{"prompt":"Resolve this.","allowed_responders":["designated"],"timeout_seconds":3600}},
+	    {"id":"judge","type":"await_signal","config":{"required_payload":["outcome"],"timeout_seconds":3600}},
 	    {"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}
 	  ],
 	  "edges":[{"from":"judge","to":"submit"}]
 	}`)
 	result := ValidateResolutionBlueprint(bp, raw)
 	if result.Valid {
-		t.Fatal("expected designated-address blueprint to be invalid")
+		t.Fatal("expected await_signal without signal_type to be invalid")
 	}
 }
 
@@ -118,12 +118,12 @@ func TestValidateResolutionBlueprintRejectsWaitNowWithDeferMode(t *testing.T) {
 	}
 }
 
-func TestValidateResolutionBlueprintAcceptsLLMJudgeAllowedOutcomesKey(t *testing.T) {
+func TestValidateResolutionBlueprintAcceptsLLMCallAllowedOutcomesKey(t *testing.T) {
 	bp, raw := mustBlueprint(t, `{
 	  "id":"llm-allowed-outcomes",
 	  "version":1,
 	  "nodes":[
-	    {"id":"judge","type":"llm_judge","config":{"prompt":"Judge this.","allowed_outcomes_key":"market.outcomes.json"}},
+	    {"id":"judge","type":"llm_call","config":{"prompt":"Judge this.","allowed_outcomes_key":"market.outcomes.json"}},
 	    {"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}
 	  ],
 	  "edges":[{"from":"judge","to":"submit"}]

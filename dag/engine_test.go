@@ -459,7 +459,7 @@ func TestResolutionWorkflow(t *testing.T) {
 			"evidence": "According to CoinGecko, BTC closed at $70,123 on 2024-03-15",
 		},
 	})
-	engine.RegisterExecutor("llm_judge", &contextAwareExecutor{})
+	engine.RegisterExecutor("llm_call", &contextAwareExecutor{})
 	engine.RegisterExecutor("submit_result", &mockExecutor{
 		outputs: map[string]string{"submitted": "true"},
 	})
@@ -472,7 +472,7 @@ func TestResolutionWorkflow(t *testing.T) {
 		Name: "BTC Price Check",
 		Nodes: []NodeDef{
 			{ID: "search", Type: "web_search"},
-			{ID: "judge", Type: "llm_judge"},
+			{ID: "judge", Type: "llm_call"},
 			{ID: "submit", Type: "submit_result"},
 			{ID: "fallback", Type: "cancel_market"},
 		},

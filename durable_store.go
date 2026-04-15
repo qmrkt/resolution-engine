@@ -38,6 +38,7 @@ type durableRunRecord struct {
 	CallbackDelivered bool                     `json:"callback_delivered,omitempty"`
 	CallbackAttempts  int                      `json:"callback_attempts,omitempty"`
 	NextCallbackAt    string                   `json:"next_callback_at,omitempty"`
+	Revision          int64                    `json:"revision,omitempty"`
 	CreatedAt         string                   `json:"created_at"`
 	UpdatedAt         string                   `json:"updated_at"`
 	CompletedAt       string                   `json:"completed_at,omitempty"`
@@ -56,17 +57,19 @@ type durableCheckpoint struct {
 }
 
 type durableWaitingNode struct {
-	NodeID         string            `json:"node_id"`
-	Kind           string            `json:"kind"`
-	Reason         string            `json:"reason,omitempty"`
-	SignalType     string            `json:"signal_type,omitempty"`
-	CorrelationKey string            `json:"correlation_key,omitempty"`
-	ResumeAtUnix   int64             `json:"resume_at_unix,omitempty"`
-	Outputs        map[string]string `json:"outputs,omitempty"`
-	TimeoutOutputs map[string]string `json:"timeout_outputs,omitempty"`
-	StartedAt      string            `json:"started_at,omitempty"`
-	InputSnapshot  map[string]string `json:"input_snapshot,omitempty"`
-	Iteration      int               `json:"iteration,omitempty"`
+	NodeID          string            `json:"node_id"`
+	Kind            string            `json:"kind"`
+	Reason          string            `json:"reason,omitempty"`
+	SignalType      string            `json:"signal_type,omitempty"`
+	CorrelationKey  string            `json:"correlation_key,omitempty"`
+	ResumeAtUnix    int64             `json:"resume_at_unix,omitempty"`
+	RequiredPayload []string          `json:"required_payload,omitempty"`
+	DefaultOutputs  map[string]string `json:"default_outputs,omitempty"`
+	Outputs         map[string]string `json:"outputs,omitempty"`
+	TimeoutOutputs  map[string]string `json:"timeout_outputs,omitempty"`
+	StartedAt       string            `json:"started_at,omitempty"`
+	InputSnapshot   map[string]string `json:"input_snapshot,omitempty"`
+	Iteration       int               `json:"iteration,omitempty"`
 }
 
 type durableEvent struct {
@@ -78,9 +81,13 @@ type durableEvent struct {
 }
 
 type durableFileStore struct {
-	dir string
-	mu  sync.Mutex
+	dir             string
+	mu              sync.Mutex
+	beforeSaveRun   func(*durableRunRecord) error
+	beforeAppendLog func(runID string, eventType string, payload interface{}) error
 }
+
+var errDurableStaleRecord = errors.New("stale durable run record")
 
 func newDurableFileStore(dir string) (*durableFileStore, error) {
 	if strings.TrimSpace(dir) == "" {
@@ -111,10 +118,35 @@ func (s *durableFileStore) saveRun(record *durableRunRecord) error {
 	if runID == "" {
 		return errors.New("run_id is required")
 	}
-	record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	current, err := s.loadRunLocked(runID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if current == nil {
+		if record.Revision != 0 {
+			return fmt.Errorf("%w: run %s has revision %d but no stored record", errDurableStaleRecord, runID, record.Revision)
+		}
+	} else {
+		if record.Revision != current.Revision {
+			return fmt.Errorf("%w: run %s incoming revision %d, stored revision %d", errDurableStaleRecord, runID, record.Revision, current.Revision)
+		}
+		if isTerminalStatus(current.Result.Status) && record.Result.Status != current.Result.Status {
+			return fmt.Errorf("%w: run %s is already terminal with status %s, incoming status %s", errDurableStaleRecord, runID, current.Result.Status, record.Result.Status)
+		}
+	}
+
+	if s.beforeSaveRun != nil {
+		if err := s.beforeSaveRun(record); err != nil {
+			return err
+		}
+	}
+
+	record.Revision++
+	record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return writeJSONAtomic(s.runPath(runID), record)
 }
 
@@ -123,6 +155,10 @@ func (s *durableFileStore) loadRun(runID string) (*durableRunRecord, error) {
 	if runID == "" {
 		return nil, errors.New("run_id is required")
 	}
+	return s.loadRunLocked(runID)
+}
+
+func (s *durableFileStore) loadRunLocked(runID string) (*durableRunRecord, error) {
 	data, err := os.ReadFile(s.runPath(runID))
 	if err != nil {
 		return nil, err
@@ -177,6 +213,11 @@ func (s *durableFileStore) appendEvent(runID string, eventType string, payload i
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.beforeAppendLog != nil {
+		if err := s.beforeAppendLog(runID, eventType, payload); err != nil {
+			return err
+		}
+	}
 	file, err := os.OpenFile(s.eventPath(runID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err

@@ -379,7 +379,7 @@ func (m *DurableRunManager) processRunOnce(runID string) {
 		m.mu.Unlock()
 	}()
 
-	if err := m.advanceRun(runCtx, runID); err != nil && !errors.Is(err, context.Canceled) {
+	if err := m.advanceRun(runCtx, runID); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errDurableStaleRecord) {
 		record, loadErr := m.store.loadRun(runID)
 		if loadErr != nil || isTerminalStatus(record.Result.Status) {
 			return
@@ -534,22 +534,40 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 		waiting.Reason = "timer"
 		waiting.ResumeAtUnix = waitUntil
 		waiting.Outputs = outputs
-	case "human_judge":
-		cfg, err := decodeNodeConfig[durableHumanJudgeConfig](node.Config)
+	case "await_signal":
+		cfg, err := decodeNodeConfig[awaitSignalConfig](node.Config)
 		if err != nil {
 			m.failNode(record, node, err, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
 			return false, nil
 		}
+		signalType := strings.TrimSpace(cfg.SignalType)
+		if signalType == "" {
+			m.failNode(record, node, errors.New("await_signal signal_type is required"), waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
+			return false, nil
+		}
 		timeoutSeconds := cfg.TimeoutSeconds
 		if timeoutSeconds <= 0 {
-			timeoutSeconds = DefaultDurableHumanJudgeTimeout
+			timeoutSeconds = DefaultDurableAwaitSignalTimeout
+		}
+		correlationKey := strings.TrimSpace(cfg.CorrelationKey)
+		if correlationKey == "" || correlationKey == "auto" {
+			correlationKey = fmt.Sprintf("%d:%s:%s", record.Request.AppID, record.Request.RunID, node.ID)
+		}
+		timeoutOutputs := cloneStringMap(cfg.TimeoutOutputs)
+		if len(timeoutOutputs) == 0 {
+			timeoutOutputs = map[string]string{"status": "timeout"}
 		}
 		waiting.Kind = "signal"
-		waiting.Reason = "human judgment"
-		waiting.SignalType = "human_judgment"
-		waiting.CorrelationKey = fmt.Sprintf("%d:%s:%s", record.Request.AppID, record.Request.RunID, node.ID)
+		waiting.Reason = strings.TrimSpace(cfg.Reason)
+		if waiting.Reason == "" {
+			waiting.Reason = "await signal"
+		}
+		waiting.SignalType = signalType
+		waiting.CorrelationKey = correlationKey
 		waiting.ResumeAtUnix = time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
-		waiting.TimeoutOutputs = map[string]string{"status": "timeout"}
+		waiting.RequiredPayload = normalizedRequiredPayload(cfg.RequiredPayload)
+		waiting.DefaultOutputs = cloneStringMap(cfg.DefaultOutputs)
+		waiting.TimeoutOutputs = timeoutOutputs
 	case "defer_resolution":
 		cfg, _ := decodeNodeConfig[durableDeferResolutionConfig](node.Config)
 		reason := strings.TrimSpace(cfg.Reason)
@@ -572,6 +590,9 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 
 	for _, signal := range sortedSignals(record.Signals) {
 		if waitingMatchesSignal(waiting, signal) {
+			if err := validateSignalForWaiting(waiting, signal); err != nil {
+				continue
+			}
 			return true, m.completeNode(record, node, outputsForSignal(waiting, signal), dag.TokenUsage{}, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
 		}
 	}
@@ -633,8 +654,9 @@ func (m *DurableRunManager) completeNode(record *durableRunRecord, node dag.Node
 	record.Checkpoint.Completed[node.ID] = true
 	delete(record.Checkpoint.Failed, node.ID)
 	delete(record.Checkpoint.Waiting, node.ID)
-	record.Checkpoint.Context = execCtx.Snapshot()
-	record.Checkpoint.Run.Context = execCtx.Snapshot()
+	snap := execCtx.Snapshot()
+	record.Checkpoint.Context = snap
+	record.Checkpoint.Run.Context = cloneStringMap(snap)
 	if err := m.evaluateOutgoingEdges(record, node.ID, execCtx); err != nil {
 		return err
 	}
@@ -664,8 +686,9 @@ func (m *DurableRunManager) failNode(record *durableRunRecord, node dag.NodeDef,
 		StartedAt:     startedAt,
 		CompletedAt:   completedAt,
 	})
-	record.Checkpoint.Context = execCtx.Snapshot()
-	record.Checkpoint.Run.Context = execCtx.Snapshot()
+	snap := execCtx.Snapshot()
+	record.Checkpoint.Context = snap
+	record.Checkpoint.Run.Context = cloneStringMap(snap)
 	if node.OnError == "continue" {
 		record.Checkpoint.Completed[node.ID] = true
 	} else {
@@ -698,8 +721,9 @@ func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, node
 	}
 	record.Checkpoint.EdgeTraversals = scheduler.TraversalSnapshot()
 	record.Checkpoint.Run.EdgeTraversals = cloneIntMap(record.Checkpoint.EdgeTraversals)
-	record.Checkpoint.Context = execCtx.Snapshot()
-	record.Checkpoint.Run.Context = execCtx.Snapshot()
+	snap := execCtx.Snapshot()
+	record.Checkpoint.Context = snap
+	record.Checkpoint.Run.Context = cloneStringMap(snap)
 	return nil
 }
 
@@ -1025,8 +1049,14 @@ type durableWaitConfig struct {
 	StartFrom       string `json:"start_from,omitempty"`
 }
 
-type durableHumanJudgeConfig struct {
-	TimeoutSeconds int `json:"timeout_seconds"`
+type awaitSignalConfig struct {
+	Reason          string            `json:"reason,omitempty"`
+	SignalType      string            `json:"signal_type"`
+	CorrelationKey  string            `json:"correlation_key,omitempty"`
+	TimeoutSeconds  int               `json:"timeout_seconds,omitempty"`
+	RequiredPayload []string          `json:"required_payload,omitempty"`
+	DefaultOutputs  map[string]string `json:"default_outputs,omitempty"`
+	TimeoutOutputs  map[string]string `json:"timeout_outputs,omitempty"`
 }
 
 type durableDeferResolutionConfig struct {
@@ -1108,7 +1138,7 @@ func decodeNodeConfig[T any](raw interface{}) (T, error) {
 }
 
 func isDurableSuspendNode(nodeType string) bool {
-	return nodeType == "wait" || nodeType == "human_judge" || nodeType == "defer_resolution"
+	return nodeType == "wait" || nodeType == "await_signal" || nodeType == "defer_resolution"
 }
 
 func isTerminalStatus(status RunStatus) bool {
@@ -1154,6 +1184,8 @@ func hasDueWaiting(waiting map[string]durableWaitingNode, now int64) bool {
 func cloneWaitingMap(values map[string]durableWaitingNode) map[string]durableWaitingNode {
 	out := make(map[string]durableWaitingNode, len(values))
 	for key, value := range values {
+		value.RequiredPayload = append([]string(nil), value.RequiredPayload...)
+		value.DefaultOutputs = cloneStringMap(value.DefaultOutputs)
 		value.Outputs = cloneStringMap(value.Outputs)
 		value.TimeoutOutputs = cloneStringMap(value.TimeoutOutputs)
 		value.InputSnapshot = cloneStringMap(value.InputSnapshot)
@@ -1189,21 +1221,26 @@ func waitingMatchesSignal(waiting durableWaitingNode, signal signalRequest) bool
 }
 
 func validateSignalForWaiting(waiting durableWaitingNode, signal signalRequest) error {
-	if waiting.SignalType == "human_judgment" && signal.SignalType == "human_judgment.responded" {
-		if strings.TrimSpace(signal.Payload["outcome"]) == "" {
-			return errors.New("human_judgment.responded signal requires payload.outcome")
+	for _, key := range waiting.RequiredPayload {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		if strings.TrimSpace(signal.Payload[key]) == "" {
+			return fmt.Errorf("%s signal requires payload.%s", signal.SignalType, key)
 		}
 	}
 	return nil
 }
 
 func outputsForSignal(waiting durableWaitingNode, signal signalRequest) map[string]string {
-	outputs := cloneStringMap(signal.Payload)
+	outputs := cloneStringMap(waiting.DefaultOutputs)
+	if outputs == nil {
+		outputs = make(map[string]string, len(signal.Payload)+1)
+	}
+	for key, value := range signal.Payload {
+		outputs[key] = value
+	}
 	switch waiting.SignalType {
-	case "human_judgment":
-		if outputs["status"] == "" {
-			outputs["status"] = "responded"
-		}
 	case "defer_resolution.resume":
 		if outputs["status"] == "" {
 			outputs["status"] = "success"
@@ -1215,4 +1252,25 @@ func outputsForSignal(waiting durableWaitingNode, signal signalRequest) map[stri
 		}
 	}
 	return outputs
+}
+
+func normalizedRequiredPayload(required []string) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(required))
+	normalized := make([]string, 0, len(required))
+	for _, key := range required {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, key)
+	}
+	sort.Strings(normalized)
+	return normalized
 }

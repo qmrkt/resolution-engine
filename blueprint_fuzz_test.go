@@ -45,8 +45,8 @@ func (e *stubExecutor) Execute(_ context.Context, node dag.NodeDef, execCtx *dag
 var terminalTypes = []string{"submit_result", "cancel_market", "defer_resolution"}
 
 var nonTerminalTypes = []string{
-	"api_fetch", "llm_judge", "human_judge", "market_evidence",
-	"wait", "outcome_terminality",
+	"api_fetch", "llm_call", "await_signal",
+	"wait", "cel_eval",
 }
 
 var allTypes = append(append([]string{}, nonTerminalTypes...), terminalTypes...)
@@ -103,15 +103,16 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 				node.Config = map[string]interface{}{
 					"url": "https://example.com/api",
 				}
-			case "llm_judge":
+			case "llm_call":
 				node.Config = map[string]interface{}{
 					"prompt": "Evaluate: {{evidence.raw}}",
 				}
-			case "human_judge":
+			case "await_signal":
 				node.Config = map[string]interface{}{
-					"prompt":            "Please judge",
-					"allowed_responders": []string{"creator"},
-					"timeout_seconds":   3600,
+					"signal_type":      "human_judgment.responded",
+					"required_payload": []string{"outcome"},
+					"default_outputs":  map[string]string{"status": "responded"},
+					"timeout_seconds":  3600,
 				}
 			case "submit_result":
 				node.Config = map[string]interface{}{

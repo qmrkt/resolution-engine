@@ -47,5 +47,5 @@ const (
 	MaxBlueprintBytes = 8192
 )
 
-// Durable human judge default timeout (seconds).
-const DefaultDurableHumanJudgeTimeout = 172800
+// Durable await-signal default timeout (seconds).
+const DefaultDurableAwaitSignalTimeout = 172800

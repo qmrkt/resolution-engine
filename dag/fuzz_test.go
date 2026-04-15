@@ -99,9 +99,9 @@ func nodeIDGen() *rapid.Generator[string] {
 // nodeTypeGen generates node types (not necessarily registered — scheduler doesn't care).
 func nodeTypeGen() *rapid.Generator[string] {
 	return rapid.SampledFrom([]string{
-		"api_fetch", "llm_judge", "human_judge", "market_evidence",
+		"api_fetch", "llm_call", "await_signal",
 		"submit_result", "cancel_market", "wait", "defer_resolution",
-		"outcome_terminality",
+		"cel_eval",
 	})
 }
 

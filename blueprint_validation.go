@@ -29,17 +29,17 @@ var terminalNodeTypes = map[string]struct{}{
 }
 
 var knownNodeTypes = map[string]struct{}{
-	"api_fetch":           {},
-	"market_evidence":     {},
-	"llm_judge":           {},
-	"human_judge":         {},
-	"wait":                {},
-	"defer_resolution":    {},
-	"submit_result":       {},
-	"cancel_market":       {},
-	"ask_creator":         {},
-	"ask_market_admin":    {},
-	"outcome_terminality": {},
+	"api_fetch":        {},
+	"llm_call":         {},
+	"await_signal":     {},
+	"wait":             {},
+	"defer_resolution": {},
+	"submit_result":    {},
+	"cancel_market":    {},
+	"ask_creator":      {},
+	"ask_market_admin": {},
+	"cel_eval":         {},
+	"map":              {},
 }
 
 func ValidateResolutionBlueprint(bp dag.Blueprint, rawJSON []byte) BlueprintValidationResult {
@@ -298,8 +298,8 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		if cfg.TimeoutSeconds < 0 {
 			add("API_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a non-negative timeout.", displayNode(node)))
 		}
-	case "llm_judge":
-		cfg, err := parseConfigForValidation[executors.LLMJudgeConfig](node.Config)
+	case "llm_call":
+		cfg, err := parseConfigForValidation[executors.LLMCallConfig](node.Config)
 		if err != nil {
 			add("LLM_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
 			return
@@ -310,30 +310,22 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		if cfg.AllowedOutcomesKey != "" && strings.TrimSpace(cfg.AllowedOutcomesKey) == "" {
 			add("LLM_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", displayNode(node)))
 		}
-	case "human_judge":
-		cfg, err := parseConfigForValidation[executors.HumanJudgeConfig](node.Config)
+	case "await_signal":
+		cfg, err := parseConfigForValidation[awaitSignalConfig](node.Config)
 		if err != nil {
-			add("HUMAN_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("AWAIT_SIGNAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
 			return
 		}
-		if strings.TrimSpace(cfg.Prompt) == "" {
-			add("HUMAN_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", displayNode(node)))
+		if strings.TrimSpace(cfg.SignalType) == "" {
+			add("AWAIT_SIGNAL_TYPE_REQUIRED", fmt.Sprintf("Node %q needs a signal_type.", displayNode(node)))
 		}
-		if len(cfg.AllowedResponders) == 0 {
-			add("HUMAN_RESPONDERS_REQUIRED", fmt.Sprintf("Node %q needs at least one allowed responder.", displayNode(node)))
+		if cfg.TimeoutSeconds < 0 || cfg.TimeoutSeconds > 604800 {
+			add("AWAIT_SIGNAL_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a timeout between 0 and 604800 seconds.", displayNode(node)))
 		}
-		if cfg.TimeoutSeconds < 300 || cfg.TimeoutSeconds > 604800 {
-			add("HUMAN_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a timeout between 300 and 604800 seconds.", displayNode(node)))
-		}
-		hasDesignated := false
-		for _, responder := range cfg.AllowedResponders {
-			if responder == "designated" {
-				hasDesignated = true
-				break
+		for _, key := range cfg.RequiredPayload {
+			if strings.TrimSpace(key) == "" {
+				add("AWAIT_SIGNAL_REQUIRED_PAYLOAD_INVALID", fmt.Sprintf("Node %q has an empty required payload key.", displayNode(node)))
 			}
-		}
-		if hasDesignated && strings.TrimSpace(cfg.DesignatedAddress) == "" {
-			add("HUMAN_DESIGNATED_ADDRESS_REQUIRED", fmt.Sprintf("Node %q has a designated responder but no address.", displayNode(node)))
 		}
 	case "wait":
 		cfg, err := parseConfigForValidation[executors.WaitConfig](node.Config)
@@ -361,6 +353,46 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		}
 		if strings.TrimSpace(cfg.OutcomeKey) == "" {
 			add("SUBMIT_OUTCOME_KEY_REQUIRED", fmt.Sprintf("Node %q needs an outcome source.", displayNode(node)))
+		}
+	case "cel_eval":
+		cfg, err := parseConfigForValidation[executors.CelEvalConfig](node.Config)
+		if err != nil {
+			add("CEL_EVAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			return
+		}
+		if len(cfg.Expressions) == 0 {
+			add("CEL_EVAL_EXPRESSIONS_REQUIRED", fmt.Sprintf("Node %q needs at least one expression.", displayNode(node)))
+		}
+	case "map":
+		cfg, err := parseConfigForValidation[executors.MapConfig](node.Config)
+		if err != nil {
+			add("MAP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			return
+		}
+		if strings.TrimSpace(cfg.ItemsKey) == "" {
+			add("MAP_ITEMS_KEY_REQUIRED", fmt.Sprintf("Node %q needs an items_key.", displayNode(node)))
+		}
+		if cfg.Inline == nil || len(cfg.Inline.Nodes) == 0 {
+			add("MAP_INLINE_REQUIRED", fmt.Sprintf("Node %q needs an inline blueprint.", displayNode(node)))
+		}
+		if cfg.Inline != nil {
+			if errs := dag.ValidateBlueprint(*cfg.Inline); len(errs) > 0 {
+				add("MAP_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint: %v", displayNode(node), errs[0]))
+			}
+			for _, child := range cfg.Inline.Nodes {
+				if child.Type == "map" {
+					add("MAP_NESTED_NOT_ALLOWED", fmt.Sprintf("Node %q inline blueprint must not contain map nodes.", displayNode(node)))
+					break
+				}
+			}
+		}
+		mode := strings.TrimSpace(cfg.Mode)
+		if mode != "" && mode != "parallel" && mode != "sequential" {
+			add("MAP_MODE_INVALID", fmt.Sprintf("Node %q mode must be \"parallel\" or \"sequential\".", displayNode(node)))
+		}
+		onError := strings.TrimSpace(cfg.OnError)
+		if onError != "" && onError != "fail" && onError != "continue" {
+			add("MAP_ON_ERROR_INVALID", fmt.Sprintf("Node %q on_error must be \"fail\" or \"continue\".", displayNode(node)))
 		}
 	}
 }
