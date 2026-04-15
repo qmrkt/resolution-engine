@@ -13,3 +13,9 @@ jobs:
         with:
           go-version: "1.23"
       - run: go test ./...
+      - name: Fuzz CEL evaluator
+        run: go test -fuzz=FuzzEvalCondition$ -fuzztime=10s ./dag/
+      - name: Fuzz JSON extractor
+        run: go test -fuzz=FuzzExtractJSON$ -fuzztime=10s ./executors/
+      - name: Fuzz JSON path
+        run: go test -fuzz=FuzzJSONPathExtract -fuzztime=10s ./executors/

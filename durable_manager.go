@@ -58,16 +58,16 @@ func NewDurableRunManager(runner *Runner, dataDir string, client *http.Client, c
 		return nil, err
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: DefaultHTTPClientTimeout}
 	}
 	if cfg.MaxWorkers <= 0 {
-		cfg.MaxWorkers = 4
+		cfg.MaxWorkers = DefaultMaxWorkers
 	}
 	if cfg.MaxQueueSize <= 0 {
-		cfg.MaxQueueSize = 1024
+		cfg.MaxQueueSize = DefaultMaxQueueSize
 	}
 	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = time.Second
+		cfg.PollInterval = DefaultPollInterval
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := &DurableRunManager{
@@ -138,21 +138,6 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 		}
 	}
 
-	if existing, ok, err := m.activeRunForApp(req.AppID); err != nil {
-		return RunResult{}, err
-	} else if ok {
-		return RunResult{}, &duplicateRunError{RunID: existing.Request.RunID}
-	}
-	if m.maxQueueSize > 0 {
-		queued, err := m.queuedRunCount()
-		if err != nil {
-			return RunResult{}, err
-		}
-		if queued >= m.maxQueueSize {
-			return RunResult{}, &queueFullError{MaxQueueSize: m.maxQueueSize}
-		}
-	}
-
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inputs := map[string]string{"market_app_id": strconv.Itoa(req.AppID)}
 	for key, value := range req.Inputs {
@@ -205,9 +190,31 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+
+	m.mu.Lock()
+	if existing, ok, err := m.activeRunForApp(req.AppID); err != nil {
+		m.mu.Unlock()
+		return RunResult{}, err
+	} else if ok {
+		m.mu.Unlock()
+		return RunResult{}, &duplicateRunError{RunID: existing.Request.RunID}
+	}
+	if m.maxQueueSize > 0 {
+		queued, err := m.queuedRunCount()
+		if err != nil {
+			m.mu.Unlock()
+			return RunResult{}, err
+		}
+		if queued >= m.maxQueueSize {
+			m.mu.Unlock()
+			return RunResult{}, &queueFullError{MaxQueueSize: m.maxQueueSize}
+		}
+	}
 	if err := m.store.saveRun(record); err != nil {
+		m.mu.Unlock()
 		return RunResult{}, err
 	}
+	m.mu.Unlock()
 	_ = m.store.appendEvent(req.RunID, "RunQueued", map[string]interface{}{"app_id": req.AppID})
 	m.enqueue(req.RunID)
 	return cloneRunResult(record.Result), nil
@@ -222,11 +229,14 @@ func (m *DurableRunManager) Get(runID string) (RunResult, bool) {
 }
 
 func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
+	m.mu.Lock()
 	record, err := m.store.loadRun(runID)
 	if err != nil {
+		m.mu.Unlock()
 		return RunResult{}, false
 	}
 	if isTerminalStatus(record.Result.Status) {
+		m.mu.Unlock()
 		return cloneRunResult(record.Result), true
 	}
 
@@ -235,6 +245,7 @@ func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
 	record.Result.Action = RunActionNone
 	record.Result.Error = "run cancelled"
 	record.CompletedAt = now
+	record.Checkpoint.Waiting = make(map[string]durableWaitingNode)
 	if record.Checkpoint.Run != nil {
 		record.Checkpoint.Run.Status = string(RunStatusCancelled)
 		record.Checkpoint.Run.Error = "run cancelled"
@@ -242,15 +253,14 @@ func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
 		record.Result.RunState = record.Checkpoint.Run
 	}
 	if err := m.store.saveRun(record); err != nil {
+		m.mu.Unlock()
 		return RunResult{}, false
 	}
-	_ = m.store.appendEvent(runID, "RunCancelled", nil)
-
-	m.mu.Lock()
 	if cancel := m.runCancels[runID]; cancel != nil {
 		cancel()
 	}
 	m.mu.Unlock()
+	_ = m.store.appendEvent(runID, "RunCancelled", nil)
 	return cloneRunResult(record.Result), true
 }
 
@@ -282,16 +292,26 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 		req.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 
+	m.mu.Lock()
 	record, err := m.findSignalTarget(req)
 	if err != nil {
+		m.mu.Unlock()
 		return signalResult{}, err
 	}
 	if record == nil {
+		m.mu.Unlock()
 		return signalResult{}, errors.New("no matching run for signal")
 	}
 	ensureDurableRecordMaps(record)
+	if isTerminalStatus(record.Result.Status) {
+		result := signalResult{RunID: record.Request.RunID, AppID: record.Request.AppID, Status: record.Result.Status}
+		m.mu.Unlock()
+		return result, nil
+	}
 	if _, exists := record.Signals[req.IdempotencyKey]; exists {
-		return signalResult{RunID: record.Request.RunID, AppID: record.Request.AppID, Status: record.Result.Status}, nil
+		result := signalResult{RunID: record.Request.RunID, AppID: record.Request.AppID, Status: record.Result.Status}
+		m.mu.Unlock()
+		return result, nil
 	}
 
 	record.Signals[req.IdempotencyKey] = req
@@ -299,9 +319,11 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 	for nodeID, waiting := range record.Checkpoint.Waiting {
 		if waitingMatchesSignal(waiting, req) {
 			if err := validateSignalForWaiting(waiting, req); err != nil {
+				m.mu.Unlock()
 				return signalResult{}, err
 			}
 			if err := m.completeWaitingNode(record, nodeID, outputsForSignal(waiting, req)); err != nil {
+				m.mu.Unlock()
 				return signalResult{}, err
 			}
 			matched = true
@@ -315,13 +337,17 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 		}
 	}
 	if err := m.store.saveRun(record); err != nil {
+		m.mu.Unlock()
 		return signalResult{}, err
 	}
-	_ = m.store.appendEvent(record.Request.RunID, "SignalReceived", req)
+	result := signalResult{RunID: record.Request.RunID, AppID: record.Request.AppID, Status: record.Result.Status}
+	runID := record.Request.RunID
+	m.mu.Unlock()
+	_ = m.store.appendEvent(runID, "SignalReceived", req)
 	if matched {
-		m.enqueue(record.Request.RunID)
+		m.enqueue(runID)
 	}
-	return signalResult{RunID: record.Request.RunID, AppID: record.Request.AppID, Status: record.Result.Status}, nil
+	return result, nil
 }
 
 func (m *DurableRunManager) worker() {
@@ -516,7 +542,7 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 		}
 		timeoutSeconds := cfg.TimeoutSeconds
 		if timeoutSeconds <= 0 {
-			timeoutSeconds = 172800
+			timeoutSeconds = DefaultDurableHumanJudgeTimeout
 		}
 		waiting.Kind = "signal"
 		waiting.Reason = "human judgment"
@@ -830,11 +856,11 @@ func (m *DurableRunManager) deliverCallbacks() error {
 		}
 		if err := m.postCallback(record.Request.CallbackURL, record.Result); err != nil {
 			record.CallbackAttempts++
-			delay := time.Duration(record.CallbackAttempts)
-			if delay > 60 {
-				delay = 60
+			delay := time.Duration(record.CallbackAttempts) * time.Second
+			if delay > DefaultCallbackMaxBackoff {
+				delay = DefaultCallbackMaxBackoff
 			}
-			record.NextCallbackAt = now.Add(delay * time.Second).Format(time.RFC3339Nano)
+			record.NextCallbackAt = now.Add(delay).Format(time.RFC3339Nano)
 			_ = m.store.saveRun(record)
 			_ = m.store.appendEvent(record.Request.RunID, "CallbackFailed", map[string]string{"error": err.Error()})
 			continue

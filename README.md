@@ -366,6 +366,16 @@ go test ./...
 - `server_test.go` -- HTTP API
 - `runner_test.go` -- trace lifecycle, evidence persistence
 
+Optional local TLA+ model checks live in `tla/`:
+
+```bash
+./tla/check-tla.sh
+```
+
+They model the single-node durable execution state machine: queueing, workers,
+suspension, timer/signal resume, cancellation, restart recovery, and callback
+delivery.
+
 ## License
 
 See [LICENSE](./LICENSE).

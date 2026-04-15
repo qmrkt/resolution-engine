@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/question-market/resolution-engine/dag"
 	"github.com/question-market/resolution-engine/executors"
@@ -216,7 +215,7 @@ func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []by
 		baseCtx = context.Background()
 	}
 
-	ctx, cancel := context.WithTimeout(baseCtx, 7*24*time.Hour)
+	ctx, cancel := context.WithTimeout(baseCtx, DefaultRunTimeout)
 	defer cancel()
 
 	inputs := map[string]string{

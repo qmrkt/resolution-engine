@@ -111,7 +111,7 @@ func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = 60 * time.Second
+		timeout = DefaultLLMTimeout
 	}
 
 	apiKey, endpoint, err := e.resolveProvider(provider, model)
@@ -177,7 +177,7 @@ func (e *LLMJudgeExecutor) callAnthropic(
 ) (string, dag.TokenUsage, error) {
 	reqBody := map[string]any{
 		"model":      model,
-		"max_tokens": 4096,
+		"max_tokens": DefaultAnthropicMaxTokens,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
@@ -189,7 +189,7 @@ func (e *LLMJudgeExecutor) callAnthropic(
 			{
 				"type":     "web_search_20250305",
 				"name":     "web_search",
-				"max_uses": 5,
+				"max_uses": DefaultWebSearchMaxUses,
 			},
 		}
 	}
@@ -244,7 +244,7 @@ func (e *LLMJudgeExecutor) callOpenAI(
 		"response_format": map[string]string{
 			"type": "json_object",
 		},
-		"max_completion_tokens": 1024,
+		"max_completion_tokens": DefaultCompletionMaxTokens,
 	}
 
 	req, err := newJSONRequest(ctx, http.MethodPost, endpoint, reqBody)
@@ -306,7 +306,7 @@ func (e *LLMJudgeExecutor) callGoogle(
 		"generationConfig": map[string]any{
 			"responseMimeType": "application/json",
 			"responseSchema":   buildGoogleResponseSchema(),
-			"maxOutputTokens":  1024,
+			"maxOutputTokens":  DefaultCompletionMaxTokens,
 		},
 	}
 
@@ -367,7 +367,10 @@ func doRequest(client *http.Client, req *http.Request) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}

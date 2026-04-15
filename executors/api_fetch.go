@@ -38,7 +38,7 @@ type APIFetchExecutor struct {
 	AllowLocal bool // For testing only — allows localhost URLs
 }
 
-const maxResponseBytes int64 = 10 << 20 // 10 MB
+const maxResponseBytes int64 = MaxAPIResponseBytes
 
 var supportedAPIFetchMethods = map[string]struct{}{
 	http.MethodDelete: {},
@@ -56,7 +56,7 @@ func NewAPIFetchExecutor() *APIFetchExecutor {
 
 func newSafeClient() *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: DefaultAPIFetchTimeout,
 		Transport: &http.Transport{
 			DialContext: safeDialContext,
 		},
@@ -64,7 +64,7 @@ func newSafeClient() *http.Client {
 			if err := validateURLSafety(req.URL.String()); err != nil {
 				return fmt.Errorf("redirect blocked: %w", err)
 			}
-			if len(via) >= 10 {
+			if len(via) >= MaxRedirects {
 				return fmt.Errorf("too many redirects")
 			}
 			return nil
@@ -100,7 +100,7 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 		if isBlockedIP(ipAddr.IP) {
 			continue
 		}
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		dialer := &net.Dialer{Timeout: DefaultDialTimeout}
 		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ipAddr.IP.String(), port))
 		if err != nil {
 			continue
@@ -135,7 +135,7 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = DefaultAPIFetchTimeout
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)

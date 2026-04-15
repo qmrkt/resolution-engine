@@ -51,11 +51,11 @@ func ValidateResolutionBlueprint(bp dag.Blueprint, rawJSON []byte) BlueprintVali
 	if len(bp.Nodes) == 0 {
 		add("EMPTY_BLUEPRINT", "Add at least one node to the blueprint.", "")
 	}
-	if len(bp.Nodes) > 16 {
-		add("TOO_MANY_NODES", "Blueprints are capped at 16 nodes in V1.", "")
+	if len(bp.Nodes) > MaxBlueprintNodes {
+		add("TOO_MANY_NODES", fmt.Sprintf("Blueprints are capped at %d nodes in V1.", MaxBlueprintNodes), "")
 	}
-	if len(rawJSON) > 8192 {
-		add("BLUEPRINT_TOO_LARGE", fmt.Sprintf("Resolution blueprint exceeds 8KB limit: %d bytes.", len(rawJSON)), "")
+	if len(rawJSON) > MaxBlueprintBytes {
+		add("BLUEPRINT_TOO_LARGE", fmt.Sprintf("Resolution blueprint exceeds %dKB limit: %d bytes.", MaxBlueprintBytes/1024, len(rawJSON)), "")
 	}
 
 	nodeIDs := make(map[string]struct{}, len(bp.Nodes))

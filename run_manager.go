@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -51,19 +52,19 @@ func (e *duplicateRunError) Error() string {
 }
 
 func NewRunManager(runner RunExecutor, client *http.Client, callbackToken string) *RunManager {
-	return NewRunManagerWithConfig(runner, client, callbackToken, 30*time.Minute, time.Minute)
+	return NewRunManagerWithConfig(runner, client, callbackToken, DefaultRunTTL, DefaultRunCleanupInterval)
 }
 
 func NewRunManagerWithConfig(runner RunExecutor, client *http.Client, callbackToken string, ttl, cleanupInterval time.Duration) *RunManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: DefaultHTTPClientTimeout}
 	}
 	if ttl <= 0 {
-		ttl = 30 * time.Minute
+		ttl = DefaultRunTTL
 	}
 	if cleanupInterval <= 0 {
-		cleanupInterval = time.Minute
+		cleanupInterval = DefaultRunCleanupInterval
 	}
 	m := &RunManager{
 		runner:          runner,
@@ -166,7 +167,14 @@ func (m *RunManager) execute(ctx context.Context, req RunRequest) {
 
 	m.setTerminal(req.RunID, result)
 	if strings.TrimSpace(req.CallbackURL) != "" {
-		_ = m.postCallback(req.CallbackURL, result)
+		if err := m.postCallback(req.CallbackURL, result); err != nil {
+			slog.Warn("callback delivery failed",
+				"component", "run_manager",
+				"run_id", req.RunID,
+				"callback_url", req.CallbackURL,
+				"error", err,
+			)
+		}
 	}
 }
 

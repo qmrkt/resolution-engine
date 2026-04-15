@@ -1,0 +1,5 @@
+.tools/
+states/
+*.out
+DurableExecution_TTrace_*.tla
+DurableExecution_TTrace_*.bin

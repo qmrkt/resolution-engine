@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/question-market/resolution-engine/dag"
 )
@@ -64,10 +63,10 @@ func NewTraceEmitter(indexerURL string, token string, logger *slog.Logger) *Trac
 		indexerURL: indexerURL,
 		token:      strings.TrimSpace(token),
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: DefaultTraceHTTPTimeout,
 		},
 		logger: logger,
-		queue:  make(chan TraceEnvelope, 64),
+		queue:  make(chan TraceEnvelope, DefaultTraceQueueSize),
 		ctx:    emitterCtx,
 		cancel: cancel,
 	}

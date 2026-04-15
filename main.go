@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/question-market/resolution-engine/executors"
 )
@@ -78,8 +77,12 @@ func main() {
 	server := NewEngineServer(manager, engineToken)
 
 	httpServer := &http.Server{
-		Addr:    ":" + listenPort,
-		Handler: server.Handler(),
+		Addr:              ":" + listenPort,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: DefaultServerReadHeaderTimeout,
+		ReadTimeout:       DefaultServerReadTimeout,
+		WriteTimeout:      DefaultServerWriteTimeout,
+		IdleTimeout:       DefaultServerIdleTimeout,
 	}
 	go func() {
 		slog.Info("engine server listening", "component", "main", "port", listenPort)
@@ -94,7 +97,7 @@ func main() {
 	slog.Info("received signal, shutting down", "component", "main", "signal", sig.String())
 	serviceCancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), DefaultShutdownTimeout)
 	defer shutdownCancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("http server shutdown error", "component", "main", "error", err)

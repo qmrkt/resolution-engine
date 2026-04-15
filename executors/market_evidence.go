@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/question-market/resolution-engine/dag"
 )
@@ -32,7 +31,7 @@ type marketEvidenceResponse struct {
 func NewMarketEvidenceExecutor(indexerURL string) *MarketEvidenceExecutor {
 	return &MarketEvidenceExecutor{
 		IndexerURL: strings.TrimRight(indexerURL, "/"),
-		Client:     &http.Client{Timeout: 15 * time.Second},
+		Client:     &http.Client{Timeout: DefaultMarketEvidenceHTTPTimeout},
 	}
 }
 

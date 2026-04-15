@@ -49,8 +49,8 @@ type humanJudgmentRecord struct {
 func NewHumanJudgeExecutor(indexerURL string) *HumanJudgeExecutor {
 	return &HumanJudgeExecutor{
 		IndexerURL:   strings.TrimRight(indexerURL, "/"),
-		Client:       &http.Client{Timeout: 15 * time.Second},
-		PollInterval: 5 * time.Second,
+		Client:       &http.Client{Timeout: DefaultHumanJudgeHTTPTimeout},
+		PollInterval: DefaultHumanJudgePollInterval,
 	}
 }
 
@@ -68,7 +68,7 @@ func (e *HumanJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, exec
 		return dag.ExecutorResult{}, fmt.Errorf("human_judge allowed_responders is required")
 	}
 	if cfg.TimeoutSeconds <= 0 {
-		cfg.TimeoutSeconds = 172800
+		cfg.TimeoutSeconds = DefaultHumanJudgeTimeout
 	}
 
 	appID, err := parseMarketAppID(execCtx)

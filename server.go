@@ -24,7 +24,6 @@ type SignalRunManagerAPI interface {
 
 type EngineServer struct {
 	manager   RunManagerAPI
-	logger    interface{}
 	startedAt time.Time
 	token     string
 }
