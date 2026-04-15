@@ -29,12 +29,12 @@ const (
 
 // LLMJudgeConfig is the node config for llm_judge steps.
 type LLMJudgeConfig struct {
-	Provider         string `json:"provider,omitempty"`          // anthropic | openai | google
-	Model            string `json:"model,omitempty"`             // e.g. "claude-sonnet-4-6"
-	Prompt           string `json:"prompt"`                      // template with {{evidence}}, {{market.question}}
-	RequireCitations bool   `json:"require_citations,omitempty"` // require cited support in the judgment
-	TimeoutSeconds   int    `json:"timeout_seconds,omitempty"`
-	WebSearch        bool   `json:"web_search,omitempty"`        // enable Anthropic server-side web search
+	Provider           string `json:"provider,omitempty"`             // anthropic | openai | google
+	Model              string `json:"model,omitempty"`                // e.g. "claude-sonnet-4-6"
+	Prompt             string `json:"prompt"`                         // template with {{evidence}}, {{market.question}}
+	TimeoutSeconds     int    `json:"timeout_seconds,omitempty"`
+	WebSearch          bool   `json:"web_search,omitempty"`           // enable Anthropic server-side web search
+	AllowedOutcomesKey string `json:"allowed_outcomes_key,omitempty"` // context key holding a JSON array of valid outcomes
 }
 
 // LLMJudgeExecutorConfig configures API access for supported model providers.
@@ -104,6 +104,11 @@ func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 		return failureResult(err.Error()), nil
 	}
 
+	allowedOutcomes, err := allowedOutcomesFromContext(execCtx, cfg.AllowedOutcomesKey)
+	if err != nil {
+		return failureResult(err.Error()), nil
+	}
+
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -126,11 +131,11 @@ func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	)
 	switch provider {
 	case LLMProviderAnthropic:
-		text, usage, err = e.callAnthropic(reqCtx, endpoint, apiKey, model, prompt, cfg.RequireCitations, cfg.WebSearch)
+		text, usage, err = e.callAnthropic(reqCtx, endpoint, apiKey, model, prompt, cfg.WebSearch)
 	case LLMProviderOpenAI:
-		text, usage, err = e.callOpenAI(reqCtx, endpoint, apiKey, model, prompt, cfg.RequireCitations)
+		text, usage, err = e.callOpenAI(reqCtx, endpoint, apiKey, model, prompt)
 	case LLMProviderGoogle:
-		text, usage, err = e.callGoogle(reqCtx, endpoint, apiKey, model, prompt, cfg.RequireCitations)
+		text, usage, err = e.callGoogle(reqCtx, endpoint, apiKey, model, prompt)
 	default:
 		return failureResult(fmt.Sprintf("unsupported llm provider %q", provider)), nil
 	}
@@ -138,7 +143,7 @@ func (e *LLMJudgeExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 		return failureResult(err.Error()), nil
 	}
 
-	return parseJudgmentResult(text, usage, cfg.RequireCitations), nil
+	return parseJudgmentResult(text, usage, allowedOutcomes), nil
 }
 
 func (e *LLMJudgeExecutor) httpClient() *http.Client {
@@ -168,7 +173,6 @@ func (e *LLMJudgeExecutor) callAnthropic(
 	apiKey string,
 	model string,
 	prompt string,
-	requireCitations bool,
 	webSearch bool,
 ) (string, dag.TokenUsage, error) {
 	reqBody := map[string]any{
@@ -177,7 +181,7 @@ func (e *LLMJudgeExecutor) callAnthropic(
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"system": buildJudgeInstructions(requireCitations),
+		"system": buildJudgeInstructions(),
 	}
 
 	if webSearch {
@@ -230,12 +234,11 @@ func (e *LLMJudgeExecutor) callOpenAI(
 	apiKey string,
 	model string,
 	prompt string,
-	requireCitations bool,
 ) (string, dag.TokenUsage, error) {
 	reqBody := map[string]any{
 		"model": model,
 		"messages": []map[string]string{
-			{"role": "system", "content": buildJudgeInstructions(requireCitations)},
+			{"role": "system", "content": buildJudgeInstructions()},
 			{"role": "user", "content": prompt},
 		},
 		"response_format": map[string]string{
@@ -285,12 +288,11 @@ func (e *LLMJudgeExecutor) callGoogle(
 	_ string,
 	model string,
 	prompt string,
-	requireCitations bool,
 ) (string, dag.TokenUsage, error) {
 	reqBody := map[string]any{
 		"systemInstruction": map[string]any{
 			"parts": []map[string]string{
-				{"text": buildJudgeInstructions(requireCitations)},
+				{"text": buildJudgeInstructions()},
 			},
 		},
 		"contents": []map[string]any{
@@ -303,7 +305,7 @@ func (e *LLMJudgeExecutor) callGoogle(
 		},
 		"generationConfig": map[string]any{
 			"responseMimeType": "application/json",
-			"responseSchema":   buildGoogleResponseSchema(requireCitations),
+			"responseSchema":   buildGoogleResponseSchema(),
 			"maxOutputTokens":  1024,
 		},
 	}
@@ -372,7 +374,7 @@ func doRequest(client *http.Client, req *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func parseJudgmentResult(raw string, usage dag.TokenUsage, requireCitations bool) dag.ExecutorResult {
+func parseJudgmentResult(raw string, usage dag.TokenUsage, allowedOutcomes []string) dag.ExecutorResult {
 	text := extractJSON(raw)
 	var judgment llmJudgment
 	if err := json.Unmarshal([]byte(text), &judgment); err != nil {
@@ -380,6 +382,18 @@ func parseJudgmentResult(raw string, usage dag.TokenUsage, requireCitations bool
 			Outputs: map[string]string{
 				"status":  "success",
 				"outcome": "inconclusive",
+				"raw":     raw,
+			},
+			Usage: usage,
+		}
+	}
+
+	if err := validateOutcomeIndex(judgment.OutcomeIndex, allowedOutcomes); err != nil {
+		return dag.ExecutorResult{
+			Outputs: map[string]string{
+				"status":  "failed",
+				"outcome": "inconclusive",
+				"error":   err.Error(),
 				"raw":     raw,
 			},
 			Usage: usage,
@@ -397,12 +411,6 @@ func parseJudgmentResult(raw string, usage dag.TokenUsage, requireCitations bool
 		citationsJSON, _ := json.Marshal(judgment.Citations)
 		outputs["citations_json"] = string(citationsJSON)
 		outputs["citations_count"] = fmt.Sprintf("%d", len(judgment.Citations))
-	}
-
-	if requireCitations && len(judgment.Citations) == 0 {
-		outputs["status"] = "failed"
-		outputs["outcome"] = "inconclusive"
-		outputs["error"] = "citations required but missing"
 	}
 
 	return dag.ExecutorResult{Outputs: outputs, Usage: usage}
@@ -479,17 +487,14 @@ func defaultModelForProvider(provider string) string {
 	}
 }
 
-func buildJudgeInstructions(requireCitations bool) string {
-	base := "You are a resolution judge for a prediction market. " +
-		"Determine the correct outcome from the provided evidence. " +
-		"Respond with ONLY a JSON object containing outcome_index (integer), confidence (high|medium|low), and reasoning (string)."
-	if requireCitations {
-		base += " Include citations as a JSON array of supporting quotes, URLs, or evidence references."
-	}
-	return base
+func buildJudgeInstructions() string {
+	return "You are a resolution judge for a prediction market. " +
+		"Determine the best outcome from the provided evidence. " +
+		"Respond with ONLY a JSON object containing outcome_index (integer), confidence (high|medium|low), and reasoning (string). " +
+		"If helpful, you may also include citations as a JSON array of supporting quotes, URLs, or evidence references."
 }
 
-func buildGoogleResponseSchema(requireCitations bool) map[string]any {
+func buildGoogleResponseSchema() map[string]any {
 	properties := map[string]any{
 		"outcome_index": map[string]any{
 			"type": "INTEGER",
@@ -501,23 +506,45 @@ func buildGoogleResponseSchema(requireCitations bool) map[string]any {
 		"reasoning": map[string]any{
 			"type": "STRING",
 		},
-	}
-	required := []string{"outcome_index", "confidence", "reasoning"}
-	if requireCitations {
-		properties["citations"] = map[string]any{
+		"citations": map[string]any{
 			"type": "ARRAY",
 			"items": map[string]any{
 				"type": "STRING",
 			},
-		}
-		required = append(required, "citations")
+		},
 	}
 
 	return map[string]any{
 		"type":       "OBJECT",
 		"properties": properties,
-		"required":   required,
+		"required":   []string{"outcome_index", "confidence", "reasoning"},
 	}
+}
+
+func allowedOutcomesFromContext(execCtx *dag.Context, key string) ([]string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, nil
+	}
+	raw := strings.TrimSpace(execCtx.Get(key))
+	if raw == "" {
+		return nil, fmt.Errorf("allowed outcomes key %q not found in context", key)
+	}
+	var outcomes []string
+	if err := json.Unmarshal([]byte(raw), &outcomes); err != nil {
+		return nil, fmt.Errorf("allowed outcomes key %q did not contain a valid JSON string array: %w", key, err)
+	}
+	return outcomes, nil
+}
+
+func validateOutcomeIndex(outcomeIndex int, allowedOutcomes []string) error {
+	if len(allowedOutcomes) == 0 {
+		return nil
+	}
+	if outcomeIndex < 0 || outcomeIndex >= len(allowedOutcomes) {
+		return fmt.Errorf("outcome_index %d is outside allowed outcome range 0..%d", outcomeIndex, len(allowedOutcomes)-1)
+	}
+	return nil
 }
 
 // extractJSON finds and returns the last JSON object in the text.

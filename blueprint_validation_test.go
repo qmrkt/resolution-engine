@@ -117,3 +117,19 @@ func TestValidateResolutionBlueprintRejectsWaitNowWithDeferMode(t *testing.T) {
 		t.Fatal("expected invalid wait blueprint to be invalid")
 	}
 }
+
+func TestValidateResolutionBlueprintAcceptsLLMJudgeAllowedOutcomesKey(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"llm-allowed-outcomes",
+	  "version":1,
+	  "nodes":[
+	    {"id":"judge","type":"llm_judge","config":{"prompt":"Judge this.","allowed_outcomes_key":"market.outcomes.json"}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}
+	  ],
+	  "edges":[{"from":"judge","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid blueprint, got issues: %+v", result.Issues)
+	}
+}

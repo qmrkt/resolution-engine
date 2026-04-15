@@ -262,7 +262,8 @@ Operationally, each run ends by either deferring, proposing a result, or explici
       "config": {
         "prompt": "Question: {{market.question}}\nOutcomes: {{market.outcomes.indexed}}\nParticipant evidence count: {{evidence.count}}\nClaimed outcome summary: {{evidence.claimed_summary}}\n\nParticipant evidence entries JSON:\n{{evidence.entries_json}}\n\nUse the participant evidence bundle to determine the correct outcome index. If the evidence is insufficient or contradictory, return inconclusive.",
         "model": "claude-sonnet-4-6",
-        "timeout_seconds": 60
+        "timeout_seconds": 60,
+        "allowed_outcomes_key": "market.outcomes.json"
       }
     },
     {

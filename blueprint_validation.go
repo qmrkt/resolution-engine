@@ -302,6 +302,9 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		if strings.TrimSpace(cfg.Prompt) == "" {
 			add("LLM_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", displayNode(node)))
 		}
+		if cfg.AllowedOutcomesKey != "" && strings.TrimSpace(cfg.AllowedOutcomesKey) == "" {
+			add("LLM_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", displayNode(node)))
+		}
 	case "human_judge":
 		cfg, err := parseConfigForValidation[executors.HumanJudgeConfig](node.Config)
 		if err != nil {
