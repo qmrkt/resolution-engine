@@ -1168,3 +1168,62 @@ func TestDurableCallbackOutboxSurvivesManagerRestart(t *testing.T) {
 	}
 	t.Fatalf("callback not delivered after manager restart; attempts=%d", attempts.Load())
 }
+
+func TestDurableMapExecutorCompletesOnce(t *testing.T) {
+	tmpDir := t.TempDir()
+	step := &durableStaticExecutor{outputs: map[string]string{"status": "success", "processed": "true"}}
+	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
+	engine := durableTestEngine(map[string]dag.NodeExecutor{
+		"step":    step,
+		"outcome": outcome,
+	})
+	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
+	manager := newDurableTestManager(t, tmpDir, engine, 1)
+	defer manager.Close()
+
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "durable-map",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "mapper", Type: "map", Config: map[string]interface{}{
+				"items_key":       "items_json",
+				"batch_size":      2,
+				"max_concurrency": 1,
+				"inline": &dag.Blueprint{
+					Nodes: []dag.NodeDef{
+						{ID: "step", Type: "step", Config: map[string]interface{}{}},
+					},
+				},
+				"output_keys": []string{"step.status", "step.processed"},
+			}},
+			{ID: "outcome", Type: "outcome", Config: map[string]interface{}{}},
+			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "outcome.outcome"}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "mapper", To: "outcome", Condition: "mapper.status == 'success'"},
+			{From: "outcome", To: "submit"},
+		},
+	})
+
+	if _, err := manager.Submit(RunRequest{
+		RunID:         "durable-map",
+		AppID:         1125,
+		BlueprintJSON: bp,
+		Inputs:        map[string]string{"items_json": `["a","b","c"]`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForDurableStatus(t, manager, "durable-map", RunStatusCompleted)
+	if result.RunState.Context["mapper.total_batches"] != "2" {
+		t.Fatalf("mapper.total_batches = %q, want 2", result.RunState.Context["mapper.total_batches"])
+	}
+	if result.RunState.Context["mapper.total_items"] != "3" {
+		t.Fatalf("mapper.total_items = %q, want 3", result.RunState.Context["mapper.total_items"])
+	}
+	if got := countDurableNodeTraces(result.RunState, "mapper"); got != 1 {
+		t.Fatalf("mapper trace count = %d, want 1", got)
+	}
+	if step.Count() != 2 {
+		t.Fatalf("inline step count = %d, want 2", step.Count())
+	}
+}

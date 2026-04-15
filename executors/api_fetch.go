@@ -112,7 +112,7 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 }
 
 func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, err := parseConfig[APIFetchConfig](node.Config)
+	cfg, err := ParseConfig[APIFetchConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("api_fetch config: %w", err)
 	}

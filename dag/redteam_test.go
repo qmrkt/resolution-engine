@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"strings"
 	"testing"
 	"time"
@@ -335,20 +334,4 @@ func TestContextInjectionViaInput(t *testing.T) {
 	if run.Context["step.result"] != "normal" {
 		t.Fatalf("expected normal, got %q (injection succeeded!)", run.Context["step.result"])
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func isLocalAddress(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return host == "localhost"
-	}
-	return ip.IsLoopback() || ip.IsPrivate()
 }

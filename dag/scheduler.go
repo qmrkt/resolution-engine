@@ -77,15 +77,6 @@ func (s *Scheduler) IsBackEdge(from, to string) bool {
 	return ok
 }
 
-// IsSkipped reports whether the scheduler has marked a node as skipped.
-func (s *Scheduler) IsSkipped(nodeID string) bool {
-	if s == nil {
-		return false
-	}
-	_, ok := s.Skipped[nodeID]
-	return ok
-}
-
 // TraversalSnapshot returns a copy of the current edge traversal counts.
 func (s *Scheduler) TraversalSnapshot() map[string]int {
 	if s == nil {

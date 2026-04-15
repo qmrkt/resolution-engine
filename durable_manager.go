@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/question-market/resolution-engine/dag"
+	"github.com/question-market/resolution-engine/executors"
 )
 
 type DurableRunManagerConfig struct {
@@ -535,7 +536,7 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 		waiting.ResumeAtUnix = waitUntil
 		waiting.Outputs = outputs
 	case "await_signal":
-		cfg, err := decodeNodeConfig[awaitSignalConfig](node.Config)
+		cfg, err := executors.ParseConfig[awaitSignalConfig](node.Config)
 		if err != nil {
 			m.failNode(record, node, err, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
 			return false, nil
@@ -569,7 +570,7 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 		waiting.DefaultOutputs = cloneStringMap(cfg.DefaultOutputs)
 		waiting.TimeoutOutputs = timeoutOutputs
 	case "defer_resolution":
-		cfg, _ := decodeNodeConfig[durableDeferResolutionConfig](node.Config)
+		cfg, _ := executors.ParseConfig[durableDeferResolutionConfig](node.Config)
 		reason := strings.TrimSpace(cfg.Reason)
 		if reason == "" {
 			reason = "resolution deferred"
@@ -1066,7 +1067,7 @@ type durableDeferResolutionConfig struct {
 }
 
 func durableWaitDecision(node dag.NodeDef, execCtx *dag.Context) (map[string]string, int64, bool, error) {
-	cfg, err := decodeNodeConfig[durableWaitConfig](node.Config)
+	cfg, err := executors.ParseConfig[durableWaitConfig](node.Config)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -1125,17 +1126,6 @@ func parseDurableInt64(raw string, name string) (int64, error) {
 	return value, nil
 }
 
-func decodeNodeConfig[T any](raw interface{}) (T, error) {
-	var out T
-	data, err := json.Marshal(raw)
-	if err != nil {
-		return out, err
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return out, err
-	}
-	return out, nil
-}
 
 func isDurableSuspendNode(nodeType string) bool {
 	return nodeType == "wait" || nodeType == "await_signal" || nodeType == "defer_resolution"

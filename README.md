@@ -96,6 +96,7 @@ The engine executes resolution blueprints as DAGs with conditional branching (CE
 | Executor              | Description                                                      |
 | --------------------- | ---------------------------------------------------------------- |
 | `llm_call`            | Multi-provider LLM call (Anthropic, OpenAI, Google)              |
+| `agent_loop`          | Multi-provider agent loop with native and blueprint-backed tools |
 | `api_fetch`           | External data source fetching                                    |
 | `await_signal`        | Suspends until a correlated signal or timeout                    |
 | `cel_eval`            | Evaluates CEL expressions into context outputs                   |
@@ -189,6 +190,19 @@ Loop example from the UI:
 ![Back edge loop example](docs/assets/back-edge-loop-example.png)
 
 The engine records edge traversal counts, so loops are explicit and inspectable.
+
+### Map batching
+
+`map` runs an inline child blueprint over a JSON array from context. It is
+configured with generic batching controls:
+
+- `batch_size`: number of items passed to each child run; defaults to `1`
+- `max_concurrency`: number of child batches that can run at once; defaults to `1`
+- `max_concurrency: 0`: start all batches concurrently, subject to engine limits and cancellation
+
+Each child run receives `batch`, `batch_index`, `batch_start_index`,
+`batch_end_index`, and `batch_item_count` inputs. Nested `map` nodes are
+allowed with a depth guard.
 
 ### A small example
 

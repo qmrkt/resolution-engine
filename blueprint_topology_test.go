@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/question-market/resolution-engine/dag"
+	"github.com/question-market/resolution-engine/executors"
 )
 
 // ---------------------------------------------------------------------------
@@ -52,18 +54,6 @@ func (e *trackingExecutor) didRun(nodeID string) bool {
 		}
 	}
 	return false
-}
-
-func (e *trackingExecutor) runCount(nodeID string) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	count := 0
-	for _, id := range e.ran {
-		if id == nodeID {
-			count++
-		}
-	}
-	return count
 }
 
 // retryAwareExecutor tracks call count per node and returns different results.
@@ -1228,5 +1218,207 @@ func TestContextInterpolationChained(t *testing.T) {
 	expectedPrompt := "The price is 105000. Did BTC hit 100k? Question: Will BTC hit 100k?"
 	if run.Context["judge.prompt_used"] != expectedPrompt {
 		t.Fatalf("expected chained interpolation %q, got %q", expectedPrompt, run.Context["judge.prompt_used"])
+	}
+}
+
+func TestMapTopologyBatchedSubmit(t *testing.T) {
+	engine := dag.NewEngine(slog.Default())
+	engine.RegisterExecutor("score_batch", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			return map[string]string{
+				"status":     "success",
+				"batch_size": execCtx.Get("batch_item_count"),
+				"start":      execCtx.Get("batch_start_index"),
+				"end":        execCtx.Get("batch_end_index"),
+			}, nil
+		},
+	})
+	engine.RegisterExecutor("submit_result", &mockExecutor{outputs: map[string]string{"submitted": "true"}})
+	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
+
+	inline := &dag.Blueprint{
+		Nodes: []dag.NodeDef{{ID: "score", Type: "score_batch", Config: map[string]interface{}{}}},
+	}
+	bp := dag.Blueprint{
+		ID: "batched-map-submit",
+		Nodes: []dag.NodeDef{
+			{ID: "claims", Type: "map", Config: map[string]interface{}{
+				"items_key":       "claims_json",
+				"batch_size":      2,
+				"max_concurrency": 1,
+				"inline":          inline,
+				"output_keys":     []string{"score.batch_size", "score.start", "score.end"},
+			}},
+			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{{From: "claims", To: "submit", Condition: "claims.status == 'success'"}},
+	}
+
+	run, err := engine.Execute(context.Background(), bp, map[string]string{
+		"claims_json": `["a","b","c","d","e"]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("run status = %s, want completed", run.Status)
+	}
+	if run.Context["claims.total_batches"] != "3" {
+		t.Fatalf("total_batches = %q, want 3", run.Context["claims.total_batches"])
+	}
+	if run.Context["claims.total_items"] != "5" {
+		t.Fatalf("total_items = %q, want 5", run.Context["claims.total_items"])
+	}
+	if run.Context["submit.submitted"] != "true" {
+		t.Fatalf("submit did not run: %+v", run.Context)
+	}
+}
+
+func TestMapTopologyNestedMapWithBackEdgeRetry(t *testing.T) {
+	engine := dag.NewEngine(slog.Default())
+	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
+	engine.RegisterExecutor("extract_claims", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			var outerBatch []json.RawMessage
+			if err := json.Unmarshal([]byte(execCtx.Get("batch")), &outerBatch); err != nil {
+				return nil, err
+			}
+			if len(outerBatch) != 1 {
+				return nil, fmt.Errorf("expected one group per outer batch, got %d", len(outerBatch))
+			}
+			return map[string]string{
+				"status":      "success",
+				"claims_json": string(outerBatch[0]),
+			}, nil
+		},
+	})
+	engine.RegisterExecutor("process_claim", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			if execCtx.Get("process._runs") == "" {
+				return map[string]string{"status": "retry", "attempt": "1"}, nil
+			}
+			return map[string]string{"status": "success", "attempt": "2"}, nil
+		},
+	})
+	engine.RegisterExecutor("retry_gate", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			if execCtx.Get("process.status") == "retry" {
+				return map[string]string{"status": "retry", "retry": "true"}, nil
+			}
+			return map[string]string{"status": "success", "retry": "false"}, nil
+		},
+	})
+	engine.RegisterExecutor("done", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			return map[string]string{
+				"status":       "success",
+				"process_runs": execCtx.Get("process._runs"),
+			}, nil
+		},
+	})
+	engine.RegisterExecutor("group_done", &configAwareExecutor{
+		handler: func(config map[string]interface{}, execCtx *dag.Context) (map[string]string, error) {
+			return map[string]string{
+				"status":          "success",
+				"inner_completed": execCtx.Get("inner.completed_batches"),
+				"inner_results":   execCtx.Get("inner.results"),
+			}, nil
+		},
+	})
+	engine.RegisterExecutor("submit_result", &mockExecutor{outputs: map[string]string{"submitted": "true"}})
+
+	innerInline := &dag.Blueprint{
+		Nodes: []dag.NodeDef{
+			{ID: "process", Type: "process_claim", Config: map[string]interface{}{}},
+			{ID: "gate", Type: "retry_gate", Config: map[string]interface{}{}},
+			{ID: "done", Type: "done", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "process", To: "gate"},
+			{From: "gate", To: "process", Condition: "gate.retry == 'true'", MaxTraversals: 1},
+			{From: "gate", To: "done", Condition: "gate.retry != 'true'"},
+		},
+	}
+	outerInline := &dag.Blueprint{
+		Nodes: []dag.NodeDef{
+			{ID: "extract", Type: "extract_claims", Config: map[string]interface{}{}},
+			{ID: "inner", Type: "map", Config: map[string]interface{}{
+				"items_key":       "extract.claims_json",
+				"batch_size":      1,
+				"max_concurrency": 2,
+				"inline":          innerInline,
+				"output_keys":     []string{"done.status", "process.status", "process._runs"},
+			}},
+			{ID: "group_done", Type: "group_done", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "extract", To: "inner"},
+			{From: "inner", To: "group_done"},
+		},
+	}
+	bp := dag.Blueprint{
+		ID: "nested-map-retry",
+		Nodes: []dag.NodeDef{
+			{ID: "groups", Type: "map", Config: map[string]interface{}{
+				"items_key":       "groups_json",
+				"batch_size":      1,
+				"max_concurrency": 0,
+				"inline":          outerInline,
+				"output_keys":     []string{"group_done.inner_completed", "group_done.inner_results"},
+			}},
+			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{{From: "groups", To: "submit"}},
+	}
+
+	run, err := engine.Execute(context.Background(), bp, map[string]string{
+		"groups_json": `[["a","b"],["c"]]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" {
+		t.Fatalf("run status = %s, want completed", run.Status)
+	}
+	if run.Context["groups.completed_batches"] != "2" {
+		t.Fatalf("outer completed_batches = %q, want 2", run.Context["groups.completed_batches"])
+	}
+
+	var outerResults []map[string]interface{}
+	if err := json.Unmarshal([]byte(run.Context["groups.results"]), &outerResults); err != nil {
+		t.Fatal(err)
+	}
+	if len(outerResults) != 2 {
+		t.Fatalf("outer result count = %d, want 2", len(outerResults))
+	}
+	expectedInnerCounts := []string{"2", "1"}
+	for i, outer := range outerResults {
+		outputs, ok := outer["outputs"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("outer result %d missing outputs: %+v", i, outer)
+		}
+		if outputs["group_done.inner_completed"] != expectedInnerCounts[i] {
+			t.Fatalf("outer result %d inner_completed = %v, want %s", i, outputs["group_done.inner_completed"], expectedInnerCounts[i])
+		}
+		innerRaw, ok := outputs["group_done.inner_results"].(string)
+		if !ok || innerRaw == "" {
+			t.Fatalf("outer result %d missing inner results: %+v", i, outputs)
+		}
+		var innerResults []map[string]interface{}
+		if err := json.Unmarshal([]byte(innerRaw), &innerResults); err != nil {
+			t.Fatal(err)
+		}
+		for j, inner := range innerResults {
+			innerOutputs, ok := inner["outputs"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("inner result %d/%d missing outputs: %+v", i, j, inner)
+			}
+			if innerOutputs["process.status"] != "success" {
+				t.Fatalf("inner result %d/%d process.status = %v, want success", i, j, innerOutputs["process.status"])
+			}
+			if innerOutputs["process._runs"] == "" {
+				t.Fatalf("inner result %d/%d missing retry history", i, j)
+			}
+		}
 	}
 }

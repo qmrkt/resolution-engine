@@ -134,6 +134,54 @@ func TestValidateResolutionBlueprintAcceptsLLMCallAllowedOutcomesKey(t *testing.
 	}
 }
 
+func TestValidateResolutionBlueprintAcceptsAgentLoopResolution(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"agent-loop",
+	  "version":1,
+	  "nodes":[
+	    {"id":"agent","type":"agent_loop","config":{"prompt":"Resolve {{market.question}}.","output_mode":"resolution","allowed_outcomes_key":"market.outcomes.json"}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"agent.outcome"}}
+	  ],
+	  "edges":[{"from":"agent","to":"submit","condition":"agent.status == 'success'"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid agent_loop blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsAgentLoopStructuredWithoutSchema(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"agent-loop-structured",
+	  "version":1,
+	  "nodes":[
+	    {"id":"agent","type":"agent_loop","config":{"prompt":"Extract a result.","output_mode":"structured"}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"agent.output.outcome"}}
+	  ],
+	  "edges":[{"from":"agent","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected structured agent_loop without schema to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsUnknownAgentLoopBuiltin(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"agent-loop-tool",
+	  "version":1,
+	  "nodes":[
+	    {"id":"agent","type":"agent_loop","config":{"prompt":"Resolve.","tools":[{"name":"made_up","kind":"builtin"}]}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"agent failed"}}
+	  ],
+	  "edges":[{"from":"agent","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected unknown agent_loop builtin to be invalid")
+	}
+}
+
 func TestValidateResolutionBlueprintAcceptsAPIFetchWithoutJSONPath(t *testing.T) {
 	bp, raw := mustBlueprint(t, `{
 	  "id":"api-raw",
@@ -147,6 +195,67 @@ func TestValidateResolutionBlueprintAcceptsAPIFetchWithoutJSONPath(t *testing.T)
 	result := ValidateResolutionBlueprint(bp, raw)
 	if !result.Valid {
 		t.Fatalf("expected valid raw api_fetch blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintAcceptsBatchedMap(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"map-batches",
+	  "version":1,
+	  "nodes":[
+	    {"id":"claims","type":"map","config":{
+	      "items_key":"claims_json",
+	      "batch_size":10,
+	      "max_concurrency":4,
+	      "inline":{"nodes":[{"id":"score","type":"cel_eval","config":{"expressions":{"ok":"'true'"}}}]}
+	    }},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"claims.status"}}
+	  ],
+	  "edges":[{"from":"claims","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid batched map blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsRemovedMapMode(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"map-mode",
+	  "version":1,
+	  "nodes":[
+	    {"id":"claims","type":"map","config":{
+	      "items_key":"claims_json",
+	      "mode":"parallel",
+	      "inline":{"nodes":[{"id":"score","type":"cel_eval","config":{"expressions":{"ok":"'true'"}}}]}
+	    }},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"claims.status"}}
+	  ],
+	  "edges":[{"from":"claims","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected map mode blueprint to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsNegativeMapConcurrency(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"map-concurrency",
+	  "version":1,
+	  "nodes":[
+	    {"id":"claims","type":"map","config":{
+	      "items_key":"claims_json",
+	      "max_concurrency":-1,
+	      "inline":{"nodes":[{"id":"score","type":"cel_eval","config":{"expressions":{"ok":"'true'"}}}]}
+	    }},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"claims.status"}}
+	  ],
+	  "edges":[{"from":"claims","to":"submit"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected negative map concurrency blueprint to be invalid")
 	}
 }
 

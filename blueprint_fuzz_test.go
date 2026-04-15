@@ -46,7 +46,7 @@ var terminalTypes = []string{"submit_result", "cancel_market", "defer_resolution
 
 var nonTerminalTypes = []string{
 	"api_fetch", "llm_call", "await_signal",
-	"wait", "cel_eval",
+	"wait", "cel_eval", "map",
 }
 
 var allTypes = append(append([]string{}, nonTerminalTypes...), terminalTypes...)
@@ -122,6 +122,19 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 				node.Config = map[string]interface{}{
 					"duration_seconds": 0,
 					"mode":             "sleep",
+				}
+			case "map":
+				node.Config = map[string]interface{}{
+					"items_key":       "items_json",
+					"batch_size":      1,
+					"max_concurrency": 1,
+					"inline": map[string]interface{}{
+						"nodes": []map[string]interface{}{
+							{"id": "step", "type": "cel_eval", "config": map[string]interface{}{
+								"expressions": map[string]string{"ok": "'true'"},
+							}},
+						},
+					},
 				}
 			default:
 				node.Config = map[string]interface{}{}

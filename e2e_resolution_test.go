@@ -28,6 +28,11 @@ func newTestRunner(anthropicKey, dataDir string) *Runner {
 	engine.RegisterExecutor("llm_call", executors.NewLLMCallExecutorWithConfig(executors.LLMCallExecutorConfig{
 		AnthropicAPIKey: anthropicKey,
 	}))
+	agentExec := executors.NewAgentLoopExecutorWithConfig(executors.LLMCallExecutorConfig{
+		AnthropicAPIKey: anthropicKey,
+	}, engine)
+	agentExec.AllowLocalSourceFetch = true
+	engine.RegisterExecutor("agent_loop", agentExec)
 	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
 	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
 	engine.RegisterExecutor("defer_resolution", executors.NewDeferResolutionExecutor())

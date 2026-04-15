@@ -17,7 +17,7 @@ func NewDeferResolutionExecutor() *DeferResolutionExecutor {
 }
 
 func (e *DeferResolutionExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, _ := parseConfig[DeferResolutionConfig](node.Config)
+	cfg, _ := ParseConfig[DeferResolutionConfig](node.Config)
 	reason := cfg.Reason
 	if reason == "" {
 		reason = "resolution deferred"

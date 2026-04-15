@@ -20,10 +20,14 @@ const (
 
 // Map executor defaults.
 const (
-	DefaultMapMaxConcurrency = 4
-	DefaultMapMaxItems       = 100
-	DefaultMapItemInputKey   = "item"
-	DefaultMapIndexInputKey  = "item_index"
-	DefaultMapMode           = "parallel"
-	DefaultMapOnError        = "fail"
+	DefaultMapBatchSize               = 1
+	DefaultMapMaxConcurrency          = 1
+	DefaultMapMaxItems                = 100
+	DefaultMapMaxDepth                = 4
+	DefaultMapBatchInputKey           = "batch"
+	DefaultMapBatchIndexInputKey      = "batch_index"
+	DefaultMapBatchStartIndexInputKey = "batch_start_index"
+	DefaultMapBatchEndIndexInputKey   = "batch_end_index"
+	DefaultMapBatchItemCountInputKey  = "batch_item_count"
+	DefaultMapOnError                 = "fail"
 )

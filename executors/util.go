@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// parseConfig unmarshals a node's config into a typed struct.
-func parseConfig[T any](raw interface{}) (T, error) {
+// ParseConfig unmarshals a node's config into a typed struct.
+func ParseConfig[T any](raw interface{}) (T, error) {
 	var cfg T
 	data, err := json.Marshal(raw)
 	if err != nil {

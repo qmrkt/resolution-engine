@@ -34,6 +34,7 @@ func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dat
 
 	engine.RegisterExecutor("api_fetch", executors.NewAPIFetchExecutor())
 	engine.RegisterExecutor("llm_call", executors.NewLLMCallExecutorWithConfig(llmConfig))
+	engine.RegisterExecutor("agent_loop", executors.NewAgentLoopExecutorWithConfig(llmConfig, engine))
 	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
 	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
 	engine.RegisterExecutor("defer_resolution", executors.NewDeferResolutionExecutor())
@@ -192,10 +193,6 @@ func sortedContextKeys(values map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-func (r *Runner) executeResolution(appID int, resolutionLogicJSON []byte, opts ...RunOptions) (*dag.RunState, error) {
-	return r.executeResolutionWithInputs(appID, resolutionLogicJSON, nil, firstRunOptions(opts...))
 }
 
 func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []byte, extraInputs map[string]string, opts RunOptions) (*dag.RunState, error) {

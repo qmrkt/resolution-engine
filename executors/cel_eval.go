@@ -20,7 +20,7 @@ func NewCelEvalExecutor() *CelEvalExecutor {
 }
 
 func (e *CelEvalExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, err := parseConfig[CelEvalConfig](node.Config)
+	cfg, err := ParseConfig[CelEvalConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("cel_eval config: %w", err)
 	}

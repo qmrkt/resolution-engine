@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1018,33 +1020,81 @@ func TestCelEvalInvalidExpressionFails(t *testing.T) {
 // --- map executor tests ---
 
 type mapTestExecutor struct {
-	outputs map[string]string
-	failOn  int // item index to fail on, -1 = never
+	outputs     map[string]string
+	failOnBatch int // batch index to fail on, -1 = never
+
+	mu     sync.Mutex
+	active int
+	peak   int
+	order  []int
+
+	started chan int
+	release <-chan struct{}
 }
 
-func (e *mapTestExecutor) Execute(_ context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	if e.failOn >= 0 {
-		idx := execCtx.Get("item_index")
-		if idx == fmt.Sprintf("%d", e.failOn) {
-			return dag.ExecutorResult{}, fmt.Errorf("deliberate failure on item %s", idx)
+func (e *mapTestExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+	idx, _ := strconv.Atoi(execCtx.Get("batch_index"))
+
+	e.mu.Lock()
+	e.active++
+	if e.active > e.peak {
+		e.peak = e.active
+	}
+	e.order = append(e.order, idx)
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.active--
+		e.mu.Unlock()
+	}()
+
+	if e.started != nil {
+		e.started <- idx
+	}
+	if e.release != nil {
+		select {
+		case <-e.release:
+		case <-ctx.Done():
+			return dag.ExecutorResult{}, ctx.Err()
 		}
 	}
-	outputs := make(map[string]string, len(e.outputs)+2)
+
+	if e.failOnBatch >= 0 && idx == e.failOnBatch {
+		return dag.ExecutorResult{}, fmt.Errorf("deliberate failure on batch %d", idx)
+	}
+	outputs := make(map[string]string, len(e.outputs)+5)
 	for k, v := range e.outputs {
 		outputs[k] = v
 	}
-	outputs["item_echo"] = execCtx.Get("item")
+	outputs["batch_echo"] = execCtx.Get("batch")
+	outputs["batch_index"] = execCtx.Get("batch_index")
+	outputs["batch_item_count"] = execCtx.Get("batch_item_count")
+	outputs["config_seen"] = execCtx.Get("config")
+	outputs["depth"] = execCtx.Get("__map_depth")
 	outputs["status"] = "success"
 	return dag.ExecutorResult{Outputs: outputs}, nil
 }
 
-func newMapTestEngine(failOn int) *dag.Engine {
+func (e *mapTestExecutor) peakConcurrency() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.peak
+}
+
+func (e *mapTestExecutor) executionOrder() []int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]int(nil), e.order...)
+}
+
+func newMapTestEngine(failOnBatch int) (*dag.Engine, *mapTestExecutor) {
 	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("step", &mapTestExecutor{
-		outputs: map[string]string{"processed": "true"},
-		failOn:  failOn,
-	})
-	return engine
+	exec := &mapTestExecutor{
+		outputs:     map[string]string{"processed": "true"},
+		failOnBatch: failOnBatch,
+	}
+	engine.RegisterExecutor("step", exec)
+	return engine, exec
 }
 
 func simpleInlineBlueprint() *dag.Blueprint {
@@ -1055,8 +1105,8 @@ func simpleInlineBlueprint() *dag.Blueprint {
 	}
 }
 
-func TestMapExecutorParallel(t *testing.T) {
-	engine := newMapTestEngine(-1)
+func TestMapExecutorDefaultSequentialBatch(t *testing.T) {
+	engine, tracker := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
 	ctx.Set("items", `["apple","banana","cherry"]`)
@@ -1067,7 +1117,6 @@ func TestMapExecutorParallel(t *testing.T) {
 		Config: map[string]interface{}{
 			"items_key": "items",
 			"inline":    simpleInlineBlueprint(),
-			"mode":      "parallel",
 		},
 	}
 
@@ -1078,14 +1127,20 @@ func TestMapExecutorParallel(t *testing.T) {
 	if result.Outputs["status"] != "success" {
 		t.Fatalf("status = %q, want success", result.Outputs["status"])
 	}
-	if result.Outputs["completed_count"] != "3" {
-		t.Fatalf("completed_count = %q, want 3", result.Outputs["completed_count"])
+	if result.Outputs["completed_batches"] != "3" {
+		t.Fatalf("completed_batches = %q, want 3", result.Outputs["completed_batches"])
 	}
-	if result.Outputs["total_count"] != "3" {
-		t.Fatalf("total_count = %q, want 3", result.Outputs["total_count"])
+	if result.Outputs["total_items"] != "3" {
+		t.Fatalf("total_items = %q, want 3", result.Outputs["total_items"])
+	}
+	if tracker.peakConcurrency() != 1 {
+		t.Fatalf("peak concurrency = %d, want 1", tracker.peakConcurrency())
+	}
+	if got := fmt.Sprint(tracker.executionOrder()); got != "[0 1 2]" {
+		t.Fatalf("execution order = %s, want [0 1 2]", got)
 	}
 
-	var results []mapItemResult
+	var results []mapBatchResult
 	if err := json.Unmarshal([]byte(result.Outputs["results"]), &results); err != nil {
 		t.Fatal(err)
 	}
@@ -1094,24 +1149,28 @@ func TestMapExecutorParallel(t *testing.T) {
 	}
 	for _, r := range results {
 		if r.Status != "completed" {
-			t.Fatalf("item %d status = %q, want completed", r.Index, r.Status)
+			t.Fatalf("batch %d status = %q, want completed", r.BatchIndex, r.Status)
+		}
+		if r.BatchItemCount != 1 {
+			t.Fatalf("batch %d item count = %d, want 1", r.BatchIndex, r.BatchItemCount)
 		}
 	}
 }
 
-func TestMapExecutorSequential(t *testing.T) {
-	engine := newMapTestEngine(-1)
+func TestMapExecutorBatchSizeChunksItems(t *testing.T) {
+	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[1, 2, 3]`)
+	ctx.Set("items", `[1, 2, 3, 4, 5]`)
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
-			"inline":    simpleInlineBlueprint(),
-			"mode":      "sequential",
+			"items_key":       "items",
+			"inline":          simpleInlineBlueprint(),
+			"batch_size":      2,
+			"max_concurrency": 1,
 		},
 	}
 
@@ -1119,13 +1178,25 @@ func TestMapExecutorSequential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["completed_count"] != "3" {
-		t.Fatalf("completed_count = %q, want 3", result.Outputs["completed_count"])
+	if result.Outputs["total_batches"] != "3" {
+		t.Fatalf("total_batches = %q, want 3", result.Outputs["total_batches"])
+	}
+	var results []mapBatchResult
+	if err := json.Unmarshal([]byte(result.Outputs["results"]), &results); err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := []int{2, 2, 1}
+	wantStarts := []int{0, 2, 4}
+	wantEnds := []int{1, 3, 4}
+	for i, result := range results {
+		if result.BatchItemCount != wantCounts[i] || result.BatchStartIndex != wantStarts[i] || result.BatchEndIndex != wantEnds[i] {
+			t.Fatalf("batch %d metadata = count:%d start:%d end:%d", i, result.BatchItemCount, result.BatchStartIndex, result.BatchEndIndex)
+		}
 	}
 }
 
 func TestMapExecutorMaxItems(t *testing.T) {
-	engine := newMapTestEngine(-1)
+	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
 	items := make([]int, 200)
@@ -1154,20 +1225,118 @@ func TestMapExecutorMaxItems(t *testing.T) {
 	}
 }
 
-func TestMapExecutorOnErrorFail(t *testing.T) {
-	engine := newMapTestEngine(1) // fail on item index 1
+func TestMapExecutorMaxConcurrencyBoundsParallelism(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan int, 10)
+	engine := dag.NewEngine(nil)
+	tracker := &mapTestExecutor{
+		outputs:     map[string]string{"processed": "true"},
+		failOnBatch: -1,
+		started:     started,
+		release:     release,
+	}
+	engine.RegisterExecutor("step", tracker)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
-	ctx.Set("items", `["a","b","c"]`)
+	ctx.Set("items", `[0,1,2,3,4,5,6,7,8,9]`)
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
-			"inline":    simpleInlineBlueprint(),
-			"mode":      "sequential",
-			"on_error":  "fail",
+			"items_key":       "items",
+			"inline":          simpleInlineBlueprint(),
+			"batch_size":      1,
+			"max_concurrency": 3,
+		},
+	}
+
+	done := make(chan struct {
+		result dag.ExecutorResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := exec.Execute(context.Background(), node, ctx)
+		done <- struct {
+			result dag.ExecutorResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	waitForMapStarts(t, started, 3)
+	if peak := tracker.peakConcurrency(); peak != 3 {
+		t.Fatalf("peak concurrency before release = %d, want 3", peak)
+	}
+	close(release)
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if out.result.Outputs["completed_batches"] != "10" {
+		t.Fatalf("completed_batches = %q, want 10", out.result.Outputs["completed_batches"])
+	}
+	if peak := tracker.peakConcurrency(); peak > 3 {
+		t.Fatalf("peak concurrency = %d, want <= 3", peak)
+	}
+}
+
+func TestMapExecutorFullParallelism(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan int, 5)
+	engine := dag.NewEngine(nil)
+	tracker := &mapTestExecutor{
+		outputs:     map[string]string{"processed": "true"},
+		failOnBatch: -1,
+		started:     started,
+		release:     release,
+	}
+	engine.RegisterExecutor("step", tracker)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `[0,1,2,3,4]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key":       "items",
+			"inline":          simpleInlineBlueprint(),
+			"batch_size":      1,
+			"max_concurrency": 0,
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := exec.Execute(context.Background(), node, ctx)
+		done <- err
+	}()
+
+	waitForMapStarts(t, started, 5)
+	if peak := tracker.peakConcurrency(); peak != 5 {
+		t.Fatalf("peak concurrency = %d, want 5", peak)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMapExecutorOnErrorFailSkipsUnstartedBatches(t *testing.T) {
+	engine, _ := newMapTestEngine(1)
+	exec := NewMapExecutor(engine)
+	ctx := dag.NewContext(nil)
+	ctx.Set("items", `["a","b","c","d"]`)
+
+	node := dag.NodeDef{
+		ID:   "mapper",
+		Type: "map",
+		Config: map[string]interface{}{
+			"items_key":       "items",
+			"inline":          simpleInlineBlueprint(),
+			"batch_size":      1,
+			"max_concurrency": 1,
+			"on_error":        "fail",
 		},
 	}
 
@@ -1175,16 +1344,25 @@ func TestMapExecutorOnErrorFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["failed_count"] == "0" {
-		t.Fatal("expected at least one failure")
+	if result.Outputs["completed_batches"] != "1" {
+		t.Fatalf("completed_batches = %q, want 1", result.Outputs["completed_batches"])
+	}
+	if result.Outputs["failed_batches"] != "1" {
+		t.Fatalf("failed_batches = %q, want 1", result.Outputs["failed_batches"])
+	}
+	if result.Outputs["skipped_batches"] != "2" {
+		t.Fatalf("skipped_batches = %q, want 2", result.Outputs["skipped_batches"])
+	}
+	if result.Outputs["status"] != "partial" {
+		t.Fatalf("status = %q, want partial", result.Outputs["status"])
 	}
 	if result.Outputs["first_error"] == "" {
 		t.Fatal("expected first_error to be set")
 	}
 }
 
-func TestMapExecutorOnErrorContinue(t *testing.T) {
-	engine := newMapTestEngine(1) // fail on item index 1
+func TestMapExecutorOnErrorContinueRunsAllBatches(t *testing.T) {
+	engine, _ := newMapTestEngine(1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
 	ctx.Set("items", `["a","b","c"]`)
@@ -1193,10 +1371,11 @@ func TestMapExecutorOnErrorContinue(t *testing.T) {
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
-			"inline":    simpleInlineBlueprint(),
-			"mode":      "sequential",
-			"on_error":  "continue",
+			"items_key":       "items",
+			"inline":          simpleInlineBlueprint(),
+			"batch_size":      1,
+			"max_concurrency": 1,
+			"on_error":        "continue",
 		},
 	}
 
@@ -1204,19 +1383,19 @@ func TestMapExecutorOnErrorContinue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["completed_count"] != "2" {
-		t.Fatalf("completed_count = %q, want 2", result.Outputs["completed_count"])
+	if result.Outputs["completed_batches"] != "2" {
+		t.Fatalf("completed_batches = %q, want 2", result.Outputs["completed_batches"])
 	}
-	if result.Outputs["failed_count"] != "1" {
-		t.Fatalf("failed_count = %q, want 1", result.Outputs["failed_count"])
+	if result.Outputs["failed_batches"] != "1" {
+		t.Fatalf("failed_batches = %q, want 1", result.Outputs["failed_batches"])
 	}
-	if result.Outputs["status"] != "partial" {
-		t.Fatalf("status = %q, want partial", result.Outputs["status"])
+	if result.Outputs["skipped_batches"] != "0" {
+		t.Fatalf("skipped_batches = %q, want 0", result.Outputs["skipped_batches"])
 	}
 }
 
 func TestMapExecutorEmptyArray(t *testing.T) {
-	engine := newMapTestEngine(-1)
+	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
 	ctx.Set("items", `[]`)
@@ -1234,14 +1413,17 @@ func TestMapExecutorEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["total_count"] != "0" {
-		t.Fatalf("total_count = %q, want 0", result.Outputs["total_count"])
+	if result.Outputs["total_items"] != "0" {
+		t.Fatalf("total_items = %q, want 0", result.Outputs["total_items"])
+	}
+	if result.Outputs["total_batches"] != "0" {
+		t.Fatalf("total_batches = %q, want 0", result.Outputs["total_batches"])
 	}
 }
 
 func TestMapExecutorInputMappings(t *testing.T) {
 	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("step", &mapTestExecutor{outputs: map[string]string{}, failOn: -1})
+	engine.RegisterExecutor("step", &mapTestExecutor{outputs: map[string]string{}, failOnBatch: -1})
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(map[string]string{"shared_config": "abc123"})
 	ctx.Set("items", `["x"]`)
@@ -1255,7 +1437,7 @@ func TestMapExecutorInputMappings(t *testing.T) {
 			"input_mappings": map[string]interface{}{
 				"config": "shared_config",
 			},
-			"output_keys": []interface{}{"step.item_echo", "step.status"},
+			"output_keys": []interface{}{"step.batch_echo", "step.status", "step.config_seen"},
 		},
 	}
 
@@ -1263,17 +1445,20 @@ func TestMapExecutorInputMappings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var results []mapItemResult
+	var results []mapBatchResult
 	if err := json.Unmarshal([]byte(result.Outputs["results"]), &results); err != nil {
 		t.Fatal(err)
 	}
 	if len(results) != 1 || results[0].Status != "completed" {
 		t.Fatalf("expected 1 completed result, got %+v", results)
 	}
+	if results[0].Outputs["step.config_seen"] != "abc123" {
+		t.Fatalf("mapped config = %q, want abc123", results[0].Outputs["step.config_seen"])
+	}
 }
 
-func TestMapExecutorRejectsNestedMap(t *testing.T) {
-	engine := dag.NewEngine(nil)
+func TestMapExecutorRejectsDeprecatedMode(t *testing.T) {
+	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
 	ctx := dag.NewContext(nil)
 	ctx.Set("items", `[1]`)
@@ -1283,19 +1468,30 @@ func TestMapExecutorRejectsNestedMap(t *testing.T) {
 		Type: "map",
 		Config: map[string]interface{}{
 			"items_key": "items",
-			"inline": &dag.Blueprint{
-				Nodes: []dag.NodeDef{
-					{ID: "nested", Type: "map", Config: map[string]interface{}{}},
-				},
-			},
+			"inline":    simpleInlineBlueprint(),
+			"mode":      "parallel",
 		},
 	}
 
 	_, err := exec.Execute(context.Background(), node, ctx)
 	if err == nil {
-		t.Fatal("expected error for nested map node")
+		t.Fatal("expected error for deprecated mode")
 	}
-	if !strings.Contains(err.Error(), "must not contain map nodes") {
+	if !strings.Contains(err.Error(), "no longer supported") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func waitForMapStarts(t *testing.T, started <-chan int, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	seen := make(map[int]struct{}, want)
+	for len(seen) < want {
+		select {
+		case idx := <-started:
+			seen[idx] = struct{}{}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d map batches to start; saw %v", want, seen)
+		}
 	}
 }

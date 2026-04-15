@@ -25,7 +25,7 @@ func NewWaitExecutor() *WaitExecutor {
 }
 
 func (e *WaitExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, err := parseConfig[WaitConfig](node.Config)
+	cfg, err := ParseConfig[WaitConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("wait config: %w", err)
 	}

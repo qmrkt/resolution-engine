@@ -93,7 +93,7 @@ func NewLLMCallExecutorWithConfig(cfg LLMCallExecutorConfig) *LLMCallExecutor {
 }
 
 func (e *LLMCallExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, err := parseConfig[LLMCallConfig](node.Config)
+	cfg, err := ParseConfig[LLMCallConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("llm_call config: %w", err)
 	}

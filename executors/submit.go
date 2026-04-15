@@ -25,7 +25,7 @@ func NewSubmitResultExecutor() *SubmitResultExecutor {
 }
 
 func (e *SubmitResultExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, _ := parseConfig[SubmitResultConfig](node.Config)
+	cfg, _ := ParseConfig[SubmitResultConfig](node.Config)
 
 	// Find the outcome index from context
 	outcome := ""
@@ -96,7 +96,7 @@ func NewCancelMarketExecutor() *CancelMarketExecutor {
 }
 
 func (e *CancelMarketExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	cfg, _ := parseConfig[CancelMarketConfig](node.Config)
+	cfg, _ := ParseConfig[CancelMarketConfig](node.Config)
 	reason := cfg.Reason
 	if reason == "" {
 		reason = "resolution failed"

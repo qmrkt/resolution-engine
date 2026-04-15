@@ -37,21 +37,6 @@ func makeBlueprint(id, nodeType string) []byte {
 	return data
 }
 
-func makeBlueprintWithSubmit(id, fetchType string) []byte {
-	bp := dag.Blueprint{
-		ID: id,
-		Nodes: []dag.NodeDef{
-			{ID: "step", Type: fetchType, Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
-		},
-		Edges: []dag.EdgeDef{
-			{From: "step", To: "submit", Condition: "step.status == 'success'"},
-		},
-	}
-	data, _ := json.Marshal(bp)
-	return data
-}
-
 func TestIsResolutionSuccessful(t *testing.T) {
 	tests := []struct {
 		name     string
