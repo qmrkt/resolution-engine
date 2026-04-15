@@ -10,3 +10,4 @@ data/
 
 # Misc
 .hermes
+.DS_Store
