@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,6 +28,27 @@ func (m *mockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Conte
 		return ExecutorResult{}, m.err
 	}
 	return ExecutorResult{Outputs: m.outputs, Usage: m.usage}, nil
+}
+
+type concurrencyRecordingExecutor struct {
+	delay     time.Duration
+	active    atomic.Int32
+	maxActive atomic.Int32
+}
+
+func (e *concurrencyRecordingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+	active := e.active.Add(1)
+	for {
+		maxActive := e.maxActive.Load()
+		if active <= maxActive || e.maxActive.CompareAndSwap(maxActive, active) {
+			break
+		}
+	}
+	defer e.active.Add(-1)
+	if e.delay > 0 {
+		time.Sleep(e.delay)
+	}
+	return ExecutorResult{Outputs: map[string]string{"done": "yes"}}, nil
 }
 
 // contextAwareExecutor reads context during execution.
@@ -338,11 +360,8 @@ func TestBudgetTimeout(t *testing.T) {
 
 func TestParallelExecution(t *testing.T) {
 	engine := NewEngine(slog.Default())
-
-	engine.RegisterExecutor("work", &mockExecutor{
-		outputs: map[string]string{"done": "yes"},
-		delay:   100 * time.Millisecond,
-	})
+	work := &concurrencyRecordingExecutor{delay: 100 * time.Millisecond}
+	engine.RegisterExecutor("work", work)
 
 	bp := Blueprint{
 		ID: "test-parallel",
@@ -354,9 +373,7 @@ func TestParallelExecution(t *testing.T) {
 		// No edges — all three are roots and should run in parallel
 	}
 
-	start := time.Now()
 	run, err := engine.Execute(context.Background(), bp, nil)
-	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatal(err)
@@ -364,9 +381,8 @@ func TestParallelExecution(t *testing.T) {
 	if run.Status != "completed" {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
-	// If parallel, should complete in ~100ms, not ~300ms
-	if elapsed > 250*time.Millisecond {
-		t.Fatalf("expected parallel execution (<250ms), took %v", elapsed)
+	if maxActive := work.maxActive.Load(); maxActive < 2 {
+		t.Fatalf("expected parallel execution, max active workers = %d", maxActive)
 	}
 }
 

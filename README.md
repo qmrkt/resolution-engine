@@ -372,9 +372,10 @@ Optional local TLA+ model checks live in `tla/`:
 ./tla/check-tla.sh
 ```
 
-They model the single-node durable execution state machine: queueing, workers,
-suspension, timer/signal resume, cancellation, restart recovery, and callback
-delivery.
+They model the single-node durable execution state machine and DAG frontier
+bookkeeping: queueing, workers, suspension, timer/signal resume, cancellation,
+restart recovery, callback delivery, back-edge reactivation, and duplicate-run
+prevention for terminal DAG nodes.
 
 ## License
 

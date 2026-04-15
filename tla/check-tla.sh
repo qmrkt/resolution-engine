@@ -23,10 +23,11 @@ if [[ ! -f "${JAR_PATH}" ]]; then
 fi
 
 run_tlc() {
-  local cfg="$1"
-  local label="$2"
+  local module="$1"
+  local cfg="$2"
+  local label="$3"
   set +e
-  java -Xss32m -cp "${JAR_PATH}" tlc2.TLC -config "${cfg}" "${ROOT_DIR}/DurableExecution.tla" -workers auto
+  java -Xss32m -cp "${JAR_PATH}" tlc2.TLC -config "${cfg}" "${ROOT_DIR}/${module}.tla" -workers auto
   local s=$?
   set -e
   if [[ ${s} -eq 0 ]]; then
@@ -38,8 +39,9 @@ run_tlc() {
 }
 
 status=0
-run_tlc "${ROOT_DIR}/DurableExecution.cfg" "DurableExecution.cfg (two workers)" || status=$?
-run_tlc "${ROOT_DIR}/DurableExecution.single_worker.cfg" "DurableExecution.single_worker.cfg" || status=$?
+run_tlc "DurableExecution" "${ROOT_DIR}/DurableExecution.cfg" "DurableExecution.cfg (two workers)" || status=$?
+run_tlc "DurableExecution" "${ROOT_DIR}/DurableExecution.single_worker.cfg" "DurableExecution.single_worker.cfg" || status=$?
+run_tlc "DurableDagFrontier" "${ROOT_DIR}/DurableDagFrontier.cfg" "DurableDagFrontier.cfg" || status=$?
 
 rm -rf "${ROOT_DIR}/states"
 

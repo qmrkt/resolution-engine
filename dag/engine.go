@@ -105,12 +105,11 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 	execCtx.Set("input.resolution_run_id", run.ID)
 	execCtx.Set("__run_id", run.ID)
 	run.Inputs = execCtx.Snapshot()
-	run.Context = execCtx.Snapshot()
 
 	for _, node := range bp.Nodes {
 		run.NodeStates[node.ID] = NodeState{Status: "pending"}
 	}
-	notifyObserver(observer, run)
+	notifyObserver(observer, run, execCtx)
 
 	err := e.runStateMachine(ctx, bp, run, execCtx, observer, cancelExecution)
 
@@ -120,7 +119,7 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 	if err != nil {
 		run.Status = "failed"
 		run.Error = err.Error()
-		notifyObserver(observer, run)
+		notifyObserver(observer, run, nil)
 		return run, err
 	}
 
@@ -141,7 +140,7 @@ func (e *Engine) ExecuteWithObserver(ctx context.Context, bp Blueprint, inputs m
 		run.Status = "completed"
 		run.Error = ""
 	}
-	notifyObserver(observer, run)
+	notifyObserver(observer, run, nil)
 
 	return run, nil
 }
@@ -186,17 +185,15 @@ func (e *Engine) runStateMachine(
 	for {
 		if err := ctx.Err(); err != nil {
 			run.EdgeTraversals = scheduler.TraversalSnapshot()
-			run.Context = execCtx.Snapshot()
 			if syncSkippedNodeStates(run, scheduler, time.Now().UTC().Format(time.RFC3339)) {
-				notifyObserver(observer, run)
+				notifyObserver(observer, run, execCtx)
 			}
 			return fmt.Errorf("execution cancelled: %w", err)
 		}
 
 		ready := scheduler.ReadyNodes(completed, failed, running)
-		run.Context = execCtx.Snapshot()
 		if syncSkippedNodeStates(run, scheduler, time.Now().UTC().Format(time.RFC3339)) {
-			notifyObserver(observer, run)
+			notifyObserver(observer, run, execCtx)
 		}
 		// Filter to only activated nodes
 		filteredReady := make([]string, 0, len(ready))
@@ -258,8 +255,7 @@ func (e *Engine) runStateMachine(
 				resultCh <- nodeResult{nodeID: nid, result: result, err: err}
 			}(nodeID)
 		}
-		run.Context = execCtx.Snapshot()
-		notifyObserver(observer, run)
+		notifyObserver(observer, run, execCtx)
 
 		// Wait for all parallel nodes
 		go func() {
@@ -358,8 +354,7 @@ func (e *Engine) runStateMachine(
 			delete(inputSnapshots, nr.nodeID)
 			delete(startedAt, nr.nodeID)
 			if budgetErr != nil {
-				run.Context = execCtx.Snapshot()
-				notifyObserver(observer, run)
+				notifyObserver(observer, run, execCtx)
 				continue
 			}
 
@@ -396,8 +391,7 @@ func (e *Engine) runStateMachine(
 					run.NodeStates[edge.To] = state
 				}
 			}
-			run.Context = execCtx.Snapshot()
-			notifyObserver(observer, run)
+			notifyObserver(observer, run, execCtx)
 		}
 
 		if budgetErr != nil {
@@ -405,9 +399,8 @@ func (e *Engine) runStateMachine(
 		}
 	}
 	run.EdgeTraversals = scheduler.TraversalSnapshot()
-	run.Context = execCtx.Snapshot()
 	if syncSkippedNodeStates(run, scheduler, time.Now().UTC().Format(time.RFC3339)) {
-		notifyObserver(observer, run)
+		notifyObserver(observer, run, execCtx)
 	}
 
 	if budgetErr != nil {
@@ -502,9 +495,14 @@ func cloneBlueprint(bp Blueprint) Blueprint {
 	return cloned
 }
 
-func notifyObserver(observer RunObserver, run *RunState) {
+func notifyObserver(observer RunObserver, run *RunState, execCtx *Context) {
 	if observer == nil || run == nil {
 		return
+	}
+	// Materialize context only for observers; normal execution keeps execCtx as
+	// the source of truth until the final returned run state is assembled.
+	if execCtx != nil {
+		run.Context = execCtx.Snapshot()
 	}
 	observer.OnRunSnapshot(cloneRunState(run))
 }

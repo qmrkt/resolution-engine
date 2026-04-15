@@ -3,17 +3,31 @@ package dag
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
 
+// celCache stores compiled CEL programs keyed on (expression + variable type
+// signature). Cache entries are immutable and safe for concurrent use.
+var celCache sync.Map // string → *celCachedProgram
+
+type celCachedProgram struct {
+	prog cel.Program
+}
+
 // EvalCondition evaluates a CEL expression against context values.
 // String values that are valid JSON arrays, objects, numbers, or booleans
 // are passed to CEL with their native types so expressions like
 // fetch._runs.size() or fetch._runs[0].status work naturally.
+//
+// Compiled CEL programs are cached keyed on (expression, referenced variable
+// type signature) so repeated evaluations of the same edge condition skip
+// environment creation, parsing, and compilation.
 func EvalCondition(expression string, ctx *Context) (bool, error) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" {
@@ -23,25 +37,22 @@ func EvalCondition(expression string, ctx *Context) (bool, error) {
 	values := ctx.ValuesForEval()
 
 	// Parse string values into native types where possible.
-	activation := make(map[string]any, len(values))
+	fullActivation := make(map[string]any, len(values))
 	for k, v := range values {
-		activation[k] = inferTypedValue(v)
+		fullActivation[k] = inferTypedValue(v)
 	}
 
-	varDecls := make([]cel.EnvOption, 0, len(values)+8)
-	for k, v := range activation {
-		varDecls = append(varDecls, cel.Variable(k, inferCELType(v)))
-	}
+	// Only declare variables the expression actually references.
+	allIdents := extractIdentifiers(expression, nil)
+	varDecls, activation, varSig := resolveExpressionVars(allIdents, fullActivation)
 
-	// Declare identifiers in the expression that aren't in values.
-	// Skip identifiers that are sub-paths of an existing map or list variable
-	// (e.g. don't declare "judge.details.outcome" when "judge.details" is a map).
-	for _, ident := range extractIdentifiers(expression, values) {
-		if isSubpathOfStructuredVar(ident, activation) {
-			continue
+	cacheKey := expression + "\x00" + varSig
+	if cached, ok := celCache.Load(cacheKey); ok {
+		out, _, err := cached.(*celCachedProgram).prog.Eval(activation)
+		if err != nil {
+			return false, fmt.Errorf("cel eval: %w", err)
 		}
-		varDecls = append(varDecls, cel.Variable(ident, cel.StringType))
-		activation[ident] = ""
+		return celToBool(out), nil
 	}
 
 	env, err := cel.NewEnv(varDecls...)
@@ -59,12 +70,85 @@ func EvalCondition(expression string, ctx *Context) (bool, error) {
 		return false, fmt.Errorf("cel program: %w", err)
 	}
 
+	celCache.Store(cacheKey, &celCachedProgram{prog: prog})
+
 	out, _, err := prog.Eval(activation)
 	if err != nil {
 		return false, fmt.Errorf("cel eval: %w", err)
 	}
 
 	return celToBool(out), nil
+}
+
+// resolveExpressionVars builds CEL variable declarations and a minimal
+// activation map for only the variables an expression references. It returns
+// a deterministic type signature string for cache keying.
+func resolveExpressionVars(exprIdents []string, fullActivation map[string]any) ([]cel.EnvOption, map[string]any, string) {
+	sort.Strings(exprIdents)
+
+	decls := make([]cel.EnvOption, 0, len(exprIdents))
+	activation := make(map[string]any, len(exprIdents))
+	declared := make(map[string]struct{})
+	var sig strings.Builder
+
+	for _, ident := range exprIdents {
+		// Direct match in context.
+		if v, ok := fullActivation[ident]; ok {
+			if _, done := declared[ident]; !done {
+				celType := inferCELType(v)
+				decls = append(decls, cel.Variable(ident, celType))
+				activation[ident] = v
+				declared[ident] = struct{}{}
+				sig.WriteString(ident)
+				sig.WriteByte(':')
+				sig.WriteString(celType.String())
+				sig.WriteByte(',')
+			}
+			continue
+		}
+
+		// Check if a prefix is a structured var (map or list) — CEL
+		// resolves the remainder as field access / method call.
+		// E.g. ident="fetch._runs.size" → declare "fetch._runs" as list.
+		prefixFound := false
+		for i := len(ident) - 1; i > 0; i-- {
+			if ident[i] != '.' {
+				continue
+			}
+			prefix := ident[:i]
+			if v, ok := fullActivation[prefix]; ok {
+				switch v.(type) {
+				case map[string]any, []any:
+					if _, done := declared[prefix]; !done {
+						celType := inferCELType(v)
+						decls = append(decls, cel.Variable(prefix, celType))
+						activation[prefix] = v
+						declared[prefix] = struct{}{}
+						sig.WriteString(prefix)
+						sig.WriteByte(':')
+						sig.WriteString(celType.String())
+						sig.WriteByte(',')
+					}
+					prefixFound = true
+				}
+				break
+			}
+		}
+		if prefixFound {
+			continue
+		}
+
+		// Unknown variable — declare as empty string.
+		if _, done := declared[ident]; !done {
+			decls = append(decls, cel.Variable(ident, cel.StringType))
+			activation[ident] = ""
+			declared[ident] = struct{}{}
+			sig.WriteString(ident)
+			sig.WriteString(":string,")
+		}
+	}
+
+	return decls, activation, sig.String()
 }
 
 // inferTypedValue attempts to parse a string as a JSON array or object.
