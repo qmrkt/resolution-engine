@@ -18,6 +18,10 @@ type RunManagerAPI interface {
 	ActiveCount() int
 }
 
+type SignalRunManagerAPI interface {
+	Signal(signalRequest) (signalResult, error)
+}
+
 type EngineServer struct {
 	manager   RunManagerAPI
 	logger    interface{}
@@ -46,6 +50,7 @@ func (s *EngineServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/run", s.handleRun)
 	mux.HandleFunc("/runs/", s.handleRunByID)
+	mux.HandleFunc("/signals", s.handleSignal)
 	mux.HandleFunc("/health", s.handleHealth)
 	return mux
 }
@@ -105,12 +110,50 @@ func (s *EngineServer) handleRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		var full *queueFullError
+		if errors.As(err, &full) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": err.Error(),
+			})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+func (s *EngineServer) handleSignal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorize(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	manager, ok := s.manager.(SignalRunManagerAPI)
+	if !ok {
+		http.Error(w, "signals are not supported by this run manager", http.StatusNotImplemented)
+		return
+	}
+
+	var payload signalRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	result, err := manager.Signal(payload)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
 }
 

@@ -69,7 +69,11 @@ func main() {
 		slog.Warn("local api_fetch is enabled; use only for trusted local smoke tests", "component", "main")
 	}
 
-	manager := NewRunManager(runner, nil, callbackToken)
+	manager, err := NewDurableRunManager(runner, dataDir, nil, callbackToken, DurableRunManagerConfig{})
+	if err != nil {
+		slog.Error("create durable run manager", "component", "main", "error", err)
+		os.Exit(1)
+	}
 	defer manager.Close()
 	server := NewEngineServer(manager, engineToken)
 

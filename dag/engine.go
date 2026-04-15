@@ -53,6 +53,11 @@ func (e *Engine) getExecutor(nodeType string) (NodeExecutor, bool) {
 	return exec, ok
 }
 
+// ExecutorFor returns the registered executor for a node type.
+func (e *Engine) ExecutorFor(nodeType string) (NodeExecutor, bool) {
+	return e.getExecutor(nodeType)
+}
+
 // Execute runs a blueprint to completion and returns the final run state.
 func (e *Engine) Execute(ctx context.Context, bp Blueprint, inputs map[string]string) (*RunState, error) {
 	return e.ExecuteWithObserver(ctx, bp, inputs, nil)

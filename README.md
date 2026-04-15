@@ -2,14 +2,15 @@
 
 Async blueprint execution service for [question.market](https://question.market).
 
-Scoped to execution only:
+Scoped to blueprint execution orchestration:
 
 - accepts blueprint execution requests over HTTP
 - runs DAG-based resolution logic
 - exposes async run status and cancellation
 - emits structured execution traces for observability
+- owns the execution lifecycle for queued, running, waiting, and terminal runs
 
-It does not poll markets, decide lifecycle transitions, submit on-chain transactions, or own durable orchestration state. Those concerns belong to the indexer/orchestrator.
+It does not own chain indexing or market read models. Those concerns belong to the indexer, which can feed the engine durable resume signals as chain facts change.
 
 ## Quick start
 
@@ -52,17 +53,37 @@ Submit a blueprint execution request.
 }
 ```
 
-Returns `202 Accepted` with a `run_id`. Returns `409 Conflict` if the market already has an active run.
+Returns `202 Accepted` with a `run_id` and durable status, usually `queued`.
+Returns `409 Conflict` if the market already has an active run.
+Returns `429 Too Many Requests` if the local workflow queue is full.
 
 Invalid blueprints are rejected with `400 Bad Request` and a list of validation issues.
 
 ### GET /runs/{run_id}
 
-Returns run state while the engine retains the run (bounded TTL).
+Returns durable run state. Runs may be `queued`, `running`, `waiting`,
+`completed`, `failed`, or `cancelled`.
 
 ### DELETE /runs/{run_id}
 
 Cancels an in-flight run.
+
+### POST /signals
+
+Persist an idempotent resume signal from the indexer or another trusted caller.
+Matching signals resume waiting workflow nodes such as `human_judge` and
+`defer_resolution`.
+
+```json
+{
+  "idempotency_key": "chain-event-123:market-456",
+  "app_id": 456,
+  "run_id": "optional-run-id",
+  "signal_type": "human_judgment.responded",
+  "correlation_key": "456:run-id:judge",
+  "payload": {"outcome": "1", "reason": "Evidence is conclusive."}
+}
+```
 
 ### GET /health
 
@@ -326,10 +347,11 @@ Operationally, each run ends by either deferring, proposing a result, or explici
 
 ## Design notes
 
-- Run state is in-memory and ephemeral. The indexer is the durable source of truth.
+- Run state is durably persisted in the local data directory for single-node operation.
+- `wait`, `human_judge`, and `defer_resolution` suspend runs instead of occupying workers.
+- Resume signals are idempotent and correlated by run, app, or explicit key.
+- Callback URLs are delivered through a durable retrying outbox.
 - Traces are observability, not control-plane state.
-- Terminal results are retained for a bounded TTL, then cleaned up.
-- Callback URLs receive the terminal result via POST when the run completes.
 
 ## Tests
 
@@ -340,6 +362,7 @@ go test ./...
 - `dag/` -- DAG engine, scheduling, CEL expressions
 - `executors/` -- executor unit tests, LLM provider routing
 - `run_manager_test.go` -- async run lifecycle
+- `durable_manager_integration_test.go` -- durable queue, suspend/resume, signals, timers, restart recovery, outbox retry
 - `server_test.go` -- HTTP API
 - `runner_test.go` -- trace lifecycle, evidence persistence
 

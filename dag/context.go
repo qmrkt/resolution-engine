@@ -24,6 +24,18 @@ func NewContext(inputs map[string]string) *Context {
 	return ctx
 }
 
+// NewContextFromSnapshot creates a context from an already materialized flat
+// key-value snapshot without adding input.* aliases.
+func NewContextFromSnapshot(values map[string]string) *Context {
+	ctx := &Context{
+		values: make(map[string]string, len(values)),
+	}
+	for k, v := range values {
+		ctx.values[k] = v
+	}
+	return ctx
+}
+
 // Set stores a key/value pair.
 func (c *Context) Set(key, value string) {
 	if c == nil {

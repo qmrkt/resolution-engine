@@ -17,6 +17,7 @@ type stubRunManager struct {
 	submitFn func(RunRequest) (RunResult, error)
 	getFn    func(string) (RunResult, bool)
 	cancelFn func(string) (RunResult, bool)
+	signalFn func(signalRequest) (signalResult, error)
 }
 
 func (s *stubRunManager) Submit(req RunRequest) (RunResult, error) {
@@ -36,6 +37,12 @@ func (s *stubRunManager) Cancel(runID string) (RunResult, bool) {
 		return RunResult{}, false
 	}
 	return s.cancelFn(runID)
+}
+func (s *stubRunManager) Signal(req signalRequest) (signalResult, error) {
+	if s.signalFn == nil {
+		return signalResult{}, errors.New("signal not implemented")
+	}
+	return s.signalFn(req)
 }
 func (s *stubRunManager) ActiveCount() int { return 2 }
 
@@ -122,6 +129,28 @@ func TestServerDeleteRunCancels(t *testing.T) {
 	}
 }
 
+func TestServerPostSignalDispatchesToManager(t *testing.T) {
+	server := NewEngineServer(&stubRunManager{signalFn: func(req signalRequest) (signalResult, error) {
+		if req.IdempotencyKey != "sig-1" {
+			t.Fatalf("idempotency_key = %q, want sig-1", req.IdempotencyKey)
+		}
+		if req.SignalType != "human_judgment.responded" {
+			t.Fatalf("signal_type = %q, want human_judgment.responded", req.SignalType)
+		}
+		if req.Payload["outcome"] != "1" {
+			t.Fatalf("payload outcome = %q, want 1", req.Payload["outcome"])
+		}
+		return signalResult{RunID: "run-signal", AppID: 42, Status: RunStatusQueued}, nil
+	}}, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewReader([]byte(`{"idempotency_key":"sig-1","app_id":42,"run_id":"run-signal","signal_type":"human_judgment.responded","correlation_key":"42:run-signal:judge","payload":{"outcome":"1"}}`)))
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
 func TestServerHealthIncludesActiveRuns(t *testing.T) {
 	server := NewEngineServer(&stubRunManager{}, "")
 
@@ -151,6 +180,9 @@ func TestBuildRunResultCancellation(t *testing.T) {
 func TestRunManagerPostsCallbackOnTerminalResult(t *testing.T) {
 	received := make(chan RunResult, 1)
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer callback-token" {
+			t.Fatalf("authorization header = %q, want Bearer callback-token", got)
+		}
 		var result RunResult
 		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
 			t.Fatal(err)
@@ -160,8 +192,8 @@ func TestRunManagerPostsCallbackOnTerminalResult(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
-	exec := &fakeRunExecutor{run: &dag.RunState{Status: "completed", Context: map[string]string{"submit.outcome": "1", "submit.evidence_hash": "abc", "submit.submitted": "true"}}}
-	manager := NewRunManager(exec, nil, "")
+	exec := &fakeRunExecutor{run: completedRun()}
+	manager := NewRunManager(exec, nil, "callback-token")
 	defer manager.Close()
 	if _, err := manager.Submit(RunRequest{RunID: "run-callback", AppID: 26, BlueprintJSON: []byte(`{"id":"bp"}`), CallbackURL: callbackServer.URL}); err != nil {
 		t.Fatal(err)

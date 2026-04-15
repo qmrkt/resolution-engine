@@ -14,7 +14,9 @@ type RunAction string
 
 const (
 	RunStatusAccepted  RunStatus = "accepted"
+	RunStatusQueued    RunStatus = "queued"
 	RunStatusRunning   RunStatus = "running"
+	RunStatusWaiting   RunStatus = "waiting"
 	RunStatusCompleted RunStatus = "completed"
 	RunStatusFailed    RunStatus = "failed"
 	RunStatusCancelled RunStatus = "cancelled"

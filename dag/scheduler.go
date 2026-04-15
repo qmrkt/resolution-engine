@@ -98,6 +98,40 @@ func (s *Scheduler) TraversalSnapshot() map[string]int {
 	return snap
 }
 
+// RestoreTraversals replaces the scheduler traversal counters from a durable
+// checkpoint.
+func (s *Scheduler) RestoreTraversals(traversals map[string]int) {
+	if s == nil {
+		return
+	}
+	s.edgeTraversals = make(map[string]int, len(traversals))
+	for key, value := range traversals {
+		s.edgeTraversals[key] = value
+	}
+}
+
+// InitialActivatedNodes returns the nodes that are active at run start: roots
+// with no incoming forward edges.
+func (s *Scheduler) InitialActivatedNodes() map[string]struct{} {
+	activated := make(map[string]struct{})
+	if s == nil {
+		return activated
+	}
+	for _, node := range s.blueprint.Nodes {
+		hasForwardIncoming := false
+		for _, edge := range s.incoming[node.ID] {
+			if !s.IsBackEdge(edge.From, edge.To) {
+				hasForwardIncoming = true
+				break
+			}
+		}
+		if !hasForwardIncoming {
+			activated[node.ID] = struct{}{}
+		}
+	}
+	return activated
+}
+
 // ReadyNodes returns nodes that can execute now.
 func (s *Scheduler) ReadyNodes(completed, failed, running map[string]struct{}) []string {
 	ready := make([]string, 0)
