@@ -7,24 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
-)
-
-const (
-	LLMProviderAnthropic = "anthropic"
-	LLMProviderOpenAI    = "openai"
-	LLMProviderGoogle    = "google"
-
-	defaultAnthropicModel   = "claude-sonnet-4-6"
-	defaultOpenAIModel      = "gpt-5.4"
-	defaultGoogleModel      = "gemini-3.1-pro-preview"
-	defaultAnthropicBaseURL = "https://api.anthropic.com/v1/messages"
-	defaultOpenAIBaseURL    = "https://api.openai.com/v1/chat/completions"
-	defaultGoogleBaseURL    = "https://generativelanguage.googleapis.com/v1beta/models"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 // LLMCallConfig is the node config for llm_call steps.
@@ -50,13 +36,7 @@ type LLMCallExecutorConfig struct {
 
 // LLMCallExecutor calls an LLM to evaluate evidence and determine an outcome.
 type LLMCallExecutor struct {
-	AnthropicAPIKey  string
-	AnthropicBaseURL string
-	OpenAIAPIKey     string
-	OpenAIBaseURL    string
-	GoogleAPIKey     string
-	GoogleBaseURL    string
-	HTTPClient       *http.Client
+	provider providerLayerConfig
 }
 
 type llmJudgment struct {
@@ -82,13 +62,7 @@ func NewLLMCallExecutor(apiKey string) *LLMCallExecutor {
 
 func NewLLMCallExecutorWithConfig(cfg LLMCallExecutorConfig) *LLMCallExecutor {
 	return &LLMCallExecutor{
-		AnthropicAPIKey:  cfg.AnthropicAPIKey,
-		AnthropicBaseURL: defaultString(cfg.AnthropicBaseURL, defaultAnthropicBaseURL),
-		OpenAIAPIKey:     cfg.OpenAIAPIKey,
-		OpenAIBaseURL:    defaultString(cfg.OpenAIBaseURL, defaultOpenAIBaseURL),
-		GoogleAPIKey:     cfg.GoogleAPIKey,
-		GoogleBaseURL:    defaultString(cfg.GoogleBaseURL, defaultGoogleBaseURL),
-		HTTPClient:       cfg.HTTPClient,
+		provider: newProviderLayerConfig(cfg),
 	}
 }
 
@@ -147,24 +121,19 @@ func (e *LLMCallExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx
 }
 
 func (e *LLMCallExecutor) httpClient() *http.Client {
-	if e.HTTPClient != nil {
-		return e.HTTPClient
-	}
-	return http.DefaultClient
+	return e.provider.httpClient()
 }
 
 func (e *LLMCallExecutor) resolveProvider(provider string, model string) (string, string, error) {
-	switch provider {
-	case LLMProviderAnthropic:
-		return e.AnthropicAPIKey, e.AnthropicBaseURL, nil
-	case LLMProviderOpenAI:
-		return e.OpenAIAPIKey, e.OpenAIBaseURL, nil
-	case LLMProviderGoogle:
-		base := strings.TrimRight(e.GoogleBaseURL, "/")
-		return e.GoogleAPIKey, fmt.Sprintf("%s/%s:generateContent?key=%s", base, url.PathEscape(model), url.QueryEscape(e.GoogleAPIKey)), nil
-	default:
-		return "", "", fmt.Errorf("unsupported llm provider %q", provider)
+	apiKey, err := e.provider.apiKey(provider)
+	if err != nil {
+		return "", "", err
 	}
+	endpoint, err := e.provider.endpoint(provider, model)
+	if err != nil {
+		return "", "", err
+	}
+	return apiKey, endpoint, nil
 }
 
 func (e *LLMCallExecutor) callAnthropic(

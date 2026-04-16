@@ -3,7 +3,7 @@ package executors
 import (
 	"context"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 type DeferResolutionConfig struct {

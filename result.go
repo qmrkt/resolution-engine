@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 type RunStatus string

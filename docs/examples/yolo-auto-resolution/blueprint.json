@@ -1,0 +1,230 @@
+{
+  "id": "yolo-auto-resolution",
+  "name": "YOLO Auto Resolution",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "draft",
+      "type": "agent_loop",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "output_mode": "structured",
+        "max_steps": 8,
+        "max_tool_calls": 6,
+        "prompt": "Draft a child resolution blueprint for this market.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\n\nPrefer primary sources, use redundancy when needed, defer rather than guess, keep the graph bounded, and end with submit_result or defer_resolution. Return the full child blueprint JSON string in blueprint_json.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "strategy_summary": {
+                "type": "string"
+              },
+              "assumptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json",
+              "strategy_summary"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "redteam",
+      "type": "agent_loop",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "output_mode": "structured",
+        "max_steps": 8,
+        "max_tool_calls": 6,
+        "prompt": "Red-team and strengthen this drafted child resolution blueprint.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\nDraft child blueprint JSON: {{draft.output.blueprint_json}}\nDraft notes JSON: {{draft.output_json}}\n\nAssume the draft may trust weak sources, miss ambiguity, or have brittle fallbacks. Strengthen reliability and boundedness, and return the full revised child blueprint JSON string in blueprint_json.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "attack_summary": {
+                "type": "string"
+              },
+              "residual_risks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json",
+              "attack_summary"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "candidate",
+      "type": "cel_eval",
+      "config": {
+        "expressions": {
+          "blueprint_json": "repair.output_json.blueprint_json != '' ? repair.output_json.blueprint_json : redteam.output_json.blueprint_json",
+          "source": "repair.output_json.blueprint_json != '' ? 'repair' : 'redteam'"
+        }
+      }
+    },
+    {
+      "id": "validate",
+      "type": "validate_blueprint",
+      "config": {
+        "blueprint_json_key": "candidate.blueprint_json"
+      }
+    },
+    {
+      "id": "repair",
+      "type": "agent_loop",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "output_mode": "structured",
+        "max_steps": 6,
+        "max_tool_calls": 4,
+        "prompt": "Repair this child resolution blueprint so it passes validation.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\nCurrent child blueprint JSON: {{candidate.blueprint_json}}\nValidation issues JSON: {{validate.issues_json}}\nValidation issues text:\n{{validate.issues_text}}\n\nFix only what is necessary, preserve conservative fallbacks, and return the full repaired child blueprint JSON string in blueprint_json.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "repair_notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "run_child",
+      "type": "gadget",
+      "config": {
+        "blueprint_json_key": "candidate.blueprint_json",
+        "propagate_terminal": true,
+        "timeout_seconds": 600,
+        "max_depth": 1,
+        "input_mappings": {
+          "market.question": "market.question",
+          "market.outcomes_json": "market.outcomes_json",
+          "market.resolution_rules": "market.resolution_rules",
+          "market.context_json": "market.context_json",
+          "market.sources_json": "market.sources_json"
+        },
+        "dynamic_blueprint_policy": {
+          "allowed_node_types": [
+            "api_fetch",
+            "llm_call",
+            "agent_loop",
+            "wait",
+            "defer_resolution",
+            "submit_result",
+            "cel_eval",
+            "map"
+          ],
+          "max_nodes": 16,
+          "max_edges": 24,
+          "max_depth": 1,
+          "max_total_time_seconds": 600,
+          "max_total_tokens": 120000,
+          "allow_agent_loop": true,
+          "allow_terminal_nodes": true
+        }
+      }
+    },
+    {
+      "id": "submit",
+      "type": "submit_result",
+      "config": {
+        "outcome_key": "run_child.outcome"
+      }
+    },
+    {
+      "id": "defer_invalid",
+      "type": "defer_resolution",
+      "config": {
+        "reason": "The generated child blueprint could not be validated within the repair budget."
+      }
+    },
+    {
+      "id": "defer_runtime",
+      "type": "defer_resolution",
+      "config": {
+        "reason": "The generated child blueprint did not produce a conclusive bounded resolution."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "draft",
+      "to": "redteam"
+    },
+    {
+      "from": "redteam",
+      "to": "candidate"
+    },
+    {
+      "from": "candidate",
+      "to": "validate"
+    },
+    {
+      "from": "validate",
+      "to": "run_child",
+      "condition": "validate.valid == 'true'"
+    },
+    {
+      "from": "validate",
+      "to": "repair",
+      "condition": "validate.valid != 'true' && size(validate._runs) < 2"
+    },
+    {
+      "from": "repair",
+      "to": "candidate",
+      "max_traversals": 2
+    },
+    {
+      "from": "validate",
+      "to": "defer_invalid",
+      "condition": "validate.valid != 'true' && size(validate._runs) >= 2"
+    },
+    {
+      "from": "run_child",
+      "to": "submit",
+      "condition": "run_child.submitted == 'true'"
+    },
+    {
+      "from": "run_child",
+      "to": "defer_runtime",
+      "condition": "run_child.deferred == 'true' || run_child.status != 'success' || run_child.submitted != 'true'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 2400,
+    "max_total_tokens": 240000
+  }
+}

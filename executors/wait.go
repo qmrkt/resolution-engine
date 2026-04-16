@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 // WaitConfig is the node config for wait steps.

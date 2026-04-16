@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 func TestAgentLoopOpenAIResponsesResolutionWithContextTool(t *testing.T) {
@@ -669,6 +669,154 @@ func TestAgentLoopPredefinedBlueprintTool(t *testing.T) {
 	}
 	if result.Outputs["output.final"] != "abc-checked" || result.Outputs["output.ok"] != "true" {
 		t.Fatalf("structured output was not flattened: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopPredefinedBlueprintToolSupportsSubagent(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{
+					{
+						"type":      "function_call",
+						"call_id":   "call_blueprint",
+						"name":      "delegate_check",
+						"arguments": `{"value":"abc"}`,
+					},
+				},
+			})
+		case 2:
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{
+					{
+						"type":    "function_call",
+						"call_id": "call_child_final",
+						"name":    defaultAgentOutputToolName,
+						"arguments": `{
+							"final":"abc-subchecked"
+						}`,
+					},
+				},
+			})
+		case 3:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			inputJSON, _ := json.Marshal(body["input"])
+			if !strings.Contains(string(inputJSON), "abc-subchecked") {
+				t.Fatalf("subagent blueprint tool output was not returned to the model: %s", string(inputJSON))
+			}
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{
+					{
+						"type":      "function_call",
+						"call_id":   "call_final",
+						"name":      defaultAgentOutputToolName,
+						"arguments": `{"final":"abc-subchecked","ok":true}`,
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected extra request")
+		}
+	}))
+	defer server.Close()
+
+	engine := dag.NewEngine(nil)
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, engine)
+	engine.RegisterExecutor("agent_loop", exec)
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderOpenAI,
+			"prompt":      "Check the value with a delegated subagent.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"final": map[string]any{"type": "string"}, "ok": map[string]any{"type": "boolean"}},
+					"required":   []string{"final", "ok"},
+				},
+			},
+			"tools": []map[string]any{
+				{
+					"name":        "delegate_check",
+					"kind":        AgentToolKindBlueprint,
+					"description": "Run a child blueprint that uses its own agent loop.",
+					"max_depth":   1,
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{"value": map[string]any{"type": "string"}},
+						"required":   []string{"value"},
+					},
+					"input_mappings": map[string]string{"input_value": "$args.value"},
+					"output_keys":    []string{"child_agent.output.final"},
+					"inline": dag.Blueprint{
+						ID:      "child-subagent-check",
+						Version: 1,
+						Nodes: []dag.NodeDef{
+							{
+								ID:   "child_agent",
+								Type: "agent_loop",
+								Config: map[string]any{
+									"provider":    LLMProviderOpenAI,
+									"prompt":      "Check this delegated value: {{input_value}}",
+									"output_mode": AgentOutputModeStructured,
+									"output_tool": map[string]any{
+										"parameters": map[string]any{
+											"type":       "object",
+											"properties": map[string]any{"final": map[string]any{"type": "string"}},
+											"required":   []string{"final"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("unexpected status: %+v", result.Outputs)
+	}
+	if result.Outputs["output.final"] != "abc-subchecked" || result.Outputs["output.ok"] != "true" {
+		t.Fatalf("structured output was not flattened: %+v", result.Outputs)
+	}
+}
+
+func TestBlueprintToolMaxDepthLimit(t *testing.T) {
+	tool := &blueprintTool{
+		name:     "delegate_check",
+		inline:   &dag.Blueprint{ID: "child", Version: 1, Nodes: []dag.NodeDef{{ID: "step", Type: "cel_eval", Config: map[string]any{"expressions": map[string]string{"ok": "'true'"}}}}},
+		maxDepth: 1,
+		engine:   dag.NewEngine(nil),
+		parentCtx: dag.NewContext(map[string]string{
+			"__agent_blueprint_depth": "1",
+		}),
+	}
+
+	result, err := tool.Execute(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected tool error result, got %+v", result)
+	}
+	if !strings.Contains(result.Output, "exceeded max_depth 1") {
+		t.Fatalf("unexpected tool output: %s", result.Output)
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 	"pgregory.net/rapid"
 )
 

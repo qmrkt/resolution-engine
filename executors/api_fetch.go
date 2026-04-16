@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 type APIFetchBasicAuth struct {
@@ -226,7 +226,7 @@ func isBlockedIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-	if ip.Equal(net.ParseIP("169.254.169.254")) {
+	if ip.Equal(net.ParseIP(cloudMetadataIPAddr)) {
 		return true
 	}
 	return false
@@ -245,7 +245,7 @@ func validateURLSafety(rawURL string) error {
 	}
 
 	// Block known dangerous hostnames
-	if host == "localhost" || host == "metadata.google.internal" {
+	if host == localhostHost || host == googleMetadataHost {
 		return fmt.Errorf("blocked host: %s", host)
 	}
 

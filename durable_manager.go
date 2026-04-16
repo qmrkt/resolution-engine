@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
-	"github.com/question-market/resolution-engine/executors"
+	"github.com/qmrkt/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/executors"
 )
 
 type DurableRunManagerConfig struct {

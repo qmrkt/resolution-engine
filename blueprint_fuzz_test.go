@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 	"pgregory.net/rapid"
 )
 
@@ -46,7 +46,7 @@ var terminalTypes = []string{"submit_result", "cancel_market", "defer_resolution
 
 var nonTerminalTypes = []string{
 	"api_fetch", "llm_call", "await_signal",
-	"wait", "cel_eval", "map",
+	"wait", "cel_eval", "map", "gadget",
 }
 
 var allTypes = append(append([]string{}, nonTerminalTypes...), terminalTypes...)
@@ -135,6 +135,10 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 							}},
 						},
 					},
+				}
+			case "gadget":
+				node.Config = map[string]interface{}{
+					"blueprint_json_key": "candidate.blueprint_json",
 				}
 			default:
 				node.Config = map[string]interface{}{}

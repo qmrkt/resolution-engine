@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/question-market/resolution-engine/dag"
-	"github.com/question-market/resolution-engine/executors"
+	"github.com/qmrkt/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/executors"
 )
 
 type BlueprintValidationIssue struct {
@@ -29,18 +29,20 @@ var terminalNodeTypes = map[string]struct{}{
 }
 
 var knownNodeTypes = map[string]struct{}{
-	"api_fetch":        {},
-	"llm_call":         {},
-	"agent_loop":       {},
-	"await_signal":     {},
-	"wait":             {},
-	"defer_resolution": {},
-	"submit_result":    {},
-	"cancel_market":    {},
-	"ask_creator":      {},
-	"ask_market_admin": {},
-	"cel_eval":         {},
-	"map":              {},
+	"api_fetch":          {},
+	"llm_call":           {},
+	"agent_loop":         {},
+	"await_signal":       {},
+	"wait":               {},
+	"defer_resolution":   {},
+	"submit_result":      {},
+	"cancel_market":      {},
+	"ask_creator":        {},
+	"ask_market_admin":   {},
+	"cel_eval":           {},
+	"map":                {},
+	"gadget":             {},
+	"validate_blueprint": {},
 }
 
 func ValidateResolutionBlueprint(bp dag.Blueprint, rawJSON []byte) BlueprintValidationResult {
@@ -442,15 +444,83 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		if onError != "" && onError != "fail" && onError != "continue" {
 			add("MAP_ON_ERROR_INVALID", fmt.Sprintf("Node %q on_error must be \"fail\" or \"continue\".", displayNode(node)))
 		}
+	case "gadget":
+		cfg, err := executors.ParseConfig[executors.GadgetConfig](node.Config)
+		if err != nil {
+			add("GADGET_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			return
+		}
+		sourceCount := 0
+		if strings.TrimSpace(cfg.BlueprintJSON) != "" {
+			sourceCount++
+		}
+		if strings.TrimSpace(cfg.BlueprintJSONKey) != "" {
+			sourceCount++
+		}
+		if cfg.Inline != nil {
+			sourceCount++
+		}
+		switch {
+		case sourceCount == 0:
+			add("GADGET_BLUEPRINT_SOURCE_REQUIRED", fmt.Sprintf("Node %q needs exactly one of blueprint_json, blueprint_json_key, or inline.", displayNode(node)))
+		case sourceCount > 1:
+			add("GADGET_BLUEPRINT_SOURCE_CONFLICT", fmt.Sprintf("Node %q can use only one of blueprint_json, blueprint_json_key, or inline.", displayNode(node)))
+		}
+		if cfg.TimeoutSeconds < 0 {
+			add("GADGET_TIMEOUT_INVALID", fmt.Sprintf("Node %q timeout_seconds must be non-negative.", displayNode(node)))
+		}
+		if cfg.MaxDepth < 0 {
+			add("GADGET_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q max_depth must be non-negative.", displayNode(node)))
+		}
+		if policy := cfg.DynamicBlueprintPolicy; policy != nil {
+			if policy.MaxNodes < 0 ||
+				policy.MaxEdges < 0 ||
+				policy.MaxDepth < 0 ||
+				policy.MaxTotalTimeSeconds < 0 ||
+				policy.MaxTotalTokens < 0 {
+				add("GADGET_DYNAMIC_POLICY_INVALID", fmt.Sprintf("Node %q dynamic blueprint policy limits must be non-negative.", displayNode(node)))
+			}
+		}
+		if cfg.Inline != nil {
+			rawInline, err := json.Marshal(cfg.Inline)
+			if err != nil {
+				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint could not be serialized.", displayNode(node)))
+			} else if child := ValidateResolutionBlueprint(*cfg.Inline, rawInline); !child.Valid {
+				first := child.Issues[0]
+				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint is invalid: %s", displayNode(node), strings.TrimSpace(first.Message)))
+			}
+		}
+		if raw := strings.TrimSpace(cfg.BlueprintJSON); raw != "" && !strings.Contains(raw, "{{") {
+			if !json.Valid([]byte(raw)) {
+				add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json must be valid JSON text.", displayNode(node)))
+			} else {
+				var child dag.Blueprint
+				if err := json.Unmarshal([]byte(raw), &child); err != nil {
+					add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json could not be parsed.", displayNode(node)))
+				} else if result := ValidateResolutionBlueprint(child, []byte(raw)); !result.Valid {
+					first := result.Issues[0]
+					add("GADGET_BLUEPRINT_INVALID", fmt.Sprintf("Node %q blueprint_json is invalid: %s", displayNode(node), strings.TrimSpace(first.Message)))
+				}
+			}
+		}
+	case "validate_blueprint":
+		cfg, err := executors.ParseConfig[executors.ValidateBlueprintConfig](node.Config)
+		if err != nil {
+			add("VALIDATE_BLUEPRINT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			return
+		}
+		if strings.TrimSpace(cfg.BlueprintJSONKey) == "" {
+			add("VALIDATE_BLUEPRINT_KEY_REQUIRED", fmt.Sprintf("Node %q needs a blueprint_json_key.", displayNode(node)))
+		}
 	}
 }
 
 func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add func(code, message string)) {
 	validBuiltins := map[string]struct{}{
-		executors.AgentBuiltinContextGet:  {},
-		executors.AgentBuiltinContextList: {},
-		executors.AgentBuiltinSourceFetch: {},
-		executors.AgentBuiltinJSONExtract: {},
+		executors.AgentBuiltinContextGet:   {},
+		executors.AgentBuiltinContextList:  {},
+		executors.AgentBuiltinSourceFetch:  {},
+		executors.AgentBuiltinJSONExtract:  {},
 		executors.AgentBuiltinRunBlueprint: {},
 	}
 	for _, tool := range cfg.Tools {
@@ -463,6 +533,9 @@ func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add
 		}
 		if tool.TimeoutSeconds < 0 {
 			add("AGENT_LOOP_TOOL_TIMEOUT_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative timeout.", displayNode(node), name))
+		}
+		if tool.MaxDepth < 0 {
+			add("AGENT_LOOP_TOOL_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative max_depth.", displayNode(node), name))
 		}
 
 		kind := strings.ToLower(strings.TrimSpace(tool.Kind))
@@ -489,11 +562,6 @@ func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add
 			if tool.Inline == nil || len(tool.Inline.Nodes) == 0 {
 				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_REQUIRED", fmt.Sprintf("Node %q tool %q needs an inline blueprint.", displayNode(node), name))
 				continue
-			}
-			for _, child := range tool.Inline.Nodes {
-				if child.Type == "agent_loop" {
-					add("AGENT_LOOP_BLUEPRINT_TOOL_RECURSIVE", fmt.Sprintf("Node %q tool %q cannot contain an agent_loop node.", displayNode(node), name))
-				}
 			}
 			if errs := dag.ValidateBlueprint(*tool.Inline); len(errs) > 0 {
 				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_INVALID", fmt.Sprintf("Node %q tool %q inline blueprint: %v.", displayNode(node), name, errs[0]))

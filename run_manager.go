@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 type RunExecutor interface {

@@ -5,10 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 
-	"github.com/question-market/resolution-engine/dag"
-	"github.com/question-market/resolution-engine/executors"
+	"github.com/qmrkt/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/executors"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -221,8 +222,10 @@ func TestE2ELLMCallResolution(t *testing.T) {
 	runner := newTestRunner("test-key", tmpDir)
 
 	// Override the LLM executor's BaseURL to point to our mock
-	llmExec := executors.NewLLMCallExecutor("test-key")
-	llmExec.AnthropicBaseURL = anthropicServer.URL
+	llmExec := executors.NewLLMCallExecutorWithConfig(executors.LLMCallExecutorConfig{
+		AnthropicAPIKey:  "test-key",
+		AnthropicBaseURL: anthropicServer.URL,
+	})
 	runner.engine.RegisterExecutor("llm_call", llmExec)
 
 	bp := buildLLMCallBlueprint()
@@ -259,6 +262,204 @@ func TestE2ELLMCallResolution(t *testing.T) {
 	if reasoning == "" {
 		t.Fatal("expected non-empty reasoning")
 	}
+}
+
+func TestE2EYOLOAutoResolutionExample(t *testing.T) {
+	validChild := dag.Blueprint{
+		ID:      "child-valid",
+		Version: 1,
+		Budget:  &dag.Budget{MaxTotalTimeSeconds: 30, MaxTotalTokens: 2000},
+		Nodes: []dag.NodeDef{
+			{
+				ID:   "pick",
+				Type: "cel_eval",
+				Config: map[string]any{
+					"expressions": map[string]string{
+						"outcome": "'1'",
+					},
+				},
+			},
+			{
+				ID:   "submit",
+				Type: "submit_result",
+				Config: map[string]any{
+					"outcome_key": "pick.outcome",
+				},
+			},
+		},
+		Edges: []dag.EdgeDef{{From: "pick", To: "submit"}},
+	}
+	invalidChild := dag.Blueprint{
+		ID:      "child-invalid",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{
+				ID:   "pick",
+				Type: "cel_eval",
+				Config: map[string]any{
+					"expressions": map[string]string{
+						"outcome": "'1'",
+					},
+				},
+			},
+		},
+	}
+	validChildJSON := mustBlueprintJSONMain(t, validChild)
+	invalidChildJSON := mustBlueprintJSONMain(t, invalidChild)
+
+	var openAIRequests atomic.Int32
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("expected /responses endpoint, got %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-openai-key" {
+			t.Fatalf("authorization header = %q, want Bearer test-openai-key", got)
+		}
+
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode openai request: %v", err)
+		}
+
+		switch openAIRequests.Add(1) {
+		case 1:
+			writeJSON(w, http.StatusOK, map[string]any{
+				"output": []map[string]any{
+					{
+						"type":    "function_call",
+						"call_id": "call_draft",
+						"name":    "record_output",
+						"arguments": mustJSONString(t, map[string]any{
+							"blueprint_json":   validChildJSON,
+							"strategy_summary": "use a minimal deterministic child blueprint",
+							"assumptions":      []string{"primary resolution is deterministic in this test"},
+						}),
+					},
+				},
+				"usage": map[string]int{"input_tokens": 20, "output_tokens": 8},
+			})
+		case 2:
+			writeJSON(w, http.StatusOK, map[string]any{
+				"output": []map[string]any{
+					{
+						"type":    "function_call",
+						"call_id": "call_repair",
+						"name":    "record_output",
+						"arguments": mustJSONString(t, map[string]any{
+							"blueprint_json": validChildJSON,
+							"repair_notes":   []string{"restore terminal node and bounded budget"},
+						}),
+					},
+				},
+				"usage": map[string]int{"input_tokens": 24, "output_tokens": 9},
+			})
+		default:
+			t.Fatalf("unexpected extra openai request")
+		}
+	}))
+	defer openAIServer.Close()
+
+	var anthropicRequests atomic.Int32
+	anthropicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-api-key"); got != "test-anthropic-key" {
+			t.Fatalf("x-api-key = %q, want test-anthropic-key", got)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"content": []map[string]any{
+				{
+					"type": "tool_use",
+					"id":   "call_redteam",
+					"name": "record_output",
+					"input": map[string]any{
+						"blueprint_json": invalidChildJSON,
+						"attack_summary": "remove the terminal node to force repair",
+						"residual_risks": []string{"child blueprint is intentionally invalid"},
+					},
+				},
+			},
+			"usage": map[string]int{"input_tokens": 18, "output_tokens": 7},
+		})
+		anthropicRequests.Add(1)
+	}))
+	defer anthropicServer.Close()
+
+	rawBlueprint, err := os.ReadFile("docs/examples/yolo-auto-resolution/blueprint.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "e2e-yolo-auto-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	runner := NewRunner(executors.LLMCallExecutorConfig{
+		AnthropicAPIKey:  "test-anthropic-key",
+		AnthropicBaseURL: anthropicServer.URL,
+		OpenAIAPIKey:     "test-openai-key",
+		OpenAIBaseURL:    openAIServer.URL + "/chat/completions",
+	}, "", tmpDir, "")
+
+	run, err := runner.RunBlueprint(2001, rawBlueprint, map[string]string{
+		"market.question":              "Will the test outcome resolve to No?",
+		"market.outcomes_json":         `["Yes","No"]`,
+		"market.resolution_rules":      "Resolve to the most truthful outcome. Defer if evidence is inconclusive.",
+		"market.context_json":          `{"test_mode":true}`,
+		"market.sources_json":          `[]`,
+		"yolo.allowed_node_types_json": `["api_fetch","llm_call","agent_loop","wait","defer_resolution","submit_result","cel_eval","map"]`,
+		"yolo.examples_json":           `[]`,
+		"yolo.source_packs_json":       `[]`,
+	})
+	if err != nil {
+		t.Fatalf("execution error: %v", err)
+	}
+
+	if run.Status != "completed" {
+		t.Fatalf("expected status=completed, got %s", run.Status)
+	}
+	if openAIRequests.Load() != 2 {
+		t.Fatalf("openai request count = %d, want 2", openAIRequests.Load())
+	}
+	if anthropicRequests.Load() != 1 {
+		t.Fatalf("anthropic request count = %d, want 1", anthropicRequests.Load())
+	}
+	if run.NodeStates["repair"].Status != "completed" {
+		t.Fatalf("expected repair node completed, got %+v", run.NodeStates["repair"])
+	}
+	if run.NodeStates["run_child"].Status != "completed" {
+		t.Fatalf("expected gadget node completed, got %+v", run.NodeStates["run_child"])
+	}
+	if run.NodeStates["submit"].Status != "completed" {
+		t.Fatalf("expected submit node completed, got %+v", run.NodeStates["submit"])
+	}
+	if run.NodeStates["defer_invalid"].Status == "completed" || run.NodeStates["defer_runtime"].Status == "completed" {
+		t.Fatalf("unexpected defer path in successful yolo run: %+v", run.NodeStates)
+	}
+	if run.Context["candidate.source"] != "repair" {
+		t.Fatalf("expected repaired child blueprint to be selected, got %q", run.Context["candidate.source"])
+	}
+	if run.Context["run_child.submitted"] != "true" {
+		t.Fatalf("expected gadget to propagate child submission, got %q", run.Context["run_child.submitted"])
+	}
+	if run.Context["submit.outcome"] != "1" {
+		t.Fatalf("expected final outcome 1, got %q", run.Context["submit.outcome"])
+	}
+	if run.Context["validate.valid"] != "true" {
+		t.Fatalf("expected final validate.valid=true, got %q", run.Context["validate.valid"])
+	}
+	if run.Context["validate._runs"] == "" {
+		t.Fatal("expected validate node history to show at least one repair loop")
+	}
+}
+
+func mustJSONString(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json string: %v", err)
+	}
+	return string(raw)
 }
 
 // --------------------------------------------------------------------------

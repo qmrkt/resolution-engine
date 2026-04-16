@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 const agentRoleUser = "user"
@@ -25,6 +25,8 @@ type agentLoopSettings struct {
 	maxSteps           int
 	maxToolCalls       int
 	maxToolResultBytes int
+	toolResultHistory  int
+	maxHistoryMessages int
 	maxTokens          int
 	toolTimeout        time.Duration
 	outputMode         string
@@ -96,7 +98,7 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, execC
 
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = DefaultLLMTimeout
+		timeout = time.Duration(defaultAgentLoopTimeoutSeconds) * time.Second
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -129,12 +131,11 @@ func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutp
 		maxSteps:           cfg.MaxSteps,
 		maxToolCalls:       cfg.MaxToolCalls,
 		maxToolResultBytes: cfg.MaxToolResultBytes,
+		toolResultHistory:  cfg.ToolResultHistory,
+		maxHistoryMessages: cfg.MaxHistoryMessages,
 		maxTokens:          cfg.MaxTokens,
 		toolTimeout:        time.Duration(cfg.ToolTimeoutSeconds) * time.Second,
 		outputMode:         outputMode,
-	}
-	if settings.maxSteps <= 0 {
-		settings.maxSteps = defaultAgentMaxSteps
 	}
 	if settings.maxToolCalls <= 0 {
 		settings.maxToolCalls = defaultAgentMaxToolCalls
@@ -142,14 +143,26 @@ func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutp
 	if settings.maxToolResultBytes <= 0 {
 		settings.maxToolResultBytes = defaultAgentMaxToolResultBytes
 	}
+	if settings.toolResultHistory <= 0 {
+		settings.toolResultHistory = defaultAgentToolResultHistory
+	}
+	if settings.maxHistoryMessages <= 0 {
+		settings.maxHistoryMessages = defaultAgentMaxHistoryMessages
+	}
 	if settings.toolTimeout <= 0 {
 		settings.toolTimeout = time.Duration(defaultAgentToolTimeoutSeconds) * time.Second
 	}
-	if settings.maxSteps < 1 {
-		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("max_steps must be positive")
+	if settings.maxSteps < 0 {
+		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("max_steps must be non-negative")
 	}
 	if settings.maxToolCalls < 1 {
 		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("max_tool_calls must be positive")
+	}
+	if settings.maxHistoryMessages < 2 {
+		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("max_history_messages must be >= 2")
+	}
+	if settings.toolResultHistory < 1 {
+		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("tool_result_history must be >= 1")
 	}
 
 	outputSpec := agentOutputSpec{mode: outputMode}
@@ -291,6 +304,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 			inputMappings:  toolCfg.InputMappings,
 			outputKeys:     toolCfg.OutputKeys,
 			timeoutSeconds: toolCfg.TimeoutSeconds,
+			maxDepth:       toolCfg.MaxDepth,
 			engine:         e.engine,
 			parentCtx:      execCtx,
 		}, nil
@@ -448,14 +462,18 @@ func (e *AgentLoopExecutor) runLoop(
 ) dag.ExecutorResult {
 	messages := []agentMessage{{
 		Role:    agentRoleUser,
-		Content: []agentContentPart{{Type: "text", Text: prompt}},
+		Content: []agentContentPart{{Type: contentPartTypeText, Text: prompt}},
 	}}
 
 	var usage dag.TokenUsage
 	var steps []agentStepRecord
 	toolCallCount := 0
 
-	for step := 1; step <= settings.maxSteps; step++ {
+	for step := 1; ; step++ {
+		if settings.maxSteps > 0 && step > settings.maxSteps {
+			return agentFailureResult(fmt.Sprintf("agent_loop reached max_steps %d", settings.maxSteps), usage, steps, messages)
+		}
+		messages = compactAgentMessages(messages, settings.maxHistoryMessages, settings.toolResultHistory)
 		req.Messages = append([]agentMessage(nil), messages...)
 		resp, err := e.client.chat(ctx, req)
 		if err != nil {
@@ -488,7 +506,7 @@ func (e *AgentLoopExecutor) runLoop(
 				return finalizeAgentStructuredResult(settings.outputMode, result.OutputJSON, result.Output, usage, steps, messages, allowedOutcomes)
 			}
 			resultParts = append(resultParts, agentContentPart{
-				Type:         "tool_result",
+				Type:         contentPartTypeToolResult,
 				ToolResultID: call.ID,
 				ToolName:     call.Name,
 				ToolOutput:   result.Output,
@@ -501,7 +519,73 @@ func (e *AgentLoopExecutor) runLoop(
 		messages = append(messages, agentMessage{Role: agentRoleUser, Content: resultParts})
 	}
 
-	return agentFailureResult(fmt.Sprintf("agent_loop reached max_steps %d", settings.maxSteps), usage, steps, messages)
+}
+
+func compactAgentMessages(messages []agentMessage, maxHistoryMessages int, toolResultHistory int) []agentMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// Count tool-result messages to decide if any work is needed.
+	toolResultCount := 0
+	for _, msg := range messages {
+		for _, part := range msg.Content {
+			if part.Type == contentPartTypeToolResult {
+				toolResultCount++
+				break
+			}
+		}
+	}
+	if len(messages) <= maxHistoryMessages && toolResultCount <= toolResultHistory {
+		return messages
+	}
+
+	// Build index of which messages contain tool results.
+	trimmed := make([]agentMessage, 0, len(messages))
+	toolResultMessageIndexes := make([]int, 0, toolResultCount)
+	for _, msg := range messages {
+		if len(msg.Content) == 0 {
+			continue
+		}
+		trimmed = append(trimmed, msg)
+		for _, part := range msg.Content {
+			if part.Type == contentPartTypeToolResult {
+				toolResultMessageIndexes = append(toolResultMessageIndexes, len(trimmed)-1)
+				break
+			}
+		}
+	}
+
+	// Strip old tool results beyond the history window.
+	droppedResults := len(toolResultMessageIndexes) > toolResultHistory
+	if droppedResults {
+		dropBefore := len(toolResultMessageIndexes) - toolResultHistory
+		cutoff := toolResultMessageIndexes[dropBefore]
+		for i := 0; i < cutoff; i++ {
+			msg := &trimmed[i]
+			parts := make([]agentContentPart, 0, len(msg.Content))
+			for _, part := range msg.Content {
+				if part.Type != contentPartTypeToolResult {
+					parts = append(parts, part)
+				}
+			}
+			msg.Content = parts
+		}
+
+		// Remove messages that became empty after stripping.
+		compacted := make([]agentMessage, 0, len(trimmed))
+		for _, msg := range trimmed {
+			if len(msg.Content) > 0 {
+				compacted = append(compacted, msg)
+			}
+		}
+		trimmed = compacted
+	}
+
+	if len(trimmed) <= maxHistoryMessages {
+		return trimmed
+	}
+	return append([]agentMessage(nil), trimmed[len(trimmed)-maxHistoryMessages:]...)
 }
 
 func executeAgentToolCalls(
@@ -783,7 +867,7 @@ func scrubAgentToolCalls(calls []agentToolCall) []agentToolCall {
 func agentMessageText(message agentMessage) string {
 	var parts []string
 	for _, part := range message.Content {
-		if part.Type == "text" && strings.TrimSpace(part.Text) != "" {
+		if part.Type == contentPartTypeText && strings.TrimSpace(part.Text) != "" {
 			parts = append(parts, part.Text)
 		}
 	}

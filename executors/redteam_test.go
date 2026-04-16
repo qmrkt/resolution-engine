@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 // ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ func TestLLMCallUnparseableResponse(t *testing.T) {
 	defer server.Close()
 
 	exec := NewLLMCallExecutor("test-key")
-	exec.AnthropicBaseURL = server.URL
+	exec.provider.AnthropicBaseURL = server.URL
 
 	node := dag.NodeDef{
 		ID:   "judge",

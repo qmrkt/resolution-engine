@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 const mapDepthKey = "__map_depth"

@@ -101,6 +101,8 @@ The engine executes resolution blueprints as DAGs with conditional branching (CE
 | `await_signal`        | Suspends until a correlated signal or timeout                    |
 | `cel_eval`            | Evaluates CEL expressions into context outputs                   |
 | `map`                 | Runs an inline child blueprint over a JSON array                 |
+| `gadget`              | Validates and runs a child blueprint supplied at runtime         |
+| `validate_blueprint`  | Validates blueprint JSON from context and emits issues           |
 | `defer_resolution`    | Defers resolution to a later time                                |
 | `wait`                | Pauses execution for a duration                                  |
 | `submit_result`       | Marks the final outcome                                          |

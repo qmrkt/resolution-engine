@@ -5,14 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 
-	"github.com/question-market/resolution-engine/dag"
-)
-
-const (
-	defaultOpenAIResponsesBaseURL = "https://api.openai.com/v1/responses"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 var agentOpenAIResponsesAPIModels = map[string]bool{
@@ -34,53 +29,40 @@ var agentOpenAIResponsesAPIModels = map[string]bool{
 }
 
 type agentProviderClient struct {
-	AnthropicAPIKey  string
-	AnthropicBaseURL string
-	OpenAIAPIKey     string
-	OpenAIBaseURL    string
-	GoogleAPIKey     string
-	GoogleBaseURL    string
-	HTTPClient       *http.Client
+	provider providerLayerConfig
 }
 
 func newAgentProviderClient(cfg LLMCallExecutorConfig) *agentProviderClient {
 	return &agentProviderClient{
-		AnthropicAPIKey:  cfg.AnthropicAPIKey,
-		AnthropicBaseURL: defaultString(cfg.AnthropicBaseURL, defaultAnthropicBaseURL),
-		OpenAIAPIKey:     cfg.OpenAIAPIKey,
-		OpenAIBaseURL:    defaultString(cfg.OpenAIBaseURL, defaultOpenAIBaseURL),
-		GoogleAPIKey:     cfg.GoogleAPIKey,
-		GoogleBaseURL:    defaultString(cfg.GoogleBaseURL, defaultGoogleBaseURL),
-		HTTPClient:       cfg.HTTPClient,
+		provider: newProviderLayerConfig(cfg),
 	}
 }
 
 func (c *agentProviderClient) httpClient() *http.Client {
-	if c != nil && c.HTTPClient != nil {
-		return c.HTTPClient
+	if c == nil {
+		return http.DefaultClient
 	}
-	return http.DefaultClient
+	return c.provider.httpClient()
 }
 
 func (c *agentProviderClient) chat(ctx context.Context, req agentProviderRequest) (agentProviderResponse, error) {
+	apiKey, err := c.provider.apiKey(req.Provider)
+	if err != nil {
+		return agentProviderResponse{}, err
+	}
+	if apiKey == "" {
+		return agentProviderResponse{}, fmt.Errorf("no %s API key configured", req.Provider)
+	}
+
 	switch req.Provider {
 	case LLMProviderAnthropic:
-		if c.AnthropicAPIKey == "" {
-			return agentProviderResponse{}, fmt.Errorf("no %s API key configured", req.Provider)
-		}
 		return c.chatAnthropic(ctx, req)
 	case LLMProviderOpenAI:
-		if c.OpenAIAPIKey == "" {
-			return agentProviderResponse{}, fmt.Errorf("no %s API key configured", req.Provider)
-		}
 		if agentOpenAIUsesResponses(req.Model) {
 			return c.chatOpenAIResponses(ctx, req)
 		}
 		return c.chatOpenAICompletions(ctx, req)
 	case LLMProviderGoogle:
-		if c.GoogleAPIKey == "" {
-			return agentProviderResponse{}, fmt.Errorf("no %s API key configured", req.Provider)
-		}
 		return c.chatGoogle(ctx, req)
 	default:
 		return agentProviderResponse{}, fmt.Errorf("unsupported llm provider %q", req.Provider)
@@ -133,11 +115,15 @@ func (c *agentProviderClient) chatAnthropic(ctx context.Context, req agentProvid
 		body["tools"] = req.Tools
 	}
 
-	httpReq, err := newJSONRequest(ctx, http.MethodPost, c.AnthropicBaseURL, body)
+	endpoint, err := c.provider.endpoint(LLMProviderAnthropic, req.Model)
 	if err != nil {
 		return agentProviderResponse{}, err
 	}
-	httpReq.Header.Set("x-api-key", c.AnthropicAPIKey)
+	httpReq, err := newJSONRequest(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return agentProviderResponse{}, err
+	}
+	httpReq.Header.Set("x-api-key", c.provider.AnthropicAPIKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	respBody, err := doRequest(c.httpClient(), httpReq)
@@ -167,15 +153,15 @@ func (c *agentProviderClient) chatAnthropic(ctx context.Context, req agentProvid
 	calls := make([]agentToolCall, 0)
 	for _, part := range apiResp.Content {
 		switch part.Type {
-		case "text":
-			message.Content = append(message.Content, agentContentPart{Type: "text", Text: part.Text})
-		case "tool_use":
+		case contentPartTypeText:
+			message.Content = append(message.Content, agentContentPart{Type: contentPartTypeText, Text: part.Text})
+		case contentPartTypeToolUse:
 			input := part.Input
 			if len(input) == 0 {
 				input = json.RawMessage(`{}`)
 			}
 			message.Content = append(message.Content, agentContentPart{
-				Type:      "tool_use",
+				Type:      contentPartTypeToolUse,
 				ToolUseID: part.ID,
 				ToolName:  part.Name,
 				ToolInput: input,
@@ -205,24 +191,24 @@ func anthropicMessages(messages []agentMessage) []anthropicAgentMessage {
 		}
 		for _, part := range msg.Content {
 			switch part.Type {
-			case "text":
+			case contentPartTypeText:
 				if strings.TrimSpace(part.Text) != "" {
-					am.Content = append(am.Content, anthropicAgentContent{Type: "text", Text: part.Text})
+					am.Content = append(am.Content, anthropicAgentContent{Type: contentPartTypeText, Text: part.Text})
 				}
-			case "tool_use":
+			case contentPartTypeToolUse:
 				input := part.ToolInput
 				if len(input) == 0 {
 					input = json.RawMessage(`{}`)
 				}
 				am.Content = append(am.Content, anthropicAgentContent{
-					Type:  "tool_use",
+					Type:  contentPartTypeToolUse,
 					ID:    part.ToolUseID,
 					Name:  part.ToolName,
 					Input: input,
 				})
-			case "tool_result":
+			case contentPartTypeToolResult:
 				am.Content = append(am.Content, anthropicAgentContent{
-					Type:      "tool_result",
+					Type:      contentPartTypeToolResult,
 					ToolUseID: part.ToolResultID,
 					Content:   part.ToolOutput,
 					IsError:   part.IsError,
@@ -276,11 +262,15 @@ func (c *agentProviderClient) chatOpenAICompletions(ctx context.Context, req age
 		delete(payload, "tools")
 	}
 
-	httpReq, err := newJSONRequest(ctx, http.MethodPost, c.OpenAIBaseURL, payload)
+	endpoint, err := c.provider.endpoint(LLMProviderOpenAI, req.Model)
 	if err != nil {
 		return agentProviderResponse{}, err
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.OpenAIAPIKey)
+	httpReq, err := newJSONRequest(ctx, http.MethodPost, endpoint, payload)
+	if err != nil {
+		return agentProviderResponse{}, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.provider.OpenAIAPIKey)
 
 	respBody, err := doRequest(c.httpClient(), httpReq)
 	if err != nil {
@@ -310,7 +300,7 @@ func (c *agentProviderClient) chatOpenAICompletions(ctx context.Context, req age
 	choice := apiResp.Choices[0]
 	message := agentMessage{Role: "assistant"}
 	if strings.TrimSpace(choice.Message.Content) != "" {
-		message.Content = append(message.Content, agentContentPart{Type: "text", Text: choice.Message.Content})
+		message.Content = append(message.Content, agentContentPart{Type: contentPartTypeText, Text: choice.Message.Content})
 	}
 	calls := make([]agentToolCall, 0, len(choice.Message.ToolCalls))
 	for _, tc := range choice.Message.ToolCalls {
@@ -319,7 +309,7 @@ func (c *agentProviderClient) chatOpenAICompletions(ctx context.Context, req age
 			input = json.RawMessage(`{}`)
 		}
 		message.Content = append(message.Content, agentContentPart{
-			Type:      "tool_use",
+			Type:      contentPartTypeToolUse,
 			ToolUseID: tc.ID,
 			ToolName:  tc.Function.Name,
 			ToolInput: input,
@@ -350,9 +340,9 @@ func openAIChatMessages(system string, messages []agentMessage) []openAIChatMess
 			var text []string
 			for _, part := range msg.Content {
 				switch part.Type {
-				case "text":
+				case contentPartTypeText:
 					text = append(text, part.Text)
-				case "tool_use":
+				case contentPartTypeToolUse:
 					tc := openAIChatCall{ID: normalizeOpenAIToolID(part.ToolUseID), Type: "function"}
 					tc.Function.Name = part.ToolName
 					tc.Function.Arguments = string(defaultRawObject(part.ToolInput))
@@ -365,9 +355,9 @@ func openAIChatMessages(system string, messages []agentMessage) []openAIChatMess
 		var text []string
 		for _, part := range msg.Content {
 			switch part.Type {
-			case "text":
+			case contentPartTypeText:
 				text = append(text, part.Text)
-			case "tool_result":
+			case contentPartTypeToolResult:
 				out = append(out, openAIChatMessage{
 					Role:       "tool",
 					Content:    part.ToolOutput,
@@ -439,12 +429,12 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 		payload["reasoning"] = map[string]string{"effort": strings.TrimSpace(req.Reasoning), "summary": "auto"}
 	}
 
-	endpoint := openAIResponsesEndpoint(c.OpenAIBaseURL)
+	endpoint := openAIResponsesEndpoint(c.provider.OpenAIBaseURL)
 	httpReq, err := newJSONRequest(ctx, http.MethodPost, endpoint, payload)
 	if err != nil {
 		return agentProviderResponse{}, err
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.OpenAIAPIKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.provider.OpenAIAPIKey)
 
 	respBody, err := doRequest(c.httpClient(), httpReq)
 	if err != nil {
@@ -480,8 +470,8 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 		switch item.Type {
 		case "message":
 			for _, c := range item.Content {
-				if (c.Type == "output_text" || c.Type == "text") && strings.TrimSpace(c.Text) != "" {
-					message.Content = append(message.Content, agentContentPart{Type: "text", Text: c.Text})
+				if (c.Type == "output_text" || c.Type == contentPartTypeText) && strings.TrimSpace(c.Text) != "" {
+					message.Content = append(message.Content, agentContentPart{Type: contentPartTypeText, Text: c.Text})
 					addedMessageText = true
 				}
 			}
@@ -495,7 +485,7 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 				callID = item.Name
 			}
 			message.Content = append(message.Content, agentContentPart{
-				Type:      "tool_use",
+				Type:      contentPartTypeToolUse,
 				ToolUseID: callID,
 				ToolName:  item.Name,
 				ToolInput: input,
@@ -504,7 +494,7 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 		}
 	}
 	if !addedMessageText && strings.TrimSpace(apiResp.OutputText) != "" {
-		message.Content = append(message.Content, agentContentPart{Type: "text", Text: apiResp.OutputText})
+		message.Content = append(message.Content, agentContentPart{Type: contentPartTypeText, Text: apiResp.OutputText})
 	}
 
 	return agentProviderResponse{
@@ -538,9 +528,9 @@ func openAIResponsesInputs(messages []agentMessage) []openAIResponsesInput {
 			var text []string
 			for _, part := range msg.Content {
 				switch part.Type {
-				case "text":
+				case contentPartTypeText:
 					text = append(text, part.Text)
-				case "tool_use":
+				case contentPartTypeToolUse:
 					if len(text) > 0 {
 						out = append(out, openAIResponsesInput{
 							Type:    "message",
@@ -568,9 +558,9 @@ func openAIResponsesInputs(messages []agentMessage) []openAIResponsesInput {
 			var content []openAIResponsesContent
 			for _, part := range msg.Content {
 				switch part.Type {
-				case "text":
+				case contentPartTypeText:
 					content = append(content, openAIResponsesContent{Type: "input_text", Text: part.Text})
-				case "tool_result":
+				case contentPartTypeToolResult:
 					output := part.ToolOutput
 					out = append(out, openAIResponsesInput{
 						Type:   "function_call_output",
@@ -677,7 +667,10 @@ func (c *agentProviderClient) chatGoogle(ctx context.Context, req agentProviderR
 		payload["tools"] = []googleAgentToolDecl{{FunctionDeclarations: decls}}
 	}
 
-	endpoint := googleAgentEndpoint(c.GoogleBaseURL, c.GoogleAPIKey, req.Model)
+	endpoint, err := c.provider.endpoint(LLMProviderGoogle, req.Model)
+	if err != nil {
+		return agentProviderResponse{}, err
+	}
 	httpReq, err := newJSONRequest(ctx, http.MethodPost, endpoint, payload)
 	if err != nil {
 		return agentProviderResponse{}, err
@@ -718,7 +711,7 @@ func (c *agentProviderClient) chatGoogle(ctx context.Context, req agentProviderR
 	calls := make([]agentToolCall, 0)
 	for idx, part := range apiResp.Candidates[0].Content.Parts {
 		if strings.TrimSpace(part.Text) != "" {
-			message.Content = append(message.Content, agentContentPart{Type: "text", Text: part.Text})
+			message.Content = append(message.Content, agentContentPart{Type: contentPartTypeText, Text: part.Text})
 		}
 		if part.FunctionCall != nil {
 			input := part.FunctionCall.Args
@@ -727,7 +720,7 @@ func (c *agentProviderClient) chatGoogle(ctx context.Context, req agentProviderR
 			}
 			callID := fmt.Sprintf("gemini_call_%d", idx+1)
 			message.Content = append(message.Content, agentContentPart{
-				Type:         "tool_use",
+				Type:         contentPartTypeToolUse,
 				ToolUseID:    callID,
 				ToolName:     part.FunctionCall.Name,
 				ToolInput:    input,
@@ -750,16 +743,11 @@ func (c *agentProviderClient) chatGoogle(ctx context.Context, req agentProviderR
 	}, nil
 }
 
-func googleAgentEndpoint(baseURL string, apiKey string, model string) string {
-	base := strings.TrimRight(defaultString(baseURL, defaultGoogleBaseURL), "/")
-	return fmt.Sprintf("%s/%s:generateContent?key=%s", base, url.PathEscape(model), url.QueryEscape(apiKey))
-}
-
 func googleMessages(messages []agentMessage) []googleAgentContent {
 	callNames := map[string]string{}
 	for _, msg := range messages {
 		for _, part := range msg.Content {
-			if part.Type == "tool_use" && part.ToolUseID != "" {
+			if part.Type == contentPartTypeToolUse && part.ToolUseID != "" {
 				callNames[part.ToolUseID] = part.ToolName
 			}
 		}
@@ -773,11 +761,11 @@ func googleMessages(messages []agentMessage) []googleAgentContent {
 		}
 		for _, part := range msg.Content {
 			switch part.Type {
-			case "text":
+			case contentPartTypeText:
 				if strings.TrimSpace(part.Text) != "" {
 					content.Parts = append(content.Parts, googleAgentPart{Text: part.Text})
 				}
-			case "tool_use":
+			case contentPartTypeToolUse:
 				content.Parts = append(content.Parts, googleAgentPart{
 					ThoughtSignature: part.ProviderMeta,
 					FunctionCall: &googleAgentFunctionCall{
@@ -785,7 +773,7 @@ func googleMessages(messages []agentMessage) []googleAgentContent {
 						Args: defaultRawObject(part.ToolInput),
 					},
 				})
-			case "tool_result":
+			case contentPartTypeToolResult:
 				name := part.ToolName
 				if name == "" {
 					name = callNames[part.ToolResultID]

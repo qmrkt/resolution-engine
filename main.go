@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/question-market/resolution-engine/executors"
+	"github.com/qmrkt/resolution-engine/executors"
 )
 
 func envOrDefault(key, fallback string) string {
@@ -28,9 +28,9 @@ func main() {
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
 
-	indexerURL := envOrDefault("INDEXER_URL", "http://localhost:3001")
-	listenPort := envOrDefault("LISTEN_PORT", "3002")
-	dataDir := envOrDefault("RESOLUTION_DATA_DIR", "data")
+	indexerURL := envOrDefault("INDEXER_URL", defaultIndexerURL)
+	listenPort := envOrDefault("LISTEN_PORT", defaultListenPort)
+	dataDir := envOrDefault("RESOLUTION_DATA_DIR", defaultDataDir)
 	traceIngestToken := envOrDefault("INDEXER_WRITE_TOKEN", envOrDefault("TRACE_INGEST_TOKEN", ""))
 	engineToken := envOrDefault("ENGINE_CONTROL_TOKEN", "")
 	callbackToken := envOrDefault("ENGINE_CALLBACK_TOKEN", "")

@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
-	"github.com/question-market/resolution-engine/dag"
-	"github.com/question-market/resolution-engine/executors"
+	"github.com/qmrkt/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/executors"
 )
 
 const (
@@ -29,6 +28,23 @@ type Runner struct {
 	mu        sync.Mutex
 }
 
+func adaptBlueprintValidation(bp dag.Blueprint, rawJSON []byte) executors.BlueprintValidationResult {
+	result := ValidateResolutionBlueprint(bp, rawJSON)
+	issues := make([]executors.BlueprintValidationIssue, 0, len(result.Issues))
+	for _, issue := range result.Issues {
+		issues = append(issues, executors.BlueprintValidationIssue{
+			Code:     issue.Code,
+			Message:  issue.Message,
+			Target:   issue.Target,
+			Severity: issue.Severity,
+		})
+	}
+	return executors.BlueprintValidationResult{
+		Valid:  result.Valid,
+		Issues: issues,
+	}
+}
+
 func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
 	engine := dag.NewEngine(nil)
 
@@ -41,6 +57,8 @@ func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dat
 	engine.RegisterExecutor("wait", executors.NewWaitExecutor())
 	engine.RegisterExecutor("cel_eval", executors.NewCelEvalExecutor())
 	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
+	engine.RegisterExecutor("gadget", executors.NewGadgetExecutor(engine, adaptBlueprintValidation))
+	engine.RegisterExecutor("validate_blueprint", executors.NewValidateBlueprintExecutor(adaptBlueprintValidation))
 
 	_ = os.MkdirAll(dataDir, 0o755)
 
@@ -120,7 +138,7 @@ func findSubmittedResolution(run *dag.RunState) (submittedResolution, bool) {
 		return zero, false
 	}
 
-	keys := sortedContextKeys(run.Context)
+	keys := executors.SortedContextKeys(run.Context)
 	for _, key := range keys {
 		if !strings.HasSuffix(key, ".submitted") {
 			continue
@@ -168,7 +186,7 @@ func findRunAction(run *dag.RunState, flag string) (runAction, bool) {
 	}
 
 	suffix := "." + strings.TrimSpace(flag)
-	for _, key := range sortedContextKeys(run.Context) {
+	for _, key := range executors.SortedContextKeys(run.Context) {
 		if !strings.HasSuffix(key, suffix) {
 			continue
 		}
@@ -184,15 +202,6 @@ func findRunAction(run *dag.RunState, flag string) (runAction, bool) {
 	}
 
 	return zero, false
-}
-
-func sortedContextKeys(values map[string]string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []byte, extraInputs map[string]string, opts RunOptions) (*dag.RunState, error) {

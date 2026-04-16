@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 type blueprintTool struct {
@@ -19,6 +19,7 @@ type blueprintTool struct {
 	inputMappings  map[string]string
 	outputKeys     []string
 	timeoutSeconds int
+	maxDepth       int
 	engine         *dag.Engine
 	parentCtx      *dag.Context
 }
@@ -35,6 +36,14 @@ func (t *blueprintTool) ReadOnly() bool              { return false }
 func (t *blueprintTool) Execute(ctx context.Context, args json.RawMessage) (agentToolResult, error) {
 	if t.engine == nil || t.inline == nil {
 		return toolErrorResult("blueprint tool %q is not configured", t.name), nil
+	}
+	maxDepth := t.maxDepth
+	if maxDepth <= 0 {
+		maxDepth = defaultAgentBlueprintMaxDepth
+	}
+	currentDepth := parseAgentBlueprintDepth(t.parentCtx.Get("__agent_blueprint_depth"))
+	if currentDepth >= maxDepth {
+		return toolErrorResult("blueprint tool %q exceeded max_depth %d", t.name, maxDepth), nil
 	}
 	childInputs, err := buildBlueprintToolInputs(t.inputMappings, args, t.parentCtx)
 	if err != nil {
@@ -196,12 +205,6 @@ func selectedContextOutputs(ctx map[string]string, keys []string) map[string]str
 }
 
 func validateDynamicBlueprint(bp dag.Blueprint, policy DynamicBlueprintPolicy, parent *dag.Context) error {
-	if policy.MaxNodes > 0 && len(bp.Nodes) > policy.MaxNodes {
-		return fmt.Errorf("node count %d exceeds max_nodes %d", len(bp.Nodes), policy.MaxNodes)
-	}
-	if policy.MaxEdges > 0 && len(bp.Edges) > policy.MaxEdges {
-		return fmt.Errorf("edge count %d exceeds max_edges %d", len(bp.Edges), policy.MaxEdges)
-	}
 	maxDepth := policy.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = 1
@@ -210,53 +213,12 @@ func validateDynamicBlueprint(bp dag.Blueprint, policy DynamicBlueprintPolicy, p
 	if depth >= maxDepth {
 		return fmt.Errorf("max dynamic blueprint depth %d exceeded", maxDepth)
 	}
-	allowed := map[string]struct{}{}
-	for _, nodeType := range policy.AllowedNodeTypes {
-		nodeType = strings.TrimSpace(nodeType)
-		if nodeType != "" {
-			allowed[nodeType] = struct{}{}
-		}
-	}
-	for _, node := range bp.Nodes {
-		if node.Type == "agent_loop" && !policy.AllowAgentLoop {
-			return fmt.Errorf("agent_loop nodes are not allowed")
-		}
-		if isTerminalAgentToolNode(node.Type) && !policy.AllowTerminalNodes {
-			return fmt.Errorf("terminal node type %q is not allowed", node.Type)
-		}
-		if len(allowed) > 0 {
-			if _, ok := allowed[node.Type]; !ok {
-				return fmt.Errorf("node type %q is not allowed", node.Type)
-			}
-		}
-	}
-	if policy.MaxTotalTimeSeconds > 0 || policy.MaxTotalTokens > 0 {
-		if bp.Budget == nil {
-			bp.Budget = &dag.Budget{}
-		}
-		if policy.MaxTotalTimeSeconds > 0 &&
-			(bp.Budget.MaxTotalTimeSeconds <= 0 || bp.Budget.MaxTotalTimeSeconds > policy.MaxTotalTimeSeconds) {
-			return fmt.Errorf("blueprint budget must set max_total_time_seconds <= %d", policy.MaxTotalTimeSeconds)
-		}
-		if policy.MaxTotalTokens > 0 &&
-			(bp.Budget.MaxTotalTokens <= 0 || bp.Budget.MaxTotalTokens > policy.MaxTotalTokens) {
-			return fmt.Errorf("blueprint budget must set max_total_tokens <= %d", policy.MaxTotalTokens)
-		}
-	}
-	if errs := dag.ValidateBlueprint(bp); len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
+	return validateRuntimeBlueprintStructure(bp, policy)
 }
 
 func validateBlueprintTool(bp *dag.Blueprint) error {
 	if bp == nil {
 		return fmt.Errorf("inline blueprint is required")
-	}
-	for _, node := range bp.Nodes {
-		if node.Type == "agent_loop" {
-			return fmt.Errorf("inline blueprint tools cannot contain agent_loop nodes")
-		}
 	}
 	if errs := dag.ValidateBlueprint(*bp); len(errs) > 0 {
 		return errs[0]
@@ -274,10 +236,7 @@ func isTerminalAgentToolNode(nodeType string) bool {
 }
 
 func parseAgentBlueprintDepth(raw string) int {
-	depth, _ := strconv.Atoi(strings.TrimSpace(raw))
-	if depth < 0 {
-		return 0
-	}
+	depth, _ := parseDepthCounter(raw)
 	return depth
 }
 

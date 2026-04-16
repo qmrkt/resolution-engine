@@ -3,7 +3,7 @@ package executors
 import (
 	"encoding/json"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 const (
@@ -14,16 +14,19 @@ const (
 	AgentToolKindBuiltin   = "builtin"
 	AgentToolKindBlueprint = "blueprint"
 
-	AgentBuiltinContextGet    = "context_get"
-	AgentBuiltinContextList   = "context_list"
-	AgentBuiltinSourceFetch   = "source_fetch"
-	AgentBuiltinJSONExtract   = "json_extract"
-	AgentBuiltinRunBlueprint  = "run_blueprint"
+	AgentBuiltinContextGet   = "context_get"
+	AgentBuiltinContextList  = "context_list"
+	AgentBuiltinSourceFetch  = "source_fetch"
+	AgentBuiltinJSONExtract  = "json_extract"
+	AgentBuiltinRunBlueprint = "run_blueprint"
 
-	defaultAgentMaxSteps           = 8
 	defaultAgentMaxToolCalls       = 16
 	defaultAgentToolTimeoutSeconds = 20
 	defaultAgentMaxToolResultBytes = 12_000
+	defaultAgentToolResultHistory  = 2
+	defaultAgentMaxHistoryMessages = 24
+	defaultAgentBlueprintMaxDepth  = 1
+	defaultAgentLoopTimeoutSeconds = 300
 	defaultAgentOutputToolName     = "record_output"
 	defaultResolutionToolName      = "record_resolution"
 )
@@ -39,6 +42,8 @@ type AgentLoopConfig struct {
 	MaxSteps               int                     `json:"max_steps,omitempty"`
 	MaxToolCalls           int                     `json:"max_tool_calls,omitempty"`
 	MaxToolResultBytes     int                     `json:"max_tool_result_bytes,omitempty"`
+	ToolResultHistory      int                     `json:"tool_result_history,omitempty"`
+	MaxHistoryMessages     int                     `json:"max_history_messages,omitempty"`
 	MaxTokens              int                     `json:"max_tokens,omitempty"`
 	Reasoning              string                  `json:"reasoning,omitempty"`
 	OutputMode             string                  `json:"output_mode,omitempty"`
@@ -68,6 +73,7 @@ type AgentToolConfig struct {
 	InputMappings  map[string]string `json:"input_mappings,omitempty"`
 	OutputKeys     []string          `json:"output_keys,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	MaxDepth       int               `json:"max_depth,omitempty"`
 }
 
 // DynamicBlueprintPolicy restricts blueprint JSON supplied dynamically by a model.

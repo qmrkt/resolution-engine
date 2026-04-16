@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 // SubmitResultConfig is the node config for submit_result steps.

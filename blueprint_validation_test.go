@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 func mustBlueprint(t *testing.T, text string) (dag.Blueprint, []byte) {
@@ -182,6 +182,72 @@ func TestValidateResolutionBlueprintRejectsUnknownAgentLoopBuiltin(t *testing.T)
 	}
 }
 
+func TestValidateResolutionBlueprintAcceptsAgentLoopBlueprintToolWithSubagent(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"agent-loop-subagent-tool",
+	  "version":1,
+	  "nodes":[
+	    {"id":"agent","type":"agent_loop","config":{
+	      "prompt":"Resolve.",
+	      "tools":[
+	        {
+	          "name":"delegate",
+	          "kind":"blueprint",
+	          "max_depth":2,
+	          "inline":{
+	            "id":"delegate-child",
+	            "version":1,
+	            "nodes":[
+	              {"id":"child_agent","type":"agent_loop","config":{"prompt":"Inspect this."}}
+	            ],
+	            "edges":[]
+	          }
+	        }
+	      ]
+	    }},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"agent failed"}}
+	  ],
+	  "edges":[{"from":"agent","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsNegativeAgentLoopToolMaxDepth(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"agent-loop-tool-max-depth",
+	  "version":1,
+	  "nodes":[
+	    {"id":"agent","type":"agent_loop","config":{
+	      "prompt":"Resolve.",
+	      "tools":[
+	        {
+	          "name":"delegate",
+	          "kind":"blueprint",
+	          "max_depth":-1,
+	          "inline":{
+	            "id":"delegate-child",
+	            "version":1,
+	            "nodes":[
+	              {"id":"step","type":"cel_eval","config":{"expressions":{"ok":"'true'"}}}
+	            ],
+	            "edges":[]
+	          }
+	        }
+	      ]
+	    }},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"agent failed"}}
+	  ],
+	  "edges":[{"from":"agent","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected negative tool max_depth blueprint to be invalid")
+	}
+}
+
 func TestValidateResolutionBlueprintAcceptsAPIFetchWithoutJSONPath(t *testing.T) {
 	bp, raw := mustBlueprint(t, `{
 	  "id":"api-raw",
@@ -256,6 +322,119 @@ func TestValidateResolutionBlueprintRejectsNegativeMapConcurrency(t *testing.T) 
 	result := ValidateResolutionBlueprint(bp, raw)
 	if result.Valid {
 		t.Fatal("expected negative map concurrency blueprint to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintAcceptsValidateBlueprintNode(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"validate-blueprint-node",
+	  "version":1,
+	  "nodes":[
+	    {"id":"generator","type":"agent_loop","config":{"prompt":"Generate a blueprint.","output_mode":"structured","output_tool":{"parameters":{"type":"object","properties":{"blueprint_json":{"type":"string"}},"required":["blueprint_json"]}}}},
+	    {"id":"check","type":"validate_blueprint","config":{"blueprint_json_key":"generator.output.blueprint_json"}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"example"}}
+	  ],
+	  "edges":[
+	    {"from":"generator","to":"check"},
+	    {"from":"check","to":"cancel"}
+	  ]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsValidateBlueprintMissingKey(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"validate-blueprint-node-missing-key",
+	  "version":1,
+	  "nodes":[
+	    {"id":"check","type":"validate_blueprint","config":{}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"example"}}
+	  ],
+	  "edges":[{"from":"check","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected validate_blueprint without blueprint_json_key to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintAcceptsGadgetNode(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"gadget-parent",
+	  "version":1,
+	  "nodes":[
+	    {"id":"run_child","type":"gadget","config":{"blueprint_json_key":"input.child_blueprint_json","propagate_terminal":true}},
+	    {"id":"submit","type":"submit_result","config":{"outcome_key":"run_child.outcome"}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"child run failed"}}
+	  ],
+	  "edges":[
+	    {"from":"run_child","to":"submit","condition":"run_child.submitted == 'true'"},
+	    {"from":"run_child","to":"cancel","condition":"run_child.submitted != 'true'"}
+	  ]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if !result.Valid {
+		t.Fatalf("expected valid gadget blueprint, got issues: %+v", result.Issues)
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsGadgetMissingSource(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"gadget-missing-source",
+	  "version":1,
+	  "nodes":[
+	    {"id":"run_child","type":"gadget","config":{}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"child run failed"}}
+	  ],
+	  "edges":[{"from":"run_child","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected gadget without a child blueprint source to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsGadgetNegativeMaxDepth(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"gadget-negative-depth",
+	  "version":1,
+	  "nodes":[
+	    {"id":"run_child","type":"gadget","config":{"blueprint_json_key":"input.child_blueprint_json","max_depth":-1}},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"child run failed"}}
+	  ],
+	  "edges":[{"from":"run_child","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected gadget with negative max_depth to be invalid")
+	}
+}
+
+func TestValidateResolutionBlueprintRejectsInvalidInlineGadgetBlueprint(t *testing.T) {
+	bp, raw := mustBlueprint(t, `{
+	  "id":"gadget-inline-invalid",
+	  "version":1,
+	  "nodes":[
+	    {"id":"run_child","type":"gadget","config":{
+	      "inline":{
+	        "id":"child",
+	        "version":1,
+	        "nodes":[
+	          {"id":"submit","type":"submit_result","config":{}}
+	        ],
+	        "edges":[]
+	      }
+	    }},
+	    {"id":"cancel","type":"cancel_market","config":{"reason":"child run failed"}}
+	  ],
+	  "edges":[{"from":"run_child","to":"cancel"}]
+	}`)
+	result := ValidateResolutionBlueprint(bp, raw)
+	if result.Valid {
+		t.Fatal("expected gadget with invalid inline child blueprint to be invalid")
 	}
 }
 

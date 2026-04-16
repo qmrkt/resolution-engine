@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/question-market/resolution-engine/dag"
+	"github.com/qmrkt/resolution-engine/dag"
 )
 
 // mockExecutor records calls and returns configured results.

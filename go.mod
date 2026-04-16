@@ -1,4 +1,4 @@
-module github.com/question-market/resolution-engine
+module github.com/qmrkt/resolution-engine
 
 go 1.23.0
 
