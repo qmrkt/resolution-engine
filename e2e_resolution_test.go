@@ -148,7 +148,7 @@ func TestE2EAPIFetchResolution(t *testing.T) {
 	bp := buildAPIFetchBlueprint(apiServer.URL)
 
 	appID := 1003
-	run, err := runner.RunBlueprint(appID, bp, nil)
+	run, err := runBlueprintSync(runner, appID, bp, nil)
 	if err != nil {
 		t.Fatalf("execution error: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestE2ELLMCallResolution(t *testing.T) {
 	bp := buildLLMCallBlueprint()
 
 	appID := 1004
-	run, err := runner.RunBlueprint(appID, bp, nil)
+	run, err := runBlueprintSync(runner, appID, bp, nil)
 	if err != nil {
 		t.Fatalf("execution error: %v", err)
 	}
@@ -399,9 +399,9 @@ func TestE2EYOLOAutoResolutionExample(t *testing.T) {
 		AnthropicBaseURL: anthropicServer.URL,
 		OpenAIAPIKey:     "test-openai-key",
 		OpenAIBaseURL:    openAIServer.URL + "/chat/completions",
-	}, "", tmpDir, "")
+	}, tmpDir)
 
-	run, err := runner.RunBlueprint(2001, rawBlueprint, map[string]string{
+	run, err := runBlueprintSync(runner, 2001, rawBlueprint, map[string]string{
 		"market.question":              "Will the test outcome resolve to No?",
 		"market.outcomes_json":         `["Yes","No"]`,
 		"market.resolution_rules":      "Resolve to the most truthful outcome. Defer if evidence is inconclusive.",

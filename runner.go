@@ -1,14 +1,11 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/qmrkt/resolution-engine/dag"
 	"github.com/qmrkt/resolution-engine/executors"
@@ -19,13 +16,22 @@ const (
 	PathDispute = "dispute"
 )
 
-// Runner executes resolution blueprints and persists evidence/traces.
+// Runner wires the DAG engine with registered executors and the durable data
+// directory used for evidence persistence.
 type Runner struct {
-	engine    *dag.Engine
-	dataDir   string
-	traceSink traceSink
-	baseCtx   context.Context
-	mu        sync.Mutex
+	engine  *dag.Engine
+	dataDir string
+}
+
+type submittedResolution struct {
+	NodeID       string
+	Outcome      string
+	EvidenceHash string
+}
+
+type runAction struct {
+	NodeID string
+	Reason string
 }
 
 func adaptBlueprintValidation(bp dag.Blueprint, rawJSON []byte) executors.BlueprintValidationResult {
@@ -45,7 +51,7 @@ func adaptBlueprintValidation(bp dag.Blueprint, rawJSON []byte) executors.Bluepr
 	}
 }
 
-func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dataDir string, traceToken string) *Runner {
+func NewRunner(llmConfig executors.LLMCallExecutorConfig, dataDir string) *Runner {
 	engine := dag.NewEngine(nil)
 
 	engine.RegisterExecutor("api_fetch", executors.NewAPIFetchExecutor())
@@ -63,28 +69,8 @@ func NewRunner(llmConfig executors.LLMCallExecutorConfig, indexerURL string, dat
 	_ = os.MkdirAll(dataDir, 0o755)
 
 	return &Runner{
-		engine:    engine,
-		dataDir:   dataDir,
-		traceSink: NewTraceEmitter(indexerURL, traceToken, nil),
-		baseCtx:   context.Background(),
-	}
-}
-
-func (r *Runner) SetContext(ctx context.Context) {
-	if r == nil || ctx == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.baseCtx = ctx
-}
-
-func (r *Runner) Close() {
-	if r == nil {
-		return
-	}
-	if closer, ok := r.traceSink.(interface{ Close() }); ok {
-		closer.Close()
+		engine:  engine,
+		dataDir: dataDir,
 	}
 }
 
@@ -98,38 +84,6 @@ func (r *Runner) WriteEvidence(appID int, payload interface{}) (string, error) {
 		return "", fmt.Errorf("write evidence payload: %w", err)
 	}
 	return evidencePath, nil
-}
-
-func (r *Runner) RunBlueprint(appID int, resolutionLogicJSON []byte, inputs map[string]string, opts ...RunOptions) (*dag.RunState, error) {
-	return r.executeResolutionWithInputs(appID, resolutionLogicJSON, inputs, firstRunOptions(opts...))
-}
-
-func isResolutionSuccessful(run *dag.RunState) bool {
-	if run == nil {
-		return false
-	}
-	if run.Status == "failed" || run.Status == "cancelled" {
-		return false
-	}
-	if _, cancelled := findRunAction(run, "cancelled"); cancelled {
-		return false
-	}
-	if _, deferred := findRunAction(run, "deferred"); deferred {
-		return false
-	}
-	_, ok := findSubmittedResolution(run)
-	return ok
-}
-
-type submittedResolution struct {
-	NodeID       string
-	Outcome      string
-	EvidenceHash string
-}
-
-type runAction struct {
-	NodeID string
-	Reason string
 }
 
 func findSubmittedResolution(run *dag.RunState) (submittedResolution, bool) {
@@ -202,96 +156,4 @@ func findRunAction(run *dag.RunState, flag string) (runAction, bool) {
 	}
 
 	return zero, false
-}
-
-func (r *Runner) executeResolutionWithInputs(appID int, resolutionLogicJSON []byte, extraInputs map[string]string, opts RunOptions) (*dag.RunState, error) {
-	var bp dag.Blueprint
-	if err := json.Unmarshal(resolutionLogicJSON, &bp); err != nil {
-		return nil, fmt.Errorf("parse resolution logic: %w", err)
-	}
-
-	baseCtx := opts.Context
-	if baseCtx == nil {
-		r.mu.Lock()
-		baseCtx = r.baseCtx
-		r.mu.Unlock()
-	}
-	if baseCtx == nil {
-		baseCtx = context.Background()
-	}
-
-	ctx, cancel := context.WithTimeout(baseCtx, DefaultRunTimeout)
-	defer cancel()
-
-	inputs := map[string]string{
-		"market_app_id": fmt.Sprintf("%d", appID),
-	}
-	for key, value := range extraInputs {
-		if strings.TrimSpace(key) == "" {
-			continue
-		}
-		inputs[key] = value
-	}
-
-	var observer dag.RunObserver
-	if opts.Trace != nil && r.traceSink != nil {
-		observer = newTraceObserver(r.traceSink, *opts.Trace)
-	}
-
-	run, err := r.engine.ExecuteWithObserver(ctx, bp, inputs, observer)
-	if err != nil {
-		return run, fmt.Errorf("DAG execution: %w", err)
-	}
-
-	return run, nil
-}
-
-func EvidenceHash(run *dag.RunState) string {
-	data, _ := json.Marshal(run)
-	hash := sha256.Sum256(data)
-	return fmt.Sprintf("%x", hash)
-}
-
-type traceObserver struct {
-	sink     traceSink
-	metadata TraceMetadata
-	mu       sync.Mutex
-	revision int
-}
-
-func newTraceObserver(sink traceSink, metadata TraceMetadata) *traceObserver {
-	return &traceObserver{
-		sink: sink,
-		metadata: TraceMetadata{
-			AppID:         metadata.AppID,
-			BlueprintPath: strings.TrimSpace(metadata.BlueprintPath),
-			Initiator:     strings.TrimSpace(metadata.Initiator),
-		},
-	}
-}
-
-func (o *traceObserver) OnRunSnapshot(run *dag.RunState) {
-	if o == nil || o.sink == nil || run == nil {
-		return
-	}
-
-	o.mu.Lock()
-	o.revision++
-	revision := o.revision
-	o.mu.Unlock()
-
-	o.sink.Enqueue(TraceEnvelope{
-		AppID:         o.metadata.AppID,
-		BlueprintPath: o.metadata.BlueprintPath,
-		Initiator:     o.metadata.Initiator,
-		Revision:      revision,
-		Run:           run,
-	})
-}
-
-func firstRunOptions(opts ...RunOptions) RunOptions {
-	if len(opts) == 0 {
-		return RunOptions{}
-	}
-	return opts[0]
 }

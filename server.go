@@ -4,12 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/qmrkt/resolution-engine/dag"
 )
+
+// validRunIDPattern keeps user-supplied run_ids filename-safe; the durable
+// store uses them as path components (runs/<run_id>.json).
+var validRunIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+func isValidRunID(runID string) bool {
+	return validRunIDPattern.MatchString(runID)
+}
 
 type RunManagerAPI interface {
 	Submit(RunRequest) (RunResult, error)
@@ -23,9 +33,10 @@ type SignalRunManagerAPI interface {
 }
 
 type EngineServer struct {
-	manager   RunManagerAPI
-	startedAt time.Time
-	token     string
+	manager      RunManagerAPI
+	startedAt    time.Time
+	token        string
+	shuttingDown atomic.Bool
 }
 
 type runHTTPRequest struct {
@@ -45,6 +56,15 @@ func NewEngineServer(manager RunManagerAPI, token string) *EngineServer {
 	}
 }
 
+// BeginShutdown marks the server as draining so new mutating requests are
+// rejected while read-only requests can still complete.
+func (s *EngineServer) BeginShutdown() {
+	if s == nil {
+		return
+	}
+	s.shuttingDown.Store(true)
+}
+
 func (s *EngineServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/run", s.handleRun)
@@ -61,6 +81,9 @@ func (s *EngineServer) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.authorize(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if s.rejectMutatingWhileShuttingDown(w) {
 		return
 	}
 
@@ -118,6 +141,10 @@ func (s *EngineServer) handleRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if errors.Is(err, errDurableManagerShuttingDown) {
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -136,6 +163,9 @@ func (s *EngineServer) handleSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if s.rejectMutatingWhileShuttingDown(w) {
+		return
+	}
 	manager, ok := s.manager.(SignalRunManagerAPI)
 	if !ok {
 		http.Error(w, "signals are not supported by this run manager", http.StatusNotImplemented)
@@ -147,8 +177,16 @@ func (s *EngineServer) handleSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
 		return
 	}
+	if trimmed := strings.TrimSpace(payload.RunID); trimmed != "" && !isValidRunID(trimmed) {
+		http.Error(w, "invalid run_id", http.StatusBadRequest)
+		return
+	}
 	result, err := manager.Signal(payload)
 	if err != nil {
+		if errors.Is(err, errDurableManagerShuttingDown) {
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -166,6 +204,10 @@ func (s *EngineServer) handleRunByID(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "run_id is required", http.StatusBadRequest)
 		return
 	}
+	if !isValidRunID(runID) {
+		http.Error(w, "invalid run_id", http.StatusBadRequest)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -177,6 +219,9 @@ func (s *EngineServer) handleRunByID(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	case http.MethodDelete:
+		if s.rejectMutatingWhileShuttingDown(w) {
+			return
+		}
 		result, ok := s.manager.Cancel(runID)
 		if !ok {
 			http.NotFound(w, r)
@@ -207,4 +252,12 @@ func (s *EngineServer) authorize(r *http.Request) bool {
 		return true
 	}
 	return r.Header.Get("Authorization") == "Bearer "+s.token
+}
+
+func (s *EngineServer) rejectMutatingWhileShuttingDown(w http.ResponseWriter) bool {
+	if s == nil || !s.shuttingDown.Load() {
+		return false
+	}
+	http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+	return true
 }

@@ -14,29 +14,26 @@ import (
 	"github.com/qmrkt/resolution-engine/dag"
 )
 
-type TraceMetadata struct {
-	AppID         int    `json:"appId"`
-	BlueprintPath string `json:"blueprintPath"`
-	Initiator     string `json:"initiator"`
-}
-
-type RunOptions struct {
-	Trace   *TraceMetadata
-	Context context.Context
-}
-
+// TraceEnvelope carries a single point-in-time snapshot of a durable run.
+// The durable manager emits one envelope per persisted revision; the indexer
+// uses them to reconstruct execution history without replaying events.
 type TraceEnvelope struct {
 	AppID         int           `json:"appId"`
 	BlueprintPath string        `json:"blueprintPath"`
 	Initiator     string        `json:"initiator"`
-	Revision      int           `json:"revision"`
+	Revision      int64         `json:"revision"`
 	Run           *dag.RunState `json:"run"`
 }
 
+// traceSink decouples the durable manager from the concrete emitter so tests
+// can capture envelopes in-memory.
 type traceSink interface {
 	Enqueue(TraceEnvelope) bool
 }
 
+// TraceEmitter POSTs trace snapshots to the indexer on a background goroutine.
+// The queue is bounded; snapshots are dropped on overflow since traces are an
+// observability signal, not a control-plane record.
 type TraceEmitter struct {
 	indexerURL string
 	token      string
@@ -49,6 +46,8 @@ type TraceEmitter struct {
 	wg         sync.WaitGroup
 }
 
+// NewTraceEmitter returns a running emitter. When indexerURL is empty it
+// returns nil so callers can skip wiring without guarding on error values.
 func NewTraceEmitter(indexerURL string, token string, logger *slog.Logger) *TraceEmitter {
 	indexerURL = strings.TrimRight(strings.TrimSpace(indexerURL), "/")
 	if indexerURL == "" {

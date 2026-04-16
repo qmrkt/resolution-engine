@@ -19,3 +19,6 @@ jobs:
         run: go test -fuzz=FuzzExtractJSON$ -fuzztime=10s ./executors/
       - name: Fuzz JSON path
         run: go test -fuzz=FuzzJSONPathExtract -fuzztime=10s ./executors/
+      - name: Benchmarks (baseline, non-blocking)
+        continue-on-error: true
+        run: go test -bench=. -benchmem -run=^$ -benchtime=1s ./dag/

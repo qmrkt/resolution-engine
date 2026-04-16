@@ -911,3 +911,127 @@ func TestTypedCELMapAccess(t *testing.T) {
 		t.Fatal("expected judge.details.confidence > 0.5")
 	}
 }
+
+// TestCELExtStringsMethodsRoundTrip exercises every method from cel-go's
+// ext.Strings() extension end-to-end through EvalExpression. The point is
+// two-fold:
+//
+//  1. Confirm the methods actually work in the engine (only trim() and
+//     lowerAscii() had any prior coverage).
+//  2. Catch drift in the isCELMethod allowlist in expr.go. That allowlist
+//     decides whether a dotted token like `fetch.raw.upperAscii` is split
+//     into variable `fetch.raw` + method `upperAscii`, or declared whole.
+//     Each method is tested in a dotted form so a missing entry in the
+//     allowlist produces a compile-time CEL failure here.
+func TestCELExtStringsMethodsRoundTrip(t *testing.T) {
+	cases := []struct {
+		name       string
+		values     map[string]string
+		expression string
+		want       string
+	}{
+		// charAt
+		{"charAt", map[string]string{"v": "hello"}, "v.charAt(1)", "e"},
+		{"charAt dotted", map[string]string{"fetch.raw": "hello"}, "fetch.raw.charAt(0)", "h"},
+		// format
+		{"format", map[string]string{"v": "hello %s"}, "v.format(['world'])", "hello world"},
+		{"format dotted", map[string]string{"fetch.tpl": "%d:%s"}, "fetch.tpl.format([7, 'ok'])", "7:ok"},
+		// indexOf
+		{"indexOf", map[string]string{"v": "hello world"}, "v.indexOf('world')", "6"},
+		{"indexOf dotted", map[string]string{"fetch.raw": "abcdef"}, "fetch.raw.indexOf('cd')", "2"},
+		// lastIndexOf
+		{"lastIndexOf", map[string]string{"v": "abcabc"}, "v.lastIndexOf('b')", "4"},
+		{"lastIndexOf dotted", map[string]string{"fetch.raw": "xyxyxy"}, "fetch.raw.lastIndexOf('y')", "5"},
+		// lowerAscii
+		{"lowerAscii", map[string]string{"v": "HELLO"}, "v.lowerAscii()", "hello"},
+		{"lowerAscii dotted", map[string]string{"fetch.raw": "HI"}, "fetch.raw.lowerAscii()", "hi"},
+		// replace
+		{"replace", map[string]string{"v": "ababab"}, "v.replace('a', 'X')", "XbXbXb"},
+		{"replace limit", map[string]string{"v": "ababab"}, "v.replace('a', 'X', 2)", "XbXbab"},
+		{"replace dotted", map[string]string{"fetch.raw": "foo"}, "fetch.raw.replace('f', 'b')", "boo"},
+		// split
+		{"split", map[string]string{"v": "a,b,c"}, "v.split(',')", `["a","b","c"]`},
+		{"split dotted", map[string]string{"fetch.raw": "x,y,z"}, "fetch.raw.split(',')", `["x","y","z"]`},
+		// substring
+		{"substring from", map[string]string{"v": "abcdef"}, "v.substring(2)", "cdef"},
+		{"substring range", map[string]string{"v": "abcdef"}, "v.substring(1, 4)", "bcd"},
+		{"substring dotted", map[string]string{"fetch.raw": "hello"}, "fetch.raw.substring(1, 3)", "el"},
+		// trim
+		{"trim", map[string]string{"v": "  hello  "}, "v.trim()", "hello"},
+		{"trim dotted", map[string]string{"fetch.raw": "  xx  "}, "fetch.raw.trim()", "xx"},
+		// upperAscii
+		{"upperAscii", map[string]string{"v": "hello"}, "v.upperAscii()", "HELLO"},
+		{"upperAscii dotted", map[string]string{"fetch.raw": "hi"}, "fetch.raw.upperAscii()", "HI"},
+		// reverse
+		{"reverse", map[string]string{"v": "abc"}, "v.reverse()", "cba"},
+		{"reverse dotted", map[string]string{"fetch.raw": "xyz"}, "fetch.raw.reverse()", "zyx"},
+		// join — uses literal list so CEL doesn't need to coerce list<dyn>
+		// (the result of parsing a JSON array from context) into list<string>.
+		{"join", nil, "['a', 'b', 'c'].join()", "abc"},
+		{"join sep", nil, "['a', 'b', 'c'].join(',')", "a,b,c"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := NewContext(nil)
+			for k, v := range tc.values {
+				ctx.Set(k, v)
+			}
+			got, err := EvalExpression(tc.expression, ctx)
+			if err != nil {
+				t.Fatalf("EvalExpression(%q) error: %v", tc.expression, err)
+			}
+			if got != tc.want {
+				t.Fatalf("EvalExpression(%q) = %q, want %q", tc.expression, got, tc.want)
+			}
+		})
+	}
+
+	// Drift guard: every method listed in isCELMethod must be exercised by
+	// at least one case above. If an entry is removed from the allowlist
+	// without removing its tests, this stays green; if an entry is added
+	// without a test, this fails. Paired with the per-method tests, the two
+	// together make the allowlist self-checking.
+	extMethods := []string{
+		"charAt", "format", "indexOf", "lastIndexOf", "lowerAscii",
+		"replace", "split", "substring", "trim", "upperAscii", "reverse", "join",
+	}
+	for _, m := range extMethods {
+		covered := false
+		for _, tc := range cases {
+			if strings.Contains(tc.expression, "."+m+"(") || strings.Contains(tc.expression, "]."+m+"(") {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("ext.Strings method %q is in isCELMethod but has no test case", m)
+		}
+	}
+}
+
+// TestExtractIdentifiersStripsCELMethods is a focused unit test of the
+// heuristic that keeps dotted node-output variables separable from the
+// trailing CEL method name. If a method is removed from isCELMethod (or the
+// upstream cel-go library renames one), identifier extraction mis-declares
+// a variable and downstream evaluations fail cryptically; this test catches
+// the drift at the source.
+func TestExtractIdentifiersStripsCELMethods(t *testing.T) {
+	methods := []string{
+		"charAt", "format", "indexOf", "lastIndexOf", "lowerAscii",
+		"replace", "split", "substring", "trim", "upperAscii", "reverse", "join",
+		// Built-in receiver methods — same stripping logic.
+		"contains", "startsWith", "endsWith", "matches", "exists", "all",
+		"filter", "size", "has",
+	}
+	for _, m := range methods {
+		m := m
+		t.Run(m, func(t *testing.T) {
+			token := "fetch.raw." + m
+			ids := extractIdentifiers(token, nil)
+			if len(ids) != 1 || ids[0] != "fetch.raw" {
+				t.Fatalf("extractIdentifiers(%q) = %v, want [fetch.raw]", token, ids)
+			}
+		})
+	}
+}

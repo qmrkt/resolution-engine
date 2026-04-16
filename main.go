@@ -55,11 +55,7 @@ func main() {
 		OpenAIBaseURL:    openAIBaseURL,
 		GoogleAPIKey:     googleKey,
 		GoogleBaseURL:    googleBaseURL,
-	}, indexerURL, dataDir, traceIngestToken)
-	serviceCtx, serviceCancel := context.WithCancel(context.Background())
-	defer serviceCancel()
-	runner.SetContext(serviceCtx)
-	defer runner.Close()
+	}, dataDir)
 
 	if allowLocalAPIFetch {
 		apiFetch := executors.NewAPIFetchExecutor()
@@ -68,7 +64,16 @@ func main() {
 		slog.Warn("local api_fetch is enabled; use only for trusted local smoke tests", "component", "main")
 	}
 
-	manager, err := NewDurableRunManager(runner, dataDir, nil, callbackToken, DurableRunManagerConfig{})
+	traceEmitter := NewTraceEmitter(indexerURL, traceIngestToken, nil)
+	if traceEmitter != nil {
+		defer traceEmitter.Close()
+	}
+
+	managerConfig := DurableRunManagerConfig{}
+	if traceEmitter != nil {
+		managerConfig.TraceSink = traceEmitter
+	}
+	manager, err := NewDurableRunManager(runner, dataDir, nil, callbackToken, managerConfig)
 	if err != nil {
 		slog.Error("create durable run manager", "component", "main", "error", err)
 		os.Exit(1)
@@ -95,7 +100,9 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	slog.Info("received signal, shutting down", "component", "main", "signal", sig.String())
-	serviceCancel()
+
+	server.BeginShutdown()
+	manager.BeginShutdown()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), DefaultShutdownTimeout)
 	defer shutdownCancel()

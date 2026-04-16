@@ -78,6 +78,26 @@ func (c *Context) ValuesForEval() map[string]string {
 	return c.Snapshot()
 }
 
+// GetMulti returns raw string values for only the requested keys, under a
+// single RLock so the result is consistent at one point in time. Missing keys
+// are omitted; callers distinguish present-but-empty from missing by checking
+// map membership. Used by CEL evaluation to avoid snapshotting the whole
+// context when only a few keys are referenced.
+func (c *Context) GetMulti(keys []string) map[string]string {
+	if c == nil || len(keys) == 0 {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		if v, ok := c.values[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // SnapshotNode returns all output keys for a node as a flat map.
 // Keys are returned without the node ID prefix (e.g. "status", not "fetch.status").
 func (c *Context) SnapshotNode(nodeID string) map[string]string {

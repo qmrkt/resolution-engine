@@ -283,6 +283,51 @@ func TestDurableCallbackDeliverySaveFailureRetriesPost(t *testing.T) {
 	t.Fatalf("callback was not delivered after marker save failure; attempts=%d", attempts.Load())
 }
 
+// TestDurableWorkerRetriesStaleCompletionWithoutReExecutingNode verifies the
+// stale-save-retry fix. The store is configured to reject the first save that
+// reflects node completion with errDurableStaleRecord, simulating a signal or
+// timer save that raced with the worker. The worker must reload the fresh
+// record, re-apply its captured completion outcome, and persist — without
+// calling the executor a second time (which would be catastrophic for
+// non-idempotent executors like submit_result or external API calls).
+func TestDurableWorkerRetriesStaleCompletionWithoutReExecutingNode(t *testing.T) {
+	tmpDir := t.TempDir()
+	counter := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+		"outcome": counter,
+	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
+	defer manager.Close()
+
+	var injected atomic.Bool
+	setDurableBeforeSaveRun(t, manager, func(record *durableRunRecord) error {
+		if record.Request.RunID != "stale-completion" {
+			return nil
+		}
+		if record.Checkpoint.Completed["step"] && injected.CompareAndSwap(false, true) {
+			return errDurableStaleRecord
+		}
+		return nil
+	})
+
+	if _, err := manager.Submit(RunRequest{
+		RunID:         "stale-completion",
+		AppID:         3010,
+		BlueprintJSON: simpleSubmitBlueprint("outcome"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForDurableStatus(t, manager, "stale-completion", RunStatusCompleted)
+	if result.Outcome != "1" {
+		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	}
+	if got := counter.Count(); got != 1 {
+		t.Fatalf("executor run count = %d, want 1 — stale save forced a re-execution", got)
+	}
+	if !injected.Load() {
+		t.Fatal("stale injection never fired; test did not exercise the retry path")
+	}
+}
+
 func TestDurableRecoveryIgnoresCorruptEventLog(t *testing.T) {
 	tmpDir := t.TempDir()
 	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(nil), DurableRunManagerConfig{

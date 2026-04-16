@@ -17,7 +17,25 @@ import (
 // signature). Entries are immutable and safe for concurrent use. The cache is
 // unbounded but naturally plateaus — expressions come from blueprint edge
 // conditions and cel_eval configs, which are finite per blueprint.
+//
+// Staleness safety: the type signature encodes the actual observed types of
+// each referenced variable at eval time. If a context value changes type
+// between calls (e.g. a key switches from string to JSON list), varSig
+// changes and a new program is compiled — the old one is never reused with
+// the wrong shape.
 var celCache sync.Map // string → cel.Program
+
+// planCache memoizes per-expression parsing work that is independent of
+// context values: the sorted list of referenced identifiers and the set of
+// candidate keys (idents + all dotted prefixes) that activation-building
+// might need to look up. Both are pure functions of the expression text.
+var planCache sync.Map // string → *exprPlan
+
+// exprPlan holds the immutable, context-independent parse of an expression.
+type exprPlan struct {
+	identifiers []string // sorted, deduped
+	candidates  []string // identifiers + every dotted prefix, for a single GetMulti call
+}
 
 // EvalCondition evaluates a CEL expression against context values and returns
 // the result as a boolean.
@@ -39,26 +57,21 @@ func EvalExpression(expression string, ctx *Context) (string, error) {
 	return celToString(val), nil
 }
 
-// evalCEL is the shared CEL evaluation core. It parses context values into
-// native types, resolves referenced variables, and evaluates the expression.
-// Compiled programs are cached keyed on (expression, variable type signature).
+// evalCEL is the shared CEL evaluation core. It resolves only the variables
+// the expression actually references, builds a typed activation, and caches
+// the compiled program by (expression, observed type signature).
 func evalCEL(expression string, ctx *Context) (ref.Val, error) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" {
 		return nil, fmt.Errorf("empty expression")
 	}
 
-	values := ctx.ValuesForEval()
+	plan := getOrBuildPlan(expression)
 
-	// Parse string values into native types where possible.
-	fullActivation := make(map[string]any, len(values))
-	for k, v := range values {
-		fullActivation[k] = inferTypedValue(v)
-	}
+	// One-shot, lock-consistent read of every key the expression might need.
+	raw := ctx.GetMulti(plan.candidates)
 
-	// Only declare variables the expression actually references.
-	allIdents := extractIdentifiers(expression, nil)
-	varDecls, activation, varSig := resolveExpressionVars(allIdents, fullActivation)
+	varDecls, activation, varSig := buildActivation(plan.identifiers, raw)
 
 	cacheKey := expression + "\x00" + varSig
 	if cached, ok := celCache.Load(cacheKey); ok {
@@ -94,24 +107,67 @@ func evalCEL(expression string, ctx *Context) (ref.Val, error) {
 	return out, nil
 }
 
-// resolveExpressionVars builds CEL variable declarations and a minimal
-// activation map for only the variables an expression references. It returns
-// a deterministic type signature string for cache keying.
-func resolveExpressionVars(exprIdents []string, fullActivation map[string]any) ([]cel.EnvOption, map[string]any, string) {
-	sort.Strings(exprIdents)
+// getOrBuildPlan returns the cached parse plan for an expression, computing
+// it on first access. Identifiers and candidates are pure functions of the
+// expression text, so caching is safe regardless of context state.
+func getOrBuildPlan(expression string) *exprPlan {
+	if cached, ok := planCache.Load(expression); ok {
+		return cached.(*exprPlan)
+	}
+	idents := extractIdentifiers(expression, nil)
+	sort.Strings(idents)
 
-	decls := make([]cel.EnvOption, 0, len(exprIdents))
-	activation := make(map[string]any, len(exprIdents))
-	declared := make(map[string]struct{})
+	// Candidates include each ident plus every dotted prefix, because
+	// activation building may fall back to prefix resolution when an ident
+	// itself is absent from context but a prefix is (e.g. JSON list/map).
+	candCap := len(idents)
+	for _, id := range idents {
+		candCap += strings.Count(id, ".")
+	}
+	candidates := make([]string, 0, candCap)
+	for _, id := range idents {
+		candidates = append(candidates, id)
+		for i := len(id) - 1; i > 0; i-- {
+			if id[i] == '.' {
+				candidates = append(candidates, id[:i])
+			}
+		}
+	}
+
+	plan := &exprPlan{identifiers: idents, candidates: candidates}
+	if actual, loaded := planCache.LoadOrStore(expression, plan); loaded {
+		return actual.(*exprPlan)
+	}
+	return plan
+}
+
+// buildActivation constructs CEL variable declarations, the activation map,
+// and a deterministic type signature for cache keying. It mirrors the
+// resolution rules of the previous full-snapshot implementation:
+//
+//  1. Direct match: ident is present in context → declare with its inferred
+//     type.
+//  2. Prefix match: ident absent but longest existing dotted prefix is a
+//     JSON list/map → declare the prefix (CEL resolves the tail as field
+//     access). Stops at the first existing prefix regardless of type.
+//  3. Otherwise: declare ident as an empty string.
+//
+// The returned signature string uniquely identifies the set of declarations
+// used for this call, so the compiled-program cache can't hand back a
+// program built against a different type shape.
+func buildActivation(idents []string, raw map[string]string) ([]cel.EnvOption, map[string]any, string) {
+	decls := make([]cel.EnvOption, 0, len(idents))
+	activation := make(map[string]any, len(idents))
+	declared := make(map[string]struct{}, len(idents))
 	var sig strings.Builder
 
-	for _, ident := range exprIdents {
-		// Direct match in context.
-		if v, ok := fullActivation[ident]; ok {
+	for _, ident := range idents {
+		if s, ok := raw[ident]; ok {
+			typed := inferTypedValue(s)
 			if _, done := declared[ident]; !done {
-				celType := inferCELType(v)
+				celType := inferCELType(typed)
 				decls = append(decls, cel.Variable(ident, celType))
-				activation[ident] = v
+				activation[ident] = typed
 				declared[ident] = struct{}{}
 				sig.WriteString(ident)
 				sig.WriteByte(':')
@@ -121,38 +177,37 @@ func resolveExpressionVars(exprIdents []string, fullActivation map[string]any) (
 			continue
 		}
 
-		// Check if a prefix is a structured var (map or list) — CEL
-		// resolves the remainder as field access / method call.
-		// E.g. ident="fetch._runs.size" → declare "fetch._runs" as list.
 		prefixFound := false
 		for i := len(ident) - 1; i > 0; i-- {
 			if ident[i] != '.' {
 				continue
 			}
 			prefix := ident[:i]
-			if v, ok := fullActivation[prefix]; ok {
-				switch v.(type) {
-				case map[string]any, []any:
-					if _, done := declared[prefix]; !done {
-						celType := inferCELType(v)
-						decls = append(decls, cel.Variable(prefix, celType))
-						activation[prefix] = v
-						declared[prefix] = struct{}{}
-						sig.WriteString(prefix)
-						sig.WriteByte(':')
-						sig.WriteString(celType.String())
-						sig.WriteByte(',')
-					}
-					prefixFound = true
-				}
-				break
+			s, ok := raw[prefix]
+			if !ok {
+				continue
 			}
+			typed := inferTypedValue(s)
+			switch typed.(type) {
+			case map[string]any, []any:
+				if _, done := declared[prefix]; !done {
+					celType := inferCELType(typed)
+					decls = append(decls, cel.Variable(prefix, celType))
+					activation[prefix] = typed
+					declared[prefix] = struct{}{}
+					sig.WriteString(prefix)
+					sig.WriteByte(':')
+					sig.WriteString(celType.String())
+					sig.WriteByte(',')
+				}
+				prefixFound = true
+			}
+			break
 		}
 		if prefixFound {
 			continue
 		}
 
-		// Unknown variable — declare as empty string.
 		if _, done := declared[ident]; !done {
 			decls = append(decls, cel.Variable(ident, cel.StringType))
 			activation[ident] = ""

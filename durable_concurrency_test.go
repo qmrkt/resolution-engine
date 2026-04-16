@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -338,4 +339,135 @@ func TestDurableConcurrentCancelAndSignalsLeaveTerminalRunClean(t *testing.T) {
 	if len(record.Checkpoint.Waiting) != 0 {
 		t.Fatalf("terminal run still has waiting nodes: %+v", record.Checkpoint.Waiting)
 	}
+}
+
+// TestDurableEnqueueRaceWithBusyWorkerIsNotLost covers the lost-wake-up race
+// between an enqueue (from a signal or timer) and a worker that is already
+// processing the same run. Before the fix, an idle worker would dequeue the
+// runID, discover markProcessing returns false because another worker holds
+// the mark, and silently drop the dispatch. If that dropped dispatch carried
+// the only signal that could progress the run, the run was effectively stuck.
+//
+// The fix: markProcessing sets a pending flag when contention is detected,
+// and the worker that holds the mark re-enqueues the run on its way out via
+// unmarkProcessing. PollInterval is set long enough that the timer loop is
+// not helping on its own — the enqueue must be preserved by the pending-flag
+// machinery for the run to make progress.
+func TestDurableEnqueueRaceWithBusyWorkerIsNotLost(t *testing.T) {
+	tmpDir := t.TempDir()
+	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+		"blocking": blocking,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   4,
+		MaxQueueSize: 32,
+		PollInterval: 10 * time.Second,
+	})
+	defer manager.Close()
+
+	const runID = "race-run"
+	if _, err := manager.Submit(RunRequest{
+		RunID:         runID,
+		AppID:         2400,
+		BlueprintJSON: simpleSubmitBlueprint("blocking"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-blocking.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for blocking node to start")
+	}
+
+	// One worker is now holding markProcessing(runID) inside exec.Execute.
+	// Simulate rapid-fire enqueues — as would arise from a signal handler or
+	// timer loop firing repeatedly while the worker is busy.
+	for i := 0; i < 8; i++ {
+		manager.enqueue(runID)
+	}
+
+	// Idle workers must dequeue these, fail to claim, and leave a pending
+	// breadcrumb so the holder re-enqueues on exit.
+	deadline := time.Now().Add(2 * time.Second)
+	var hadPending bool
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		hadPending = manager.pending[runID]
+		manager.mu.Unlock()
+		if hadPending {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !hadPending {
+		t.Fatal("expected pending flag to be set while worker held markProcessing")
+	}
+
+	// Release the holder. The run completes normally; the pending flag
+	// triggers a benign re-enqueue against a terminal run.
+	close(blocking.release)
+	result := waitForDurableStatus(t, manager, runID, RunStatusCompleted)
+	if result.Outcome != "1" {
+		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	}
+}
+
+// TestDurableEnqueueBurstStaysBounded verifies the enqueue dedup. With
+// MaxWorkers=1 and MaxQueueSize=1, a burst of enqueues targeting a run that
+// is already being processed would — without dedup — see the channel fill
+// up on the first call and spawn a blocked sender goroutine for every
+// subsequent call. With dedup, all but the first see processing=true and
+// return immediately without touching the channel.
+func TestDurableEnqueueBurstStaysBounded(t *testing.T) {
+	tmpDir := t.TempDir()
+	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+		"blocking": blocking,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 1,
+		PollInterval: 10 * time.Second,
+	})
+	defer manager.Close()
+
+	const runID = "enqueue-burst"
+	if _, err := manager.Submit(RunRequest{
+		RunID:         runID,
+		AppID:         2500,
+		BlueprintJSON: simpleSubmitBlueprint("blocking"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for blocking node to start")
+	}
+
+	// Let any transient startup goroutines settle, then sample baseline.
+	time.Sleep(30 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	const burst = 200
+	for i := 0; i < burst; i++ {
+		manager.enqueue(runID)
+	}
+	time.Sleep(50 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	if diff := after - baseline; diff > 20 {
+		t.Fatalf("goroutine count grew by %d after a %d-enqueue burst (before=%d, after=%d) — dedup regressed", diff, burst, baseline, after)
+	}
+
+	// Confirm the dedup path actually fired: pending should be set because
+	// the worker is still busy with the blocking executor.
+	manager.mu.Lock()
+	pendingSet := manager.pending[runID]
+	manager.mu.Unlock()
+	if !pendingSet {
+		t.Fatal("pending flag was not set during enqueue burst — dedup did not exercise the processing path")
+	}
+
+	close(blocking.release)
+	waitForDurableStatus(t, manager, runID, RunStatusCompleted)
 }

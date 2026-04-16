@@ -233,6 +233,38 @@ In practice:
 - Callback URLs are delivered through a durable retrying outbox.
 - Traces are observability, not control-plane state.
 
+## Security
+
+Blueprints and LLM outputs cannot cause arbitrary code or command execution.
+The engine does not spawn processes, load plugins, eval code, or render
+templates — no `os/exec`, `syscall.Exec`, `plugin.Open`, `reflect.Call`,
+`unsafe`, or `text/template`. The only sandboxed evaluator is
+[CEL](https://cel.dev), a pure-expression language used for edge conditions
+and `cel_eval`; it has no I/O, no user-defined functions, and is configured
+with only the safe `ext.Strings` extension.
+
+What blueprints _can_ do is bounded:
+
+- **HTTP egress** via `api_fetch` and the agent-loop `source_fetch` tool is
+  SSRF-protected (`safeDialContext` rejects loopback/private/link-local at
+  connect time, redirects are re-validated, bodies are capped at 10 MB).
+- **Filesystem writes** are confined to the configured data directory
+  (durable run records, event logs, per-app evidence).
+- **Dynamic/child blueprints** (via `gadget`, `map`, or the agent's
+  `run_blueprint` tool) go through the same validator plus a
+  `DynamicBlueprintPolicy` that caps nodes, edges, depth, time, and tokens
+  and allowlists node types.
+- **`run_id` path traversal** is rejected at the HTTP boundary — runIDs must
+  match `^[A-Za-z0-9_-]{1,128}$`.
+
+Operator responsibilities:
+
+- Set `ENGINE_CONTROL_TOKEN` in production; when unset, every endpoint is
+  open.
+- Restrict network access to the indexer (firewall, k8s NetworkPolicy,
+  mesh authz, or bind the listener to loopback) — the engine does not
+  enforce caller identity beyond the bearer token.
+
 ## Tests
 
 ```bash

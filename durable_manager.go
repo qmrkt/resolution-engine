@@ -21,6 +21,9 @@ type DurableRunManagerConfig struct {
 	MaxWorkers   int
 	MaxQueueSize int
 	PollInterval time.Duration
+	// TraceSink receives a snapshot envelope on every state-advancing save.
+	// Optional — when nil, no observability traces are emitted.
+	TraceSink traceSink
 }
 
 type DurableRunManager struct {
@@ -31,20 +34,30 @@ type DurableRunManager struct {
 	maxWorkers    int
 	maxQueueSize  int
 	pollInterval  time.Duration
+	traceSink     traceSink
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	queue  chan string
 
-	mu         sync.Mutex
-	processing map[string]bool
+	mu           sync.Mutex
+	shuttingDown bool
+	processing   map[string]bool
+	// pending: enqueue attempts that arrived while markProcessing was held;
+	// the holder re-enqueues on unmark so the dispatch is not lost.
+	pending map[string]bool
+	// queued: runs currently in the dispatch channel; the flag dedupes
+	// enqueue bursts so the channel and blocked senders stay bounded.
+	queued     map[string]bool
 	runCancels map[string]context.CancelFunc
 }
 
 type queueFullError struct {
 	MaxQueueSize int
 }
+
+var errDurableManagerShuttingDown = errors.New("run manager is shutting down")
 
 func (e *queueFullError) Error() string {
 	return fmt.Sprintf("workflow queue full: max queued runs %d", e.MaxQueueSize)
@@ -79,10 +92,13 @@ func NewDurableRunManager(runner *Runner, dataDir string, client *http.Client, c
 		maxWorkers:    cfg.MaxWorkers,
 		maxQueueSize:  cfg.MaxQueueSize,
 		pollInterval:  cfg.PollInterval,
+		traceSink:     cfg.TraceSink,
 		ctx:           ctx,
 		cancel:        cancel,
 		queue:         make(chan string, cfg.MaxQueueSize),
 		processing:    make(map[string]bool),
+		pending:       make(map[string]bool),
+		queued:        make(map[string]bool),
 		runCancels:    make(map[string]context.CancelFunc),
 	}
 	if err := manager.recoverRuns(); err != nil {
@@ -103,13 +119,25 @@ func (m *DurableRunManager) Close() {
 	if m == nil {
 		return
 	}
-	m.cancel()
+	m.BeginShutdown()
 	m.mu.Lock()
 	for _, cancel := range m.runCancels {
 		cancel()
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
+}
+
+// BeginShutdown stops accepting new mutating work and cancels the manager
+// context so workers, timers, and callback delivery unwind promptly.
+func (m *DurableRunManager) BeginShutdown() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.shuttingDown = true
+	m.mu.Unlock()
+	m.cancel()
 }
 
 func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
@@ -193,6 +221,10 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 	}
 
 	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return RunResult{}, errDurableManagerShuttingDown
+	}
 	if existing, ok, err := m.activeRunForApp(req.AppID); err != nil {
 		m.mu.Unlock()
 		return RunResult{}, err
@@ -211,7 +243,7 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 			return RunResult{}, &queueFullError{MaxQueueSize: m.maxQueueSize}
 		}
 	}
-	if err := m.store.saveRun(record); err != nil {
+	if err := m.persist(record); err != nil {
 		m.mu.Unlock()
 		return RunResult{}, err
 	}
@@ -253,7 +285,7 @@ func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
 		record.Checkpoint.Run.CompletedAt = now
 		record.Result.RunState = record.Checkpoint.Run
 	}
-	if err := m.store.saveRun(record); err != nil {
+	if err := m.persist(record); err != nil {
 		m.mu.Unlock()
 		return RunResult{}, false
 	}
@@ -294,6 +326,10 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 	}
 
 	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return signalResult{}, errDurableManagerShuttingDown
+	}
 	record, err := m.findSignalTarget(req)
 	if err != nil {
 		m.mu.Unlock()
@@ -337,7 +373,7 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 			record.Result.RunState = record.Checkpoint.Run
 		}
 	}
-	if err := m.store.saveRun(record); err != nil {
+	if err := m.persist(record); err != nil {
 		m.mu.Unlock()
 		return signalResult{}, err
 	}
@@ -358,16 +394,28 @@ func (m *DurableRunManager) worker() {
 		case <-m.ctx.Done():
 			return
 		case runID := <-m.queue:
+			m.clearQueued(runID)
 			m.processRunOnce(runID)
 		}
 	}
 }
 
+func (m *DurableRunManager) clearQueued(runID string) {
+	m.mu.Lock()
+	delete(m.queued, runID)
+	m.mu.Unlock()
+}
+
 func (m *DurableRunManager) processRunOnce(runID string) {
 	if !m.markProcessing(runID) {
+		// markProcessing set the pending flag; the holder will re-enqueue.
 		return
 	}
-	defer m.unmarkProcessing(runID)
+	defer func() {
+		if m.unmarkProcessing(runID) {
+			m.enqueue(runID)
+		}
+	}()
 
 	runCtx, cancel := context.WithCancel(m.ctx)
 	m.mu.Lock()
@@ -395,7 +443,7 @@ func (m *DurableRunManager) processRunOnce(runID string) {
 			record.Checkpoint.Run.CompletedAt = now
 			record.Result.RunState = record.Checkpoint.Run
 		}
-		_ = m.store.saveRun(record)
+		_ = m.persist(record)
 		_ = m.store.appendEvent(runID, "RunFailed", map[string]string{"error": err.Error()})
 	}
 }
@@ -418,7 +466,7 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 		record.Checkpoint.Run.Status = string(RunStatusRunning)
 		record.Result.RunState = record.Checkpoint.Run
 	}
-	if err := m.store.saveRun(record); err != nil {
+	if err := m.persist(record); err != nil {
 		return err
 	}
 	_ = m.store.appendEvent(runID, "RunRunning", nil)
@@ -431,7 +479,7 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 			return err
 		}
 		if isTerminalStatus(record.Result.Status) {
-			return m.store.saveRun(record)
+			return m.persist(record)
 		}
 
 		ready := m.readyNodes(record)
@@ -442,7 +490,7 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 					record.Checkpoint.Run.Status = string(RunStatusWaiting)
 					record.Result.RunState = record.Checkpoint.Run
 				}
-				if err := m.store.saveRun(record); err != nil {
+				if err := m.persist(record); err != nil {
 					return err
 				}
 				_ = m.store.appendEvent(runID, "RunWaiting", map[string]interface{}{"waiting": record.Checkpoint.Waiting})
@@ -452,11 +500,24 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 		}
 
 		nodeID := ready[0]
-		if err := m.executeNode(ctx, record, nodeID); err != nil {
+		exec, err := m.executeNode(ctx, record, nodeID)
+		if err != nil {
 			return err
 		}
-		if err := m.store.saveRun(record); err != nil {
+		applyFn := func(r *durableRunRecord) error {
+			return m.applyNodeExecution(r, exec)
+		}
+		if err := applyFn(record); err != nil {
 			return err
+		}
+		// Emit the audit event before persisting: the event log must survive
+		// a stale-record abort or an injected store failure.
+		m.logNodeExecution(record, exec)
+		if err := m.persistWithRetry(record, applyFn); err != nil {
+			return err
+		}
+		if isTerminalStatus(record.Result.Status) {
+			return nil
 		}
 		if len(record.Checkpoint.Waiting) > 0 {
 			record.Result.Status = RunStatusWaiting
@@ -464,7 +525,7 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 				record.Checkpoint.Run.Status = string(RunStatusWaiting)
 				record.Result.RunState = record.Checkpoint.Run
 			}
-			if err := m.store.saveRun(record); err != nil {
+			if err := m.persist(record); err != nil {
 				return err
 			}
 			_ = m.store.appendEvent(runID, "RunWaiting", map[string]interface{}{"waiting": record.Checkpoint.Waiting})
@@ -473,10 +534,33 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 	}
 }
 
-func (m *DurableRunManager) executeNode(ctx context.Context, record *durableRunRecord, nodeID string) error {
+// nodeExecution is the outcome of a node attempt, carried from executeNode
+// to the caller so record mutation and persistence can happen separately —
+// which is what persistWithRetry needs to re-apply after a stale reload
+// without re-running the executor.
+type nodeExecution struct {
+	NodeID        string
+	Node          dag.NodeDef
+	StartedAt     string
+	CompletedAt   string
+	InputSnapshot map[string]string
+	Iteration     int
+	// Kind is one of "completed", "failed", "suspended".
+	Kind    string
+	Outputs map[string]string
+	Usage   dag.TokenUsage
+	Err     error
+	Waiting durableWaitingNode
+}
+
+// executeNode runs one attempt of a node and returns the outcome. Callers
+// apply the outcome via applyNodeExecution and emit the terminal event via
+// logNodeExecution; keeping those separate is what lets persistWithRetry
+// re-apply on stale without duplicating events.
+func (m *DurableRunManager) executeNode(ctx context.Context, record *durableRunRecord, nodeID string) (nodeExecution, error) {
 	node, ok := nodeByID(record.Checkpoint.Run.Definition, nodeID)
 	if !ok {
-		return fmt.Errorf("node %q not found", nodeID)
+		return nodeExecution{}, fmt.Errorf("node %q not found", nodeID)
 	}
 	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
 	record.Checkpoint.IterationCount[nodeID]++
@@ -491,45 +575,83 @@ func (m *DurableRunManager) executeNode(ctx context.Context, record *durableRunR
 	state.Usage = dag.TokenUsage{}
 	record.Checkpoint.Run.NodeStates[nodeID] = state
 	record.Result.RunState = record.Checkpoint.Run
-	if err := m.store.saveRun(record); err != nil {
-		return err
+	if err := m.persist(record); err != nil {
+		return nodeExecution{}, err
 	}
 	_ = m.store.appendEvent(record.Request.RunID, "NodeStarted", map[string]interface{}{"node_id": nodeID, "iteration": iteration})
 
-	if suspended, err := m.trySuspendNode(record, node, execCtx, durableWaitingNode{
+	exec := nodeExecution{
 		NodeID:        nodeID,
+		Node:          node,
 		StartedAt:     startedAt,
 		InputSnapshot: inputSnapshot,
 		Iteration:     iteration,
-	}); suspended || err != nil {
-		return err
 	}
 
-	exec, ok := m.runner.engine.ExecutorFor(node.Type)
-	if !ok {
-		return fmt.Errorf("no executor registered for node type %q", node.Type)
+	kind, waiting, outputs, failErr := m.classifySuspension(record, node, execCtx, startedAt, inputSnapshot, iteration)
+	switch kind {
+	case "fail":
+		exec.Kind = "failed"
+		exec.Err = failErr
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return exec, nil
+	case "immediate", "signal-match":
+		exec.Kind = "completed"
+		exec.Outputs = outputs
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return exec, nil
+	case "suspend":
+		exec.Kind = "suspended"
+		exec.Waiting = waiting
+		return exec, nil
 	}
-	result, err := exec.Execute(ctx, node, execCtx)
+	// kind == "normal" — run the node's executor.
+
+	executor, ok := m.runner.engine.ExecutorFor(node.Type)
+	if !ok {
+		return nodeExecution{}, fmt.Errorf("no executor registered for node type %q", node.Type)
+	}
+	result, err := executor.Execute(ctx, node, execCtx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return err
+			return exec, err
 		}
-		m.failNode(record, node, err, startedAt, inputSnapshot, iteration)
-		return nil
+		exec.Kind = "failed"
+		exec.Err = err
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return exec, nil
 	}
-	return m.completeNode(record, node, result.Outputs, result.Usage, startedAt, inputSnapshot, iteration)
+	exec.Kind = "completed"
+	exec.Outputs = result.Outputs
+	exec.Usage = result.Usage
+	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	return exec, nil
 }
 
-func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.NodeDef, execCtx *dag.Context, waiting durableWaitingNode) (bool, error) {
+// classifySuspension inspects a suspension-capable node and returns how it
+// should resolve this attempt. It does not mutate the record.
+//
+// Kinds:
+//   - "normal": regular executor node; caller should run exec.Execute.
+//   - "immediate": wait-mode defer anchor is already in the past.
+//   - "signal-match": an earlier signal already matches this suspension.
+//   - "suspend": register the waiting entry.
+//   - "fail": config error; fail the node.
+func (m *DurableRunManager) classifySuspension(record *durableRunRecord, node dag.NodeDef, execCtx *dag.Context, startedAt string, inputSnapshot map[string]string, iteration int) (string, durableWaitingNode, map[string]string, error) {
+	waiting := durableWaitingNode{
+		NodeID:        node.ID,
+		StartedAt:     startedAt,
+		InputSnapshot: inputSnapshot,
+		Iteration:     iteration,
+	}
 	switch node.Type {
 	case "wait":
 		outputs, waitUntil, done, err := durableWaitDecision(node, execCtx)
 		if err != nil {
-			m.failNode(record, node, err, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
-			return false, nil
+			return "fail", durableWaitingNode{}, nil, err
 		}
 		if done {
-			return true, m.completeNode(record, node, outputs, dag.TokenUsage{}, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
+			return "immediate", durableWaitingNode{}, outputs, nil
 		}
 		waiting.Kind = "timer"
 		waiting.Reason = "timer"
@@ -538,13 +660,11 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 	case "await_signal":
 		cfg, err := executors.ParseConfig[awaitSignalConfig](node.Config)
 		if err != nil {
-			m.failNode(record, node, err, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
-			return false, nil
+			return "fail", durableWaitingNode{}, nil, err
 		}
 		signalType := strings.TrimSpace(cfg.SignalType)
 		if signalType == "" {
-			m.failNode(record, node, errors.New("await_signal signal_type is required"), waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
-			return false, nil
+			return "fail", durableWaitingNode{}, nil, errors.New("await_signal signal_type is required")
 		}
 		timeoutSeconds := cfg.TimeoutSeconds
 		if timeoutSeconds <= 0 {
@@ -586,7 +706,7 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 			waiting.CorrelationKey = fmt.Sprintf("%d:%s:%s", record.Request.AppID, record.Request.RunID, node.ID)
 		}
 	default:
-		return false, nil
+		return "normal", durableWaitingNode{}, nil, nil
 	}
 
 	for _, signal := range sortedSignals(record.Signals) {
@@ -594,19 +714,171 @@ func (m *DurableRunManager) trySuspendNode(record *durableRunRecord, node dag.No
 			if err := validateSignalForWaiting(waiting, signal); err != nil {
 				continue
 			}
-			return true, m.completeNode(record, node, outputsForSignal(waiting, signal), dag.TokenUsage{}, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
+			return "signal-match", durableWaitingNode{}, outputsForSignal(waiting, signal), nil
 		}
 	}
-
-	state := record.Checkpoint.Run.NodeStates[node.ID]
-	state.Status = "waiting"
-	record.Checkpoint.Run.NodeStates[node.ID] = state
-	record.Checkpoint.Waiting[node.ID] = waiting
-	record.Result.RunState = record.Checkpoint.Run
-	_ = m.store.appendEvent(record.Request.RunID, "NodeSuspended", waiting)
-	return true, nil
+	return "suspend", waiting, nil, nil
 }
 
+// applyNodeExecution folds the outcome into the record. Safe to re-apply
+// after a stale reload: a fresh on-disk record cannot contain our
+// uncommitted mutations (only a successful persist would have written them),
+// so re-applying on top produces the same final state — no double-counted
+// usage, no duplicated trace entry.
+func (m *DurableRunManager) applyNodeExecution(record *durableRunRecord, exec nodeExecution) error {
+	switch exec.Kind {
+	case "completed":
+		return m.applyCompletion(record, exec)
+	case "failed":
+		m.applyFailure(record, exec)
+		return nil
+	case "suspended":
+		m.applySuspension(record, exec)
+		return nil
+	}
+	return nil
+}
+
+func (m *DurableRunManager) applyCompletion(record *durableRunRecord, exec nodeExecution) error {
+	outputs := exec.Outputs
+	if outputs == nil {
+		outputs = map[string]string{}
+	}
+	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
+	for key, value := range outputs {
+		execCtx.Set(exec.Node.ID+"."+key, value)
+	}
+	if execCtx.Get(exec.Node.ID+".status") == "" {
+		execCtx.Set(exec.Node.ID+".status", "completed")
+	}
+
+	completedAt := exec.CompletedAt
+	if completedAt == "" {
+		completedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	state := record.Checkpoint.Run.NodeStates[exec.Node.ID]
+	state.Status = "completed"
+	state.CompletedAt = completedAt
+	state.Error = ""
+	state.Usage = exec.Usage
+	record.Checkpoint.Run.NodeStates[exec.Node.ID] = state
+	record.Checkpoint.Run.NodeTraces = append(record.Checkpoint.Run.NodeTraces, dag.NodeTrace{
+		NodeID:        exec.Node.ID,
+		NodeType:      exec.Node.Type,
+		NodeLabel:     exec.Node.Label,
+		Iteration:     exec.Iteration,
+		Status:        "completed",
+		InputSnapshot: cloneStringMap(exec.InputSnapshot),
+		Outputs:       cloneStringMap(outputs),
+		Usage:         exec.Usage,
+		StartedAt:     exec.StartedAt,
+		CompletedAt:   completedAt,
+	})
+	record.Checkpoint.Run.Usage.InputTokens += exec.Usage.InputTokens
+	record.Checkpoint.Run.Usage.OutputTokens += exec.Usage.OutputTokens
+	record.Checkpoint.Completed[exec.Node.ID] = true
+	delete(record.Checkpoint.Failed, exec.Node.ID)
+	delete(record.Checkpoint.Waiting, exec.Node.ID)
+	snap := execCtx.Snapshot()
+	record.Checkpoint.Context = snap
+	record.Checkpoint.Run.Context = cloneStringMap(snap)
+	if err := m.evaluateOutgoingEdges(record, exec.Node.ID, execCtx); err != nil {
+		return err
+	}
+	record.Result.RunState = record.Checkpoint.Run
+	return nil
+}
+
+func (m *DurableRunManager) applyFailure(record *durableRunRecord, exec nodeExecution) {
+	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
+	execCtx.Set(exec.Node.ID+".status", "failed")
+	execCtx.Set(exec.Node.ID+".error", exec.Err.Error())
+	completedAt := exec.CompletedAt
+	if completedAt == "" {
+		completedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	state := record.Checkpoint.Run.NodeStates[exec.Node.ID]
+	state.Status = "failed"
+	state.CompletedAt = completedAt
+	state.Error = exec.Err.Error()
+	record.Checkpoint.Run.NodeStates[exec.Node.ID] = state
+	record.Checkpoint.Run.NodeTraces = append(record.Checkpoint.Run.NodeTraces, dag.NodeTrace{
+		NodeID:        exec.Node.ID,
+		NodeType:      exec.Node.Type,
+		NodeLabel:     exec.Node.Label,
+		Iteration:     exec.Iteration,
+		Status:        "failed",
+		InputSnapshot: cloneStringMap(exec.InputSnapshot),
+		Error:         exec.Err.Error(),
+		StartedAt:     exec.StartedAt,
+		CompletedAt:   completedAt,
+	})
+	snap := execCtx.Snapshot()
+	record.Checkpoint.Context = snap
+	record.Checkpoint.Run.Context = cloneStringMap(snap)
+	if exec.Node.OnError == "continue" {
+		record.Checkpoint.Completed[exec.Node.ID] = true
+	} else {
+		record.Checkpoint.Failed[exec.Node.ID] = true
+	}
+	record.Result.RunState = record.Checkpoint.Run
+}
+
+func (m *DurableRunManager) applySuspension(record *durableRunRecord, exec nodeExecution) {
+	state := record.Checkpoint.Run.NodeStates[exec.Node.ID]
+	state.Status = "waiting"
+	record.Checkpoint.Run.NodeStates[exec.Node.ID] = state
+	record.Checkpoint.Waiting[exec.Node.ID] = exec.Waiting
+	record.Result.RunState = record.Checkpoint.Run
+}
+
+func (m *DurableRunManager) logNodeExecution(record *durableRunRecord, exec nodeExecution) {
+	switch exec.Kind {
+	case "completed":
+		_ = m.store.appendEvent(record.Request.RunID, "NodeCompleted", map[string]interface{}{"node_id": exec.Node.ID, "outputs": exec.Outputs})
+	case "failed":
+		_ = m.store.appendEvent(record.Request.RunID, "NodeFailed", map[string]interface{}{"node_id": exec.Node.ID, "error": exec.Err.Error()})
+	case "suspended":
+		_ = m.store.appendEvent(record.Request.RunID, "NodeSuspended", exec.Waiting)
+	}
+}
+
+// persistWithRetry persists the record; on errDurableStaleRecord it reloads,
+// re-applies the caller's mutation to the fresh record, and retries up to
+// maxAttempts. If the fresh record is terminal (e.g. Cancel raced in), the
+// mutation is abandoned and the caller's record is set to the fresh state.
+func (m *DurableRunManager) persistWithRetry(record *durableRunRecord, reapply func(*durableRunRecord) error) error {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := m.persist(record)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errDurableStaleRecord) {
+			return err
+		}
+		lastErr = err
+		fresh, loadErr := m.store.loadRun(record.Request.RunID)
+		if loadErr != nil {
+			return loadErr
+		}
+		ensureDurableRecordMaps(fresh)
+		if isTerminalStatus(fresh.Result.Status) {
+			*record = *fresh
+			return nil
+		}
+		if err := reapply(fresh); err != nil {
+			return err
+		}
+		*record = *fresh
+	}
+	return lastErr
+}
+
+// completeWaitingNode resumes a waiting node after an external event
+// (signal handler or timer loop). Mutates in place under the caller's lock;
+// persistence is the caller's responsibility.
 func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID string, outputs map[string]string) error {
 	waiting, ok := record.Checkpoint.Waiting[nodeID]
 	if !ok {
@@ -616,87 +888,21 @@ func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID
 	if !ok {
 		return fmt.Errorf("node %q not found", nodeID)
 	}
-	return m.completeNode(record, node, outputs, dag.TokenUsage{}, waiting.StartedAt, waiting.InputSnapshot, waiting.Iteration)
-}
-
-func (m *DurableRunManager) completeNode(record *durableRunRecord, node dag.NodeDef, outputs map[string]string, usage dag.TokenUsage, startedAt string, inputSnapshot map[string]string, iteration int) error {
-	if outputs == nil {
-		outputs = map[string]string{}
-	}
-	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
-	for key, value := range outputs {
-		execCtx.Set(node.ID+"."+key, value)
-	}
-	if execCtx.Get(node.ID+".status") == "" {
-		execCtx.Set(node.ID+".status", "completed")
-	}
-
-	completedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	state := record.Checkpoint.Run.NodeStates[node.ID]
-	state.Status = "completed"
-	state.CompletedAt = completedAt
-	state.Error = ""
-	state.Usage = usage
-	record.Checkpoint.Run.NodeStates[node.ID] = state
-	record.Checkpoint.Run.NodeTraces = append(record.Checkpoint.Run.NodeTraces, dag.NodeTrace{
+	exec := nodeExecution{
 		NodeID:        node.ID,
-		NodeType:      node.Type,
-		NodeLabel:     node.Label,
-		Iteration:     iteration,
-		Status:        "completed",
-		InputSnapshot: cloneStringMap(inputSnapshot),
-		Outputs:       cloneStringMap(outputs),
-		Usage:         usage,
-		StartedAt:     startedAt,
-		CompletedAt:   completedAt,
-	})
-	record.Checkpoint.Run.Usage.InputTokens += usage.InputTokens
-	record.Checkpoint.Run.Usage.OutputTokens += usage.OutputTokens
-	record.Checkpoint.Completed[node.ID] = true
-	delete(record.Checkpoint.Failed, node.ID)
-	delete(record.Checkpoint.Waiting, node.ID)
-	snap := execCtx.Snapshot()
-	record.Checkpoint.Context = snap
-	record.Checkpoint.Run.Context = cloneStringMap(snap)
-	if err := m.evaluateOutgoingEdges(record, node.ID, execCtx); err != nil {
+		Node:          node,
+		StartedAt:     waiting.StartedAt,
+		InputSnapshot: waiting.InputSnapshot,
+		Iteration:     waiting.Iteration,
+		Kind:          "completed",
+		Outputs:       outputs,
+		CompletedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := m.applyCompletion(record, exec); err != nil {
 		return err
 	}
-	record.Result.RunState = record.Checkpoint.Run
-	_ = m.store.appendEvent(record.Request.RunID, "NodeCompleted", map[string]interface{}{"node_id": node.ID, "outputs": outputs})
+	m.logNodeExecution(record, exec)
 	return nil
-}
-
-func (m *DurableRunManager) failNode(record *durableRunRecord, node dag.NodeDef, err error, startedAt string, inputSnapshot map[string]string, iteration int) {
-	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
-	execCtx.Set(node.ID+".status", "failed")
-	execCtx.Set(node.ID+".error", err.Error())
-	completedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	state := record.Checkpoint.Run.NodeStates[node.ID]
-	state.Status = "failed"
-	state.CompletedAt = completedAt
-	state.Error = err.Error()
-	record.Checkpoint.Run.NodeStates[node.ID] = state
-	record.Checkpoint.Run.NodeTraces = append(record.Checkpoint.Run.NodeTraces, dag.NodeTrace{
-		NodeID:        node.ID,
-		NodeType:      node.Type,
-		NodeLabel:     node.Label,
-		Iteration:     iteration,
-		Status:        "failed",
-		InputSnapshot: cloneStringMap(inputSnapshot),
-		Error:         err.Error(),
-		StartedAt:     startedAt,
-		CompletedAt:   completedAt,
-	})
-	snap := execCtx.Snapshot()
-	record.Checkpoint.Context = snap
-	record.Checkpoint.Run.Context = cloneStringMap(snap)
-	if node.OnError == "continue" {
-		record.Checkpoint.Completed[node.ID] = true
-	} else {
-		record.Checkpoint.Failed[node.ID] = true
-	}
-	record.Result.RunState = record.Checkpoint.Run
-	_ = m.store.appendEvent(record.Request.RunID, "NodeFailed", map[string]interface{}{"node_id": node.ID, "error": err.Error()})
 }
 
 func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, nodeID string, execCtx *dag.Context) error {
@@ -753,7 +959,7 @@ func (m *DurableRunManager) completeRun(record *durableRunRecord) error {
 	record.Result.RunState = record.Checkpoint.Run
 	record.CompletedAt = now
 	_, _ = m.runner.WriteEvidence(record.Request.AppID, record.Checkpoint.Run)
-	if err := m.store.saveRun(record); err != nil {
+	if err := m.persist(record); err != nil {
 		return err
 	}
 	_ = m.store.appendEvent(record.Request.RunID, "RunCompleted", map[string]interface{}{"status": record.Result.Status, "action": record.Result.Action})
@@ -821,7 +1027,7 @@ func (m *DurableRunManager) wakeDueRuns() error {
 				record.Result.RunState = record.Checkpoint.Run
 			}
 		}
-		if err := m.store.saveRun(record); err != nil {
+		if err := m.persist(record); err != nil {
 			return err
 		}
 		m.enqueue(record.Request.RunID)
@@ -936,7 +1142,7 @@ func (m *DurableRunManager) recoverRuns() error {
 				record.Checkpoint.Run.Status = string(RunStatusQueued)
 				record.Result.RunState = record.Checkpoint.Run
 			}
-			if err := m.store.saveRun(record); err != nil {
+			if err := m.persist(record); err != nil {
 				return err
 			}
 			_ = m.store.appendEvent(record.Request.RunID, "RunRecovered", nil)
@@ -1009,39 +1215,100 @@ func (m *DurableRunManager) handleInterruptedRun(runID string, err error) error 
 		record.Checkpoint.Run.Status = string(RunStatusQueued)
 		record.Result.RunState = record.Checkpoint.Run
 	}
-	_ = m.store.saveRun(record)
+	_ = m.persist(record)
 	_ = m.store.appendEvent(runID, "RunInterrupted", map[string]string{"error": err.Error()})
 	return err
 }
 
+// enqueue dispatches runID to a worker, deduping against runs already in the
+// channel or currently being processed. The dedup keeps bursts of signals or
+// rapid timer ticks from stacking channel sends or spawning an unbounded
+// number of goroutines under a saturated queue.
 func (m *DurableRunManager) enqueue(runID string) {
+	m.mu.Lock()
+	if m.queued[runID] {
+		m.mu.Unlock()
+		return
+	}
+	if m.processing[runID] {
+		m.pending[runID] = true
+		m.mu.Unlock()
+		return
+	}
+	m.queued[runID] = true
+	m.mu.Unlock()
+
 	select {
 	case m.queue <- runID:
 	case <-m.ctx.Done():
+		m.clearQueued(runID)
 	default:
+		// Channel saturated; blocked sender is bounded to one per runID by
+		// dedup.
 		go func() {
 			select {
 			case m.queue <- runID:
 			case <-m.ctx.Done():
+				m.clearQueued(runID)
 			}
 		}()
 	}
 }
 
+// persist saves the record through the durable store and, on success, emits
+// a trace snapshot for observability. Use persist for state-advancing saves
+// so the trace stream matches the durable state machine. Bookkeeping-only
+// saves (e.g. callback delivery metadata) should call store.saveRun directly.
+func (m *DurableRunManager) persist(record *durableRunRecord) error {
+	if err := m.store.saveRun(record); err != nil {
+		return err
+	}
+	m.emitTrace(record)
+	return nil
+}
+
+// emitTrace sends a defensive snapshot of the current run state to the trace
+// sink. Best-effort: the sink may drop envelopes under pressure.
+func (m *DurableRunManager) emitTrace(record *durableRunRecord) {
+	if m.traceSink == nil || record == nil || record.Checkpoint.Run == nil {
+		return
+	}
+	m.traceSink.Enqueue(TraceEnvelope{
+		AppID:         record.Request.AppID,
+		BlueprintPath: strings.TrimSpace(record.Request.BlueprintPath),
+		Initiator:     strings.TrimSpace(record.Request.Initiator),
+		Revision:      record.Revision,
+		Run:           cloneDAGRunState(record.Checkpoint.Run),
+	})
+}
+
+// markProcessing claims exclusive processing for runID. If another worker
+// already holds it, the claim fails but the pending flag is raised so the
+// holder re-enqueues the run on its way out.
 func (m *DurableRunManager) markProcessing(runID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.processing[runID] {
+		m.pending[runID] = true
 		return false
 	}
 	m.processing[runID] = true
+	delete(m.pending, runID)
 	return true
 }
 
-func (m *DurableRunManager) unmarkProcessing(runID string) {
+// unmarkProcessing releases the claim and reports whether another dispatch
+// arrived while the claim was held. The caller is expected to re-enqueue when
+// this returns true.
+func (m *DurableRunManager) unmarkProcessing(runID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.processing, runID)
+	if m.pending[runID] {
+		delete(m.pending, runID)
+		return true
+	}
+	return false
 }
 
 type durableWaitConfig struct {
@@ -1125,7 +1392,6 @@ func parseDurableInt64(raw string, name string) (int64, error) {
 	}
 	return value, nil
 }
-
 
 func isDurableSuspendNode(nodeType string) bool {
 	return nodeType == "wait" || nodeType == "await_signal" || nodeType == "defer_resolution"

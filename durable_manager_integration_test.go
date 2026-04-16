@@ -786,6 +786,69 @@ func TestDurableCancellationIgnoresOutstandingTimer(t *testing.T) {
 	}
 }
 
+func TestDurableBeginShutdownRejectsNewMutations(t *testing.T) {
+	tmpDir := t.TempDir()
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
+	defer manager.Close()
+
+	manager.BeginShutdown()
+
+	if _, err := manager.Submit(RunRequest{
+		RunID:         "shutdown-submit",
+		AppID:         1113,
+		BlueprintJSON: awaitSignalBlueprint(),
+	}); !errors.Is(err, errDurableManagerShuttingDown) {
+		t.Fatalf("submit error = %v, want %v", err, errDurableManagerShuttingDown)
+	}
+
+	if _, err := manager.Signal(signalRequest{
+		IdempotencyKey: "shutdown-signal",
+		AppID:          1113,
+		RunID:          "shutdown-submit",
+		SignalType:     "human_judgment.responded",
+		CorrelationKey: "1113:shutdown-submit:judge",
+		Payload:        map[string]string{"outcome": "1"},
+	}); !errors.Is(err, errDurableManagerShuttingDown) {
+		t.Fatalf("signal error = %v, want %v", err, errDurableManagerShuttingDown)
+	}
+}
+
+func TestDurableBeginShutdownCancelsInFlightWorker(t *testing.T) {
+	tmpDir := t.TempDir()
+	blocking := &durableBlockingExecutor{started: make(chan struct{}, 1)}
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+		"blocking": blocking,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		PollInterval: 10 * time.Millisecond,
+	})
+	defer manager.Close()
+
+	if _, err := manager.Submit(RunRequest{
+		RunID:         "shutdown-cancel",
+		AppID:         1114,
+		BlueprintJSON: simpleSubmitBlueprint("blocking"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocking executor to start")
+	}
+
+	manager.BeginShutdown()
+	waitForDurableNotProcessing(t, manager, "shutdown-cancel")
+
+	record, err := manager.store.loadRun("shutdown-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := record.Checkpoint.Run.NodeStates["step"].Status; state != "running" {
+		t.Fatalf("node state after shutdown = %q, want running checkpoint for recovery", state)
+	}
+}
+
 func TestDurableCallbackOutboxRetriesUntilSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
 	var attempts atomic.Int32
@@ -1225,5 +1288,158 @@ func TestDurableMapExecutorCompletesOnce(t *testing.T) {
 	}
 	if step.Count() != 2 {
 		t.Fatalf("inline step count = %d, want 2", step.Count())
+	}
+}
+
+// TestDurableManagerEmitsTraceSnapshotsOverLifecycle verifies that the durable
+// manager pushes a trace envelope to the configured sink on every
+// state-advancing persisted save. A suspend/resume/complete cycle touches
+// enough distinct transitions that we can assert revisions stay monotonic,
+// the final envelope matches the terminal state, and request metadata
+// (AppID, BlueprintPath, Initiator) rides along.
+func TestDurableManagerEmitsTraceSnapshotsOverLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	sink := newFakeTraceSink()
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(nil), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 4,
+		PollInterval: 10 * time.Millisecond,
+		TraceSink:    sink,
+	})
+	defer manager.Close()
+
+	const runID = "trace-lifecycle"
+	const appID = 4001
+	if _, err := manager.Submit(RunRequest{
+		RunID:         runID,
+		AppID:         appID,
+		BlueprintPath: PathMain,
+		Initiator:     "test:trace",
+		BlueprintJSON: awaitSignalBlueprint(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDurableStatus(t, manager, runID, RunStatusWaiting)
+
+	if _, err := manager.Signal(signalRequest{
+		IdempotencyKey: "trace-sig",
+		AppID:          appID,
+		RunID:          runID,
+		SignalType:     "human_judgment.responded",
+		CorrelationKey: fmt.Sprintf("%d:%s:judge", appID, runID),
+		Payload:        map[string]string{"outcome": "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDurableStatus(t, manager, runID, RunStatusCompleted)
+
+	// waitForDurableStatus reads the on-disk record, which is written just
+	// before the trace envelope is enqueued. Poll the sink until the
+	// terminal-status envelope has landed so we don't race with the emit.
+	var envelopes []TraceEnvelope
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		envelopes = sink.Snapshot()
+		if len(envelopes) > 0 && envelopes[len(envelopes)-1].Run != nil && envelopes[len(envelopes)-1].Run.Status == "completed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(envelopes) < 4 {
+		t.Fatalf("expected multiple trace snapshots across lifecycle, got %d: %+v", len(envelopes), envelopes)
+	}
+
+	var lastRevision int64
+	sawRunning := false
+	sawWaiting := false
+	for i, env := range envelopes {
+		if env.AppID != appID {
+			t.Fatalf("envelope[%d].AppID = %d, want %d", i, env.AppID, appID)
+		}
+		if env.BlueprintPath != PathMain {
+			t.Fatalf("envelope[%d].BlueprintPath = %q, want %q", i, env.BlueprintPath, PathMain)
+		}
+		if env.Initiator != "test:trace" {
+			t.Fatalf("envelope[%d].Initiator = %q, want test:trace", i, env.Initiator)
+		}
+		if env.Run == nil {
+			t.Fatalf("envelope[%d].Run is nil", i)
+		}
+		if env.Run.ID != runID {
+			t.Fatalf("envelope[%d].Run.ID = %q, want %q", i, env.Run.ID, runID)
+		}
+		if env.Revision <= lastRevision {
+			t.Fatalf("envelope[%d] revision %d did not increase from %d", i, env.Revision, lastRevision)
+		}
+		lastRevision = env.Revision
+		switch env.Run.Status {
+		case string(RunStatusRunning):
+			sawRunning = true
+		case string(RunStatusWaiting):
+			sawWaiting = true
+		}
+	}
+	if !sawRunning {
+		t.Fatal("expected at least one snapshot with status=running")
+	}
+	if !sawWaiting {
+		t.Fatal("expected at least one snapshot with status=waiting")
+	}
+	final := envelopes[len(envelopes)-1]
+	if final.Run.Status != "completed" {
+		t.Fatalf("final envelope status = %q, want completed", final.Run.Status)
+	}
+	if got := final.Run.Context["judge.outcome"]; got != "1" {
+		t.Fatalf("final envelope judge.outcome = %q, want 1", got)
+	}
+}
+
+// TestDurableManagerEmitsDefensiveSnapshots verifies the envelope's RunState
+// is a defensive copy — a consumer mutating the captured Run must not
+// influence a subsequent snapshot of the same run.
+func TestDurableManagerEmitsDefensiveSnapshots(t *testing.T) {
+	tmpDir := t.TempDir()
+	sink := newFakeTraceSink()
+	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+		"outcome": outcome,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 4,
+		PollInterval: 10 * time.Millisecond,
+		TraceSink:    sink,
+	})
+	defer manager.Close()
+
+	if _, err := manager.Submit(RunRequest{
+		RunID:         "trace-defensive",
+		AppID:         4002,
+		BlueprintPath: PathMain,
+		Initiator:     "test:defensive",
+		BlueprintJSON: simpleSubmitBlueprint("outcome"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDurableStatus(t, manager, "trace-defensive", RunStatusCompleted)
+
+	envelopes := sink.Snapshot()
+	if len(envelopes) < 2 {
+		t.Fatalf("expected multiple envelopes, got %d", len(envelopes))
+	}
+	// Mutate the earliest snapshot's Context; the final snapshot must be
+	// unaffected.
+	first := envelopes[0]
+	if first.Run == nil || first.Run.Context == nil {
+		t.Fatal("first envelope has no run/context")
+	}
+	first.Run.Context["spurious"] = "mutation"
+	first.Run.Status = "mutated"
+
+	final := envelopes[len(envelopes)-1]
+	if _, ok := final.Run.Context["spurious"]; ok {
+		t.Fatal("mutation to earlier envelope leaked into final envelope")
+	}
+	if final.Run.Status == "mutated" {
+		t.Fatal("mutation to earlier envelope leaked into final envelope status")
 	}
 }
