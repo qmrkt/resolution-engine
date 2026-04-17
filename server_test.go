@@ -21,7 +21,7 @@ type stubRunManager struct {
 }
 
 func validRunRequestBody() []byte {
-	return []byte(`{"app_id":21,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},{"id":"submit","type":"submit_result","config":{"outcome_key":"judge.outcome"}}],"edges":[{"from":"judge","to":"submit"}]}}`)
+	return []byte(`{"app_id":21,"blueprint_json":{"id":"bp","version":1,"nodes":[{"id":"judge","type":"await_signal","config":{"signal_type":"human_judgment.responded","required_payload":["outcome"],"default_outputs":{"status":"responded"},"timeout_seconds":3600}},{"id":"done","type":"return","config":{"value":{"status":"success","outcome":"{{results.judge.outcome}}"}}}],"edges":[{"from":"judge","to":"done"}]}}`)
 }
 
 func (s *stubRunManager) Submit(req RunRequest) (RunResult, error) {
@@ -58,7 +58,7 @@ func TestServerPostRunReturnsAccepted(t *testing.T) {
 		if len(req.BlueprintJSON) == 0 {
 			t.Fatal("expected blueprint_json to be populated")
 		}
-		return RunResult{RunID: req.RunID, AppID: 21, Status: RunStatusAccepted}, nil
+		return RunResult{RunID: req.RunID, AppID: 21, Status: RunStatusQueued}, nil
 	}}, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewReader(validRunRequestBody()))

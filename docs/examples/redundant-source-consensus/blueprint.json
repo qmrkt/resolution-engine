@@ -9,16 +9,10 @@
       "type": "map",
       "label": "Fetch Sources",
       "config": {
-        "items_key": "market.sources_json",
+        "items_key": "inputs.market.sources_json",
         "batch_size": 1,
         "max_concurrency": 4,
         "on_error": "continue",
-        "output_keys": [
-          "fetch.status",
-          "fetch.outcome",
-          "fetch.extracted",
-          "fetch.raw"
-        ],
         "inline": {
           "id": "fetch-one-source",
           "version": 1,
@@ -27,7 +21,7 @@
               "id": "fetch",
               "type": "api_fetch",
               "config": {
-                "url": "{{source_url}}",
+                "url": "{{inputs.source_url}}",
                 "method": "GET",
                 "json_path": "data.outcome",
                 "outcome_mapping": {
@@ -36,12 +30,26 @@
                 },
                 "timeout_seconds": 20
               }
+            },
+            {
+              "id": "out",
+              "type": "return",
+              "config": {
+                "value": {
+                  "status": "{{results.fetch.status}}",
+                  "outcome": "{{results.fetch.outcome}}",
+                  "extracted": "{{results.fetch.extracted}}",
+                  "raw": "{{results.fetch.raw}}"
+                }
+              }
             }
           ],
-          "edges": []
+          "edges": [
+            { "from": "fetch", "to": "out" }
+          ]
         },
         "input_mappings": {
-          "source_url": "market.source_url"
+          "source_url": "inputs.market.source_url"
         }
       }
     },
@@ -53,10 +61,10 @@
         "provider": "openai",
         "model": "gpt-5.4",
         "output_mode": "resolution",
-        "allowed_outcomes_key": "market.outcomes_json",
+        "allowed_outcomes_key": "inputs.market.outcomes_json",
         "max_steps": 4,
         "max_tool_calls": 6,
-        "prompt": "Resolve this prediction market only if the fetched sources are mutually consistent.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nSource fetch results JSON: {{fetch_sources.results_json}}\n\nIf sources conflict, are missing, or do not support any outcome, return inconclusive.",
+        "prompt": "Resolve this prediction market only if the fetched sources are mutually consistent.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nSource fetch results JSON: {{results.fetch_sources.results_json}}\n\nIf sources conflict, are missing, or do not support any outcome, return inconclusive.",
         "tools": [
           {
             "name": "context_get",
@@ -71,18 +79,26 @@
     },
     {
       "id": "submit",
-      "type": "submit_result",
+      "type": "return",
       "label": "Submit Consensus",
       "config": {
-        "outcome_key": "consensus.outcome"
+        "value": {
+          "status": "success",
+          "outcome": "{{results.consensus.outcome}}",
+          "confidence": "{{results.consensus.confidence}}",
+          "reasoning": "{{results.consensus.reasoning}}"
+        }
       }
     },
     {
       "id": "cancel",
-      "type": "cancel_market",
+      "type": "return",
       "label": "Cancel",
       "config": {
-        "reason": "Configured sources did not reach a coherent outcome."
+        "value": {
+          "status": "cancelled",
+          "reason": "Configured sources did not reach a coherent outcome."
+        }
       }
     }
   ],
@@ -90,17 +106,17 @@
     {
       "from": "fetch_sources",
       "to": "consensus",
-      "condition": "fetch_sources.status == 'success'"
+      "condition": "results.fetch_sources.status == 'success'"
     },
     {
       "from": "consensus",
       "to": "submit",
-      "condition": "consensus.status == 'success' && consensus.outcome != 'inconclusive' && consensus.outcome != ''"
+      "condition": "results.consensus.status == 'success' && results.consensus.outcome != 'inconclusive' && results.consensus.outcome != ''"
     },
     {
       "from": "consensus",
       "to": "cancel",
-      "condition": "consensus.outcome == 'inconclusive' || consensus.status != 'success'"
+      "condition": "results.consensus.outcome == 'inconclusive' || results.consensus.status != 'success'"
     }
   ],
   "budget": {

@@ -9,40 +9,25 @@ import (
 	"pgregory.net/rapid"
 )
 
-// stubExecutor always succeeds with configurable outputs.
+// stubExecutor always succeeds with configurable outputs. Real `return`
+// nodes hit the production ReturnExecutor; this stub covers everything
+// else so the fuzz can mix shapes without wiring per-type executors.
 type stubExecutor struct {
 	outputs map[string]string
 }
 
-func (e *stubExecutor) Execute(_ context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *stubExecutor) Execute(_ context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	outputs := make(map[string]string, len(e.outputs))
 	for k, v := range e.outputs {
 		outputs[k] = v
 	}
-	// Terminal nodes need specific outputs to satisfy result validation.
-	switch node.Type {
-	case "submit_result":
+	if outputs["status"] == "" {
 		outputs["status"] = "success"
-		outputs["outcome"] = "0"
-		outputs["evidence_hash"] = "abc123"
-		outputs["submitted"] = "true"
-	case "cancel_market":
-		outputs["status"] = "success"
-		outputs["cancelled"] = "true"
-		outputs["reason"] = "test"
-	case "defer_resolution":
-		outputs["status"] = "success"
-		outputs["deferred"] = "true"
-		outputs["reason"] = "test"
-	default:
-		if outputs["status"] == "" {
-			outputs["status"] = "success"
-		}
 	}
 	return dag.ExecutorResult{Outputs: outputs}, nil
 }
 
-var terminalTypes = []string{"submit_result", "cancel_market", "defer_resolution"}
+var terminalTypes = []string{"return"}
 
 var nonTerminalTypes = []string{
 	"api_fetch", "llm_call", "await_signal",
@@ -105,7 +90,7 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 				}
 			case "llm_call":
 				node.Config = map[string]interface{}{
-					"prompt": "Evaluate: {{evidence.raw}}",
+					"prompt": "Evaluate: {{results.evidence.raw}}",
 				}
 			case "await_signal":
 				node.Config = map[string]interface{}{
@@ -114,9 +99,12 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 					"default_outputs":  map[string]string{"status": "responded"},
 					"timeout_seconds":  3600,
 				}
-			case "submit_result":
+			case "return":
 				node.Config = map[string]interface{}{
-					"outcome_key": "judge.outcome",
+					"value": map[string]interface{}{
+						"status":  "success",
+						"outcome": "{{results.judge.outcome}}",
+					},
 				}
 			case "wait":
 				node.Config = map[string]interface{}{
@@ -125,7 +113,7 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 				}
 			case "map":
 				node.Config = map[string]interface{}{
-					"items_key":       "items_json",
+					"items_key":       "inputs.items_json",
 					"batch_size":      1,
 					"max_concurrency": 1,
 					"inline": map[string]interface{}{
@@ -138,7 +126,7 @@ func blueprintGen() *rapid.Generator[dag.Blueprint] {
 				}
 			case "gadget":
 				node.Config = map[string]interface{}{
-					"blueprint_json_key": "candidate.blueprint_json",
+					"blueprint_json_key": "inputs.candidate.blueprint_json",
 				}
 			default:
 				node.Config = map[string]interface{}{}

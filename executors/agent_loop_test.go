@@ -86,12 +86,12 @@ func TestAgentLoopOpenAIResponsesResolutionWithContextTool(t *testing.T) {
 		Type: "agent_loop",
 		Config: map[string]any{
 			"provider":             LLMProviderOpenAI,
-			"prompt":               "Resolve {{market.question}}",
+			"prompt":               "Resolve {{inputs.market.question}}",
 			"output_mode":          AgentOutputModeResolution,
-			"allowed_outcomes_key": "market.outcomes_json",
+			"allowed_outcomes_key": "inputs.market.outcomes_json",
 		},
 	}
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market.question":      "Will the event resolve No?",
 		"market.outcomes_json": `["Yes","No"]`,
 	})
@@ -199,7 +199,7 @@ func TestAgentLoopOpenAIChatCompletionsResolutionWithContextTool(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(map[string]string{"market.question": "question"}))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{"market.question": "question"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestAgentLoopAnthropicResolutionToolCalling(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(map[string]string{"market.question": "question"}))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{"market.question": "question"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestAgentLoopGoogleResolutionToolCalling(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(map[string]string{"market.question": "question"}))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{"market.question": "question"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestAgentLoopAnthropicReasoningRequestMatchesMerak4(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +567,7 @@ func TestAgentLoopGoogleThoughtSignatureRoundTrip(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(map[string]string{"market.question": "question"}))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{"market.question": "question"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,6 +618,7 @@ func TestAgentLoopPredefinedBlueprintTool(t *testing.T) {
 
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("agent_test_echo", &agentLoopEchoExecutor{})
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "test-openai-key",
 		OpenAIBaseURL: server.URL + "/chat/completions",
@@ -647,20 +648,26 @@ func TestAgentLoopPredefinedBlueprintTool(t *testing.T) {
 						"required":   []string{"value"},
 					},
 					"input_mappings": map[string]string{"input_value": "$args.value"},
-					"output_keys":    []string{"echo.value"},
 					"inline": dag.Blueprint{
 						ID:      "child-check",
 						Version: 1,
 						Nodes: []dag.NodeDef{
 							{ID: "echo", Type: "agent_test_echo", Config: map[string]any{}},
+							{ID: "done", Type: "return", Config: map[string]any{
+								"value": map[string]any{
+									"status": "success",
+									"value":  "{{results.echo.value}}",
+								},
+							}},
 						},
+						Edges: []dag.EdgeDef{{From: "echo", To: "done"}},
 					},
 				},
 			},
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,6 +733,7 @@ func TestAgentLoopPredefinedBlueprintToolSupportsSubagent(t *testing.T) {
 	defer server.Close()
 
 	engine := dag.NewEngine(nil)
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "test-openai-key",
 		OpenAIBaseURL: server.URL + "/chat/completions",
@@ -757,7 +765,6 @@ func TestAgentLoopPredefinedBlueprintToolSupportsSubagent(t *testing.T) {
 						"required":   []string{"value"},
 					},
 					"input_mappings": map[string]string{"input_value": "$args.value"},
-					"output_keys":    []string{"child_agent.output.final"},
 					"inline": dag.Blueprint{
 						ID:      "child-subagent-check",
 						Version: 1,
@@ -767,7 +774,7 @@ func TestAgentLoopPredefinedBlueprintToolSupportsSubagent(t *testing.T) {
 								Type: "agent_loop",
 								Config: map[string]any{
 									"provider":    LLMProviderOpenAI,
-									"prompt":      "Check this delegated value: {{input_value}}",
+									"prompt":      "Check this delegated value: {{inputs.input_value}}",
 									"output_mode": AgentOutputModeStructured,
 									"output_tool": map[string]any{
 										"parameters": map[string]any{
@@ -778,14 +785,25 @@ func TestAgentLoopPredefinedBlueprintToolSupportsSubagent(t *testing.T) {
 									},
 								},
 							},
+							{
+								ID:   "done",
+								Type: "return",
+								Config: map[string]any{
+									"value": map[string]any{
+										"status": "success",
+										"final":  "{{results.child_agent.output.final}}",
+									},
+								},
+							},
 						},
+						Edges: []dag.EdgeDef{{From: "child_agent", To: "done"}},
 					},
 				},
 			},
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,7 +821,7 @@ func TestBlueprintToolMaxDepthLimit(t *testing.T) {
 		inline:   &dag.Blueprint{ID: "child", Version: 1, Nodes: []dag.NodeDef{{ID: "step", Type: "cel_eval", Config: map[string]any{"expressions": map[string]string{"ok": "'true'"}}}}},
 		maxDepth: 1,
 		engine:   dag.NewEngine(nil),
-		parentCtx: dag.NewContext(map[string]string{
+		parentCtx: dag.NewInvocationFromInputs(map[string]string{
 			"__agent_blueprint_depth": "1",
 		}),
 	}
@@ -827,7 +845,14 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 		Budget:  &dag.Budget{MaxTotalTimeSeconds: 10},
 		Nodes: []dag.NodeDef{
 			{ID: "calc", Type: "cel_eval", Config: map[string]any{"expressions": map[string]string{"answer": "'dynamic-ok'"}}},
+			{ID: "done", Type: "return", Config: map[string]any{
+				"value": map[string]any{
+					"status": "success",
+					"answer": "{{results.calc.answer}}",
+				},
+			}},
 		},
+		Edges: []dag.EdgeDef{{From: "calc", To: "done"}},
 	}
 	childJSON, err := json.Marshal(child)
 	if err != nil {
@@ -835,7 +860,6 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 	}
 	runBlueprintArgs, _ := json.Marshal(map[string]any{
 		"blueprint_json": string(childJSON),
-		"output_keys":    []string{"calc.answer"},
 	})
 
 	var requests atomic.Int32
@@ -879,6 +903,7 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("cel_eval", NewCelEvalExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
 		OpenAIAPIKey:  "test-openai-key",
 		OpenAIBaseURL: server.URL + "/chat/completions",
@@ -901,7 +926,7 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,12 +935,41 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 	}
 }
 
+func TestValidateDynamicBlueprintAllowsInlineWaitByDefault(t *testing.T) {
+	bp := dag.Blueprint{
+		ID:      "dynamic-inline-wait",
+		Version: 1,
+		Budget:  &dag.Budget{MaxTotalTimeSeconds: 5},
+		Nodes: []dag.NodeDef{
+			{
+				ID:     "pause",
+				Type:   "wait",
+				Config: map[string]any{"duration_seconds": 0},
+			},
+			{
+				ID:   "done",
+				Type: "return",
+				Config: map[string]any{
+					"value": map[string]any{"status": "success"},
+				},
+			},
+		},
+		Edges: []dag.EdgeDef{{From: "pause", To: "done"}},
+	}
+
+	engine := dag.NewEngine(nil)
+	engine.RegisterExecutor("wait", NewWaitExecutor())
+	if err := validateDynamicBlueprint(engine, bp, defaultDynamicBlueprintPolicy(nil), dag.NewInvocationFromInputs(nil)); err != nil {
+		t.Fatalf("validateDynamicBlueprint rejected inline wait: %v", err)
+	}
+}
+
 type agentLoopEchoExecutor struct{}
 
-func (e *agentLoopEchoExecutor) Execute(_ context.Context, _ dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *agentLoopEchoExecutor) Execute(_ context.Context, _ dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	return dag.ExecutorResult{Outputs: map[string]string{
 		"status": "success",
-		"value":  fmt.Sprintf("%s-checked", execCtx.Get("input_value")),
+		"value":  fmt.Sprintf("%s-checked", inv.Run.Inputs["input_value"]),
 	}}, nil
 }
 

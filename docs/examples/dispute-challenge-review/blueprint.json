@@ -15,7 +15,7 @@
         "reasoning": "medium",
         "max_steps": 7,
         "max_tool_calls": 10,
-        "prompt": "Review this market challenge. Decide whether the original proposed resolution should be reaffirmed, the market should be cancelled, or the dispute should be escalated to a human admin.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nProposed outcome: {{dispute.proposed_outcome}}\nProposer evidence: {{dispute.proposer_evidence}}\nChallenge evidence: {{dispute.challenge_evidence}}\n\nUse tools if source verification is needed. Be conservative: escalate if the dispute is credible and cannot be resolved from available evidence.",
+        "prompt": "Review this market challenge. Decide whether the original proposed resolution should be reaffirmed, the market should be cancelled, or the dispute should be escalated to a human admin.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nProposed outcome: {{inputs.dispute.proposed_outcome}}\nProposer evidence: {{inputs.dispute.proposer_evidence}}\nChallenge evidence: {{inputs.dispute.challenge_evidence}}\n\nUse tools if source verification is needed. Be conservative: escalate if the dispute is credible and cannot be resolved from available evidence.",
         "tools": [
           { "name": "source_fetch", "kind": "builtin" },
           { "name": "json_extract", "kind": "builtin" },
@@ -57,34 +57,48 @@
     },
     {
       "id": "submit_review",
-      "type": "submit_result",
+      "type": "return",
       "label": "Submit Reviewed Outcome",
       "config": {
-        "outcome_key": "review.output.outcome"
+        "value": {
+          "status": "success",
+          "outcome": "{{results.review.output.outcome}}",
+          "source": "review"
+        }
       }
     },
     {
       "id": "submit_admin",
-      "type": "submit_result",
+      "type": "return",
       "label": "Submit Admin Outcome",
       "config": {
-        "outcome_key": "admin.outcome"
+        "value": {
+          "status": "success",
+          "outcome": "{{results.admin.outcome}}",
+          "source": "admin"
+        }
       }
     },
     {
       "id": "cancel_review",
-      "type": "cancel_market",
+      "type": "return",
       "label": "Cancel From Review",
       "config": {
-        "reason": "The dispute review found the market unresolved or invalid."
+        "value": {
+          "status": "cancelled",
+          "reason": "The dispute review found the market unresolved or invalid."
+        }
       }
     },
     {
       "id": "cancel_admin",
-      "type": "cancel_market",
+      "type": "return",
       "label": "Cancel From Admin Timeout",
       "config": {
-        "reason": "The admin fallback did not produce a usable dispute ruling."
+        "value": {
+          "status": "cancelled",
+          "reason": "The admin fallback did not produce a usable dispute ruling."
+        }
       }
     }
   ],
@@ -92,27 +106,27 @@
     {
       "from": "review",
       "to": "submit_review",
-      "condition": "review.output.decision == 'reaffirm'"
+      "condition": "results.review.output.decision == 'reaffirm'"
     },
     {
       "from": "review",
       "to": "cancel_review",
-      "condition": "review.output.decision == 'cancel'"
+      "condition": "results.review.output.decision == 'cancel'"
     },
     {
       "from": "review",
       "to": "admin",
-      "condition": "review.output.decision == 'escalate' || review.status != 'success'"
+      "condition": "results.review.output.decision == 'escalate' || results.review.status != 'success'"
     },
     {
       "from": "admin",
       "to": "submit_admin",
-      "condition": "admin.status == 'responded' && admin.outcome != '' && admin.outcome != 'inconclusive'"
+      "condition": "results.admin.status == 'responded' && results.admin.outcome != '' && results.admin.outcome != 'inconclusive'"
     },
     {
       "from": "admin",
       "to": "cancel_admin",
-      "condition": "admin.status != 'responded' || admin.outcome == 'inconclusive' || admin.outcome == ''"
+      "condition": "results.admin.status != 'responded' || results.admin.outcome == 'inconclusive' || results.admin.outcome == ''"
     }
   ],
   "budget": {

@@ -19,6 +19,7 @@ func (e *duplicateRunError) Error() string {
 
 func cloneRunResult(result RunResult) RunResult {
 	cloned := result
+	cloned.Return = cloneJSONRawMessage(result.Return)
 	if result.RunState != nil {
 		cloned.RunState = cloneDAGRunState(result.RunState)
 	}
@@ -30,10 +31,10 @@ func cloneDAGRunState(run *dag.RunState) *dag.RunState {
 		return nil
 	}
 	cloned := *run
+	cloned.Return = cloneJSONRawMessage(run.Return)
 	cloned.Definition = cloneBlueprint(run.Definition)
 	cloned.Inputs = cloneStringMap(run.Inputs)
 	cloned.NodeStates = cloneNodeStateMap(run.NodeStates)
-	cloned.Context = cloneStringMap(run.Context)
 	cloned.EdgeTraversals = cloneIntMap(run.EdgeTraversals)
 	cloned.NodeTraces = cloneNodeTraces(run.NodeTraces)
 	return &cloned
@@ -79,6 +80,21 @@ func cloneJSONValue(value interface{}) interface{} {
 		return value
 	}
 	return cloned
+}
+
+func cloneJSONRawMessage(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), value...)
+}
+
+func cloneJSONRawMessagePtr(value *json.RawMessage) *json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	cloned := cloneJSONRawMessage(*value)
+	return &cloned
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

@@ -39,7 +39,7 @@ func TestAPIFetchSuccess(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestAPIFetchHTTPError(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,18 +94,39 @@ func TestAPIFetchWithInterpolation(t *testing.T) {
 		ID:   "fetch",
 		Type: "api_fetch",
 		Config: map[string]interface{}{
-			"url":       server.URL + "?q={{market_question}}",
+			"url":       server.URL + "?q={{inputs.market_question}}",
 			"json_path": "result",
 		},
 	}
 
-	ctx := dag.NewContext(map[string]string{"market_question": "will-btc-100k"})
+	ctx := dag.NewInvocationFromInputs(map[string]string{"market_question": "will-btc-100k"})
 	result, err := exec.Execute(context.Background(), node, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["extracted"] != "yes" {
 		t.Fatalf("expected yes, got %q", result.Outputs["extracted"])
+	}
+}
+
+func TestAPIFetchRejectsUnknownConfigField(t *testing.T) {
+	exec := &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true}
+	node := dag.NodeDef{
+		ID:   "fetch",
+		Type: "api_fetch",
+		Config: map[string]interface{}{
+			"url":       "https://example.com",
+			"json_path": "result",
+			"glork":     "boom",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err == nil {
+		t.Fatal("expected unknown config field to be rejected")
+	}
+	if !strings.Contains(err.Error(), `unknown field "glork"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -140,16 +161,16 @@ func TestAPIFetchPostWithHeadersAndBody(t *testing.T) {
 		Config: map[string]any{
 			"url":       server.URL,
 			"method":    "post",
-			"body":      `{"question":"{{market_question}}"}`,
+			"body":      `{"question":"{{inputs.market_question}}"}`,
 			"json_path": "result",
 			"headers": map[string]string{
 				"Content-Type": "application/json",
-				"X-API-Key":    "{{api_key}}",
+				"X-API-Key":    "{{inputs.api_key}}",
 			},
 		},
 	}
 
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market_question": "Will BTC hit 100k?",
 		"api_key":         "secret-123",
 	})
@@ -189,13 +210,13 @@ func TestAPIFetchBasicAuth(t *testing.T) {
 			"url":       server.URL,
 			"json_path": "result",
 			"basic_auth": map[string]string{
-				"username": "{{api_user}}",
-				"password": "{{api_password}}",
+				"username": "{{inputs.api_user}}",
+				"password": "{{inputs.api_password}}",
 			},
 		},
 	}
 
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"api_user":     "resolver",
 		"api_password": "s3cr3t",
 	})
@@ -227,7 +248,7 @@ func TestAPIFetchRawTextResponse(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,103 +298,10 @@ func TestJSONPathExtraction(t *testing.T) {
 	}
 }
 
-func TestSubmitResultSuccess(t *testing.T) {
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("judge.outcome", "2")
-
-	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["outcome"] != "2" {
-		t.Fatalf("expected outcome=2, got %q", result.Outputs["outcome"])
-	}
-	if result.Outputs["evidence_hash"] == "" {
-		t.Fatal("expected non-empty evidence_hash")
-	}
-	if result.Outputs["submitted"] != "true" {
-		t.Fatal("expected submitted=true")
-	}
-}
-
-func TestSubmitResultNoOutcome(t *testing.T) {
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-
-	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
-	_, err := exec.Execute(context.Background(), node, ctx)
-	if err == nil {
-		t.Fatal("expected error when no outcome determined")
-	}
-}
-
-func TestSubmitResultWithExplicitKey(t *testing.T) {
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("my_custom.result", "1")
-
-	node := dag.NodeDef{
-		ID:   "submit",
-		Type: "submit_result",
-		Config: map[string]interface{}{
-			"outcome_key": "my_custom.result",
-		},
-	}
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["outcome"] != "1" {
-		t.Fatalf("expected outcome=1, got %q", result.Outputs["outcome"])
-	}
-}
-
-func TestCancelMarketExecutor(t *testing.T) {
-	exec := NewCancelMarketExecutor()
-	ctx := dag.NewContext(nil)
-
-	node := dag.NodeDef{
-		ID:   "cancel",
-		Type: "cancel_market",
-		Config: map[string]interface{}{
-			"reason": "evidence unavailable",
-		},
-	}
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["action"] != "cancel" {
-		t.Fatalf("expected action=cancel, got %q", result.Outputs["action"])
-	}
-	if result.Outputs["reason"] != "evidence unavailable" {
-		t.Fatalf("expected reason, got %q", result.Outputs["reason"])
-	}
-}
-
-func TestDeferResolutionExecutor(t *testing.T) {
-	exec := NewDeferResolutionExecutor()
-	result, err := exec.Execute(context.Background(), dag.NodeDef{
-		ID:   "defer",
-		Type: "defer_resolution",
-		Config: map[string]interface{}{
-			"reason": "not terminal yet",
-		},
-	}, dag.NewContext(nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["deferred"] != "true" || result.Outputs["action"] != "defer" {
-		t.Fatalf("expected defer action, got %#v", result.Outputs)
-	}
-	if result.Outputs["reason"] != "not terminal yet" {
-		t.Fatalf("expected defer reason, got %q", result.Outputs["reason"])
-	}
-}
-
-func TestWaitExecutor(t *testing.T) {
+func TestWaitExecutorShortDurationSleepsInline(t *testing.T) {
+	// A sub-cap duration should sleep in-process and return outputs
+	// directly — no Suspend — so the in-memory engine and sub-blueprint
+	// callers can run it without hitting the durable path.
 	exec := NewWaitExecutor()
 	node := dag.NodeDef{
 		ID:   "wait",
@@ -382,42 +310,124 @@ func TestWaitExecutor(t *testing.T) {
 			"duration_seconds": 1,
 		},
 	}
-
 	start := time.Now()
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	elapsed := time.Since(start)
-
 	if err != nil {
 		t.Fatal(err)
 	}
+	if result.Suspend != nil {
+		t.Fatalf("expected inline execution (no Suspend), got %+v", result.Suspend)
+	}
 	if result.Outputs["status"] != "success" {
-		t.Fatalf("expected success, got %s", result.Outputs["status"])
+		t.Fatalf("status = %q", result.Outputs["status"])
 	}
 	if elapsed < 900*time.Millisecond {
-		t.Fatalf("expected ~1s wait, got %v", elapsed)
+		t.Fatalf("expected ~1s inline sleep, got %v", elapsed)
 	}
 }
 
-func TestWaitExecutorCancellation(t *testing.T) {
+func TestWaitExecutorInlineSleepRespectsContextCancellation(t *testing.T) {
 	exec := NewWaitExecutor()
 	node := dag.NodeDef{
 		ID:   "wait",
 		Type: "wait",
 		Config: map[string]interface{}{
-			"duration_seconds": 60,
+			"duration_seconds": 10,
 		},
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-
-	_, err := exec.Execute(ctx, node, dag.NewContext(nil))
+	start := time.Now()
+	_, err := exec.Execute(ctx, node, dag.NewInvocationFromInputs(nil))
+	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("expected cancellation error")
+		t.Fatal("expected context cancellation error")
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("expected fast cancel, got %v", elapsed)
 	}
 }
 
-func TestWaitExecutorDeferMode(t *testing.T) {
+func TestWaitExecutorCustomInlineCapForcesSuspension(t *testing.T) {
+	// With max_inline_seconds=2, a 5s wait must suspend rather than sleep
+	// inline; the opposite config (below) verifies the flipped case.
+	exec := NewWaitExecutor()
+	node := dag.NodeDef{
+		ID:   "wait",
+		Type: "wait",
+		Config: map[string]interface{}{
+			"duration_seconds":   5,
+			"max_inline_seconds": 2,
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspend == nil {
+		t.Fatal("expected Suspend for duration > max_inline_seconds")
+	}
+	if result.Suspend.Kind != dag.SuspensionKindTimer {
+		t.Fatalf("kind = %q", result.Suspend.Kind)
+	}
+}
+
+func TestWaitExecutorSleepReturnsTimerSuspension(t *testing.T) {
+	exec := NewWaitExecutor()
+	node := dag.NodeDef{
+		ID:   "wait",
+		Type: "wait",
+		Config: map[string]interface{}{
+			"duration_seconds": 30,
+		},
+	}
+
+	before := time.Now().Unix()
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	after := time.Now().Unix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspend == nil {
+		t.Fatal("expected Suspend, got nil")
+	}
+	if result.Suspend.Kind != dag.SuspensionKindTimer {
+		t.Fatalf("kind = %q, want timer", result.Suspend.Kind)
+	}
+	if result.Suspend.ResumeAtUnix < before+30 || result.Suspend.ResumeAtUnix > after+30 {
+		t.Fatalf("resume_at = %d, want roughly %d", result.Suspend.ResumeAtUnix, before+30)
+	}
+	if result.Suspend.Outputs["status"] != "success" {
+		t.Fatalf("outputs.status = %q", result.Suspend.Outputs["status"])
+	}
+	if result.Suspend.Outputs["waited"] != "30" {
+		t.Fatalf("outputs.waited = %q", result.Suspend.Outputs["waited"])
+	}
+}
+
+func TestWaitExecutorZeroDurationCompletesImmediately(t *testing.T) {
+	exec := NewWaitExecutor()
+	node := dag.NodeDef{
+		ID:   "wait",
+		Type: "wait",
+		Config: map[string]interface{}{
+			"duration_seconds": 0,
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspend != nil {
+		t.Fatalf("expected no suspension, got %+v", result.Suspend)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("status = %q", result.Outputs["status"])
+	}
+}
+
+func TestWaitExecutorDeferModeAnchorPassedCompletesImmediately(t *testing.T) {
 	exec := NewWaitExecutor()
 	node := dag.NodeDef{
 		ID:   "wait",
@@ -428,8 +438,7 @@ func TestWaitExecutorDeferMode(t *testing.T) {
 			"duration_seconds": 3600,
 		},
 	}
-
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market.now_ts":                   "1712347200",
 		"market.resolution_pending_since": "1712343600",
 	})
@@ -438,15 +447,18 @@ func TestWaitExecutorDeferMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if result.Suspend != nil {
+		t.Fatalf("expected no suspension, got %+v", result.Suspend)
+	}
 	if result.Outputs["status"] != "success" {
-		t.Fatalf("expected success, got %#v", result.Outputs)
+		t.Fatalf("status = %q", result.Outputs["status"])
 	}
 	if result.Outputs["ready_at"] != "1712347200" {
 		t.Fatalf("ready_at = %q, want 1712347200", result.Outputs["ready_at"])
 	}
 }
 
-func TestWaitExecutorDeferModeWaiting(t *testing.T) {
+func TestWaitExecutorDeferModeAnchorFutureReturnsTimerSuspension(t *testing.T) {
 	exec := NewWaitExecutor()
 	node := dag.NodeDef{
 		ID:   "wait",
@@ -457,8 +469,7 @@ func TestWaitExecutorDeferModeWaiting(t *testing.T) {
 			"duration_seconds": 43200,
 		},
 	}
-
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market.now_ts":   "1712347200",
 		"market.deadline": "1712340000",
 	})
@@ -467,14 +478,78 @@ func TestWaitExecutorDeferModeWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Outputs["status"] != "waiting" {
-		t.Fatalf("expected waiting, got %#v", result.Outputs)
+	if result.Suspend == nil {
+		t.Fatal("expected Suspend, got nil")
 	}
-	if result.Outputs["waiting"] != "true" {
-		t.Fatalf("expected waiting=true, got %#v", result.Outputs)
+	if result.Suspend.Kind != dag.SuspensionKindTimer {
+		t.Fatalf("kind = %q, want timer", result.Suspend.Kind)
 	}
-	if result.Outputs["remaining_seconds"] != "36000" {
-		t.Fatalf("remaining_seconds = %q, want 36000", result.Outputs["remaining_seconds"])
+	if result.Suspend.ResumeAtUnix != 1712383200 {
+		t.Fatalf("resume_at = %d, want 1712383200", result.Suspend.ResumeAtUnix)
+	}
+	if result.Suspend.Outputs["status"] != "success" {
+		t.Fatalf("outputs.status = %q", result.Suspend.Outputs["status"])
+	}
+	if result.Suspend.Outputs["ready_at"] != "1712383200" {
+		t.Fatalf("outputs.ready_at = %q", result.Suspend.Outputs["ready_at"])
+	}
+}
+
+func TestAwaitSignalExecutorReturnsSignalSuspension(t *testing.T) {
+	exec := NewAwaitSignalExecutor()
+	inv := dag.NewInvocation(dag.Run{
+		ID:     "run-xyz",
+		Inputs: map[string]string{"market_app_id": "99"},
+	})
+	node := dag.NodeDef{
+		ID:   "judge",
+		Type: "await_signal",
+		Config: map[string]interface{}{
+			"signal_type":      "human.responded",
+			"required_payload": []string{"outcome", " "},
+			"default_outputs":  map[string]string{"status": "responded"},
+			"timeout_seconds":  30,
+		},
+	}
+	before := time.Now().Unix()
+	result, err := exec.Execute(context.Background(), node, inv)
+	after := time.Now().Unix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Suspend == nil {
+		t.Fatal("expected Suspend, got nil")
+	}
+	if result.Suspend.SignalType != "human.responded" {
+		t.Fatalf("signal_type = %q", result.Suspend.SignalType)
+	}
+	if result.Suspend.CorrelationKey != "run-xyz:judge" {
+		t.Fatalf("correlation_key = %q", result.Suspend.CorrelationKey)
+	}
+	if len(result.Suspend.RequiredPayload) != 1 || result.Suspend.RequiredPayload[0] != "outcome" {
+		t.Fatalf("required_payload = %v", result.Suspend.RequiredPayload)
+	}
+	if result.Suspend.ResumeAtUnix < before+30 || result.Suspend.ResumeAtUnix > after+30 {
+		t.Fatalf("resume_at = %d, want ~%d", result.Suspend.ResumeAtUnix, before+30)
+	}
+	if result.Suspend.TimeoutOutputs["status"] == "" {
+		t.Fatalf("timeout_outputs missing status: %+v", result.Suspend.TimeoutOutputs)
+	}
+	if result.Suspend.DefaultOutputs["status"] != "responded" {
+		t.Fatalf("default_outputs[status] = %q", result.Suspend.DefaultOutputs["status"])
+	}
+}
+
+func TestAwaitSignalExecutorRequiresSignalType(t *testing.T) {
+	exec := NewAwaitSignalExecutor()
+	node := dag.NodeDef{
+		ID:     "judge",
+		Type:   "await_signal",
+		Config: map[string]interface{}{},
+	}
+	_, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err == nil {
+		t.Fatal("expected error for missing signal_type")
 	}
 }
 
@@ -488,7 +563,7 @@ func TestLLMCallNoAPIKey(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,12 +598,12 @@ func TestLLMCallWithMockServer(t *testing.T) {
 		ID:   "judge",
 		Type: "llm_call",
 		Config: map[string]interface{}{
-			"prompt": "Evidence: {{search.evidence}}\nQuestion: {{market_question}}",
+			"prompt": "Evidence: {{results.search.evidence}}\nQuestion: {{inputs.market_question}}",
 		},
 	}
 
-	ctx := dag.NewContext(map[string]string{"market_question": "Did BTC hit 70k?"})
-	ctx.Set("search.evidence", "BTC closed at $70,123")
+	ctx := dag.NewInvocationFromInputs(map[string]string{"market_question": "Did BTC hit 70k?"})
+	ctx.Results.SetField("search", "evidence", "BTC closed at $70,123")
 
 	result, err := exec.Execute(context.Background(), node, ctx)
 	if err != nil {
@@ -591,7 +666,7 @@ func TestLLMCallOpenAIProvider(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +730,7 @@ func TestLLMCallGoogleProvider(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,7 +778,7 @@ func TestLLMCallSucceedsWithoutCitations(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +815,7 @@ func TestLLMCallAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market.outcomes.json": `["Yes","No"]`,
 	})
 
@@ -751,7 +826,7 @@ func TestLLMCallAcceptsOutcomeWithinAllowedRange(t *testing.T) {
 			"provider":             "openai",
 			"model":                "gpt-5.4",
 			"prompt":               "Judge this evidence.",
-			"allowed_outcomes_key": "market.outcomes.json",
+			"allowed_outcomes_key": "inputs.market.outcomes.json",
 		},
 	}
 
@@ -789,7 +864,7 @@ func TestLLMCallRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 		OpenAIAPIKey:  "openai-key",
 		OpenAIBaseURL: server.URL,
 	})
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market.outcomes.json": `["Yes","No"]`,
 	})
 
@@ -800,7 +875,7 @@ func TestLLMCallRejectsOutcomeOutsideAllowedRange(t *testing.T) {
 			"provider":             "openai",
 			"model":                "gpt-5.4",
 			"prompt":               "Judge this evidence.",
-			"allowed_outcomes_key": "market.outcomes.json",
+			"allowed_outcomes_key": "inputs.market.outcomes.json",
 		},
 	}
 
@@ -832,18 +907,18 @@ func TestLLMCallFailsWhenAllowedOutcomesKeyMissing(t *testing.T) {
 			"provider":             "openai",
 			"model":                "gpt-5.4",
 			"prompt":               "Judge this evidence.",
-			"allowed_outcomes_key": "market.outcomes.json",
+			"allowed_outcomes_key": "inputs.market.outcomes.json",
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["status"] != "failed" {
 		t.Fatalf("expected failed status, got %q", result.Outputs["status"])
 	}
-	if !strings.Contains(result.Outputs["error"], `allowed outcomes key "market.outcomes.json" not found in context`) {
+	if !strings.Contains(result.Outputs["error"], `allowed outcomes key "inputs.market.outcomes.json" not found in context`) {
 		t.Fatalf("unexpected error: %q", result.Outputs["error"])
 	}
 }
@@ -860,8 +935,7 @@ func TestFullResolutionDAGWithExecutors(t *testing.T) {
 
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("api_fetch", &APIFetchExecutor{Client: http.DefaultClient, AllowLocal: true})
-	engine.RegisterExecutor("submit_result", NewSubmitResultExecutor())
-	engine.RegisterExecutor("cancel_market", NewCancelMarketExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 
 	bp := dag.Blueprint{
 		ID:   "price-check",
@@ -878,14 +952,22 @@ func TestFullResolutionDAGWithExecutors(t *testing.T) {
 					},
 				},
 			},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
-			{ID: "fallback", Type: "cancel_market", Config: map[string]interface{}{
-				"reason": "API unavailable",
+			{ID: "submit", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status":  "success",
+					"outcome": "{{results.fetch.outcome}}",
+				},
+			}},
+			{ID: "fallback", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status": "cancelled",
+					"reason": "API unavailable",
+				},
 			}},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "fetch", To: "submit", Condition: "fetch.status == 'success'"},
-			{From: "fetch", To: "fallback", Condition: "fetch.status != 'success'"},
+			{From: "fetch", To: "submit", Condition: "results.fetch.status == 'success'"},
+			{From: "fetch", To: "fallback", Condition: "results.fetch.status != 'success'"},
 		},
 		Budget: &dag.Budget{MaxTotalTimeSeconds: 30},
 	}
@@ -907,37 +989,42 @@ func TestFullResolutionDAGWithExecutors(t *testing.T) {
 		t.Fatalf("submit not completed: %s", run.NodeStates["submit"].Status)
 	}
 
-	outcome := run.Context["submit.outcome"]
-	if outcome != "0" {
-		t.Fatalf("expected submit outcome=0, got %q", outcome)
+	if len(run.Return) == 0 {
+		t.Fatal("expected non-empty run return value")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(run.Return, &payload); err != nil {
+		t.Fatalf("unmarshal run return: %v", err)
+	}
+	if payload["status"] != "success" || payload["outcome"] != "0" {
+		t.Fatalf("unexpected return payload: %+v", payload)
 	}
 
-	evidenceHash := run.Context["submit.evidence_hash"]
-	if evidenceHash == "" {
-		t.Fatal("expected non-empty evidence hash")
+	// Fallback should NOT have run; either skipped (early-return cancelled
+	// it before activation) or pending (never activated by the failing edge).
+	switch run.NodeStates["fallback"].Status {
+	case "pending", "skipped":
+		// ok
+	default:
+		t.Fatalf("fallback should be pending or skipped, got %s", run.NodeStates["fallback"].Status)
 	}
 
-	// Fallback should NOT have run
-	if run.NodeStates["fallback"].Status != "pending" {
-		t.Fatalf("fallback should be pending, got %s", run.NodeStates["fallback"].Status)
-	}
-
-	fmt.Printf("Resolution complete: outcome=%s evidence=%s\n", outcome, evidenceHash[:16]+"...")
+	fmt.Printf("Resolution complete: outcome=%s\n", payload["outcome"])
 }
 
 // --- cel_eval tests ---
 
 func TestCelEvalBasicExpressions(t *testing.T) {
 	exec := NewCelEvalExecutor()
-	ctx := dag.NewContext(map[string]string{"name": "world"})
+	ctx := dag.NewInvocationFromInputs(map[string]string{"name": "world"})
 
 	node := dag.NodeDef{
 		ID:   "eval",
 		Type: "cel_eval",
 		Config: map[string]interface{}{
 			"expressions": map[string]interface{}{
-				"greeting":  "'hello ' + name",
-				"is_world":  "name == 'world'",
+				"greeting":  "'hello ' + inputs.name",
+				"is_world":  "inputs.name == 'world'",
 				"math_test": "1 + 2",
 			},
 		},
@@ -960,15 +1047,15 @@ func TestCelEvalBasicExpressions(t *testing.T) {
 
 func TestCelEvalStringFunctions(t *testing.T) {
 	exec := NewCelEvalExecutor()
-	ctx := dag.NewContext(map[string]string{"value": "  Hello, World  "})
+	ctx := dag.NewInvocationFromInputs(map[string]string{"value": "  Hello, World  "})
 
 	node := dag.NodeDef{
 		ID:   "eval",
 		Type: "cel_eval",
 		Config: map[string]interface{}{
 			"expressions": map[string]interface{}{
-				"trimmed": "value.trim()",
-				"lower":   "value.trim().lowerAscii()",
+				"trimmed": "inputs.value.trim()",
+				"lower":   "inputs.value.trim().lowerAscii()",
 			},
 		},
 	}
@@ -994,7 +1081,7 @@ func TestCelEvalEmptyExpressionsFails(t *testing.T) {
 			"expressions": map[string]interface{}{},
 		},
 	}
-	_, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	_, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err == nil {
 		t.Fatal("expected error for empty expressions")
 	}
@@ -1011,7 +1098,7 @@ func TestCelEvalInvalidExpressionFails(t *testing.T) {
 			},
 		},
 	}
-	_, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	_, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err == nil {
 		t.Fatal("expected error for invalid expression")
 	}
@@ -1032,8 +1119,8 @@ type mapTestExecutor struct {
 	release <-chan struct{}
 }
 
-func (e *mapTestExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	idx, _ := strconv.Atoi(execCtx.Get("batch_index"))
+func (e *mapTestExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
+	idx, _ := strconv.Atoi(inv.Run.Inputs["batch_index"])
 
 	e.mu.Lock()
 	e.active++
@@ -1066,11 +1153,11 @@ func (e *mapTestExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx
 	for k, v := range e.outputs {
 		outputs[k] = v
 	}
-	outputs["batch_echo"] = execCtx.Get("batch")
-	outputs["batch_index"] = execCtx.Get("batch_index")
-	outputs["batch_item_count"] = execCtx.Get("batch_item_count")
-	outputs["config_seen"] = execCtx.Get("config")
-	outputs["depth"] = execCtx.Get("__map_depth")
+	outputs["batch_echo"] = inv.Run.Inputs["batch"]
+	outputs["batch_index"] = inv.Run.Inputs["batch_index"]
+	outputs["batch_item_count"] = inv.Run.Inputs["batch_item_count"]
+	outputs["config_seen"] = inv.Run.Inputs["config"]
+	outputs["depth"] = inv.Run.Inputs["__map_depth"]
 	outputs["status"] = "success"
 	return dag.ExecutorResult{Outputs: outputs}, nil
 }
@@ -1094,6 +1181,7 @@ func newMapTestEngine(failOnBatch int) (*dag.Engine, *mapTestExecutor) {
 		failOnBatch: failOnBatch,
 	}
 	engine.RegisterExecutor("step", exec)
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	return engine, exec
 }
 
@@ -1101,21 +1189,34 @@ func simpleInlineBlueprint() *dag.Blueprint {
 	return &dag.Blueprint{
 		Nodes: []dag.NodeDef{
 			{ID: "step", Type: "step", Config: map[string]interface{}{}},
+			{ID: "done", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status":      "success",
+					"processed":   "{{results.step.processed}}",
+					"batch_echo":  "{{results.step.batch_echo}}",
+					"config_seen": "{{results.step.config_seen}}",
+					"depth":       "{{results.step.depth}}",
+					"step_status": "{{results.step.status}}",
+					"batch_index": "{{results.step.batch_index}}",
+					"batch_count": "{{results.step.batch_item_count}}",
+				},
+			}},
 		},
+		Edges: []dag.EdgeDef{{From: "step", To: "done"}},
 	}
 }
 
 func TestMapExecutorDefaultSequentialBatch(t *testing.T) {
 	engine, tracker := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `["apple","banana","cherry"]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `["apple","banana","cherry"]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
+			"items_key": "inputs.items",
 			"inline":    simpleInlineBlueprint(),
 		},
 	}
@@ -1160,14 +1261,14 @@ func TestMapExecutorDefaultSequentialBatch(t *testing.T) {
 func TestMapExecutorBatchSizeChunksItems(t *testing.T) {
 	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[1, 2, 3, 4, 5]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `[1, 2, 3, 4, 5]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key":       "items",
+			"items_key":       "inputs.items",
 			"inline":          simpleInlineBlueprint(),
 			"batch_size":      2,
 			"max_concurrency": 1,
@@ -1198,19 +1299,19 @@ func TestMapExecutorBatchSizeChunksItems(t *testing.T) {
 func TestMapExecutorMaxItems(t *testing.T) {
 	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
+	ctx := dag.NewInvocationFromInputs(nil)
 	items := make([]int, 200)
 	for i := range items {
 		items[i] = i
 	}
 	data, _ := json.Marshal(items)
-	ctx.Set("items", string(data))
+	ctx.Run.Inputs["items"] = string(data)
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
+			"items_key": "inputs.items",
 			"inline":    simpleInlineBlueprint(),
 			"max_items": 5,
 		},
@@ -1236,15 +1337,16 @@ func TestMapExecutorMaxConcurrencyBoundsParallelism(t *testing.T) {
 		release:     release,
 	}
 	engine.RegisterExecutor("step", tracker)
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[0,1,2,3,4,5,6,7,8,9]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `[0,1,2,3,4,5,6,7,8,9]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key":       "items",
+			"items_key":       "inputs.items",
 			"inline":          simpleInlineBlueprint(),
 			"batch_size":      1,
 			"max_concurrency": 3,
@@ -1291,15 +1393,16 @@ func TestMapExecutorFullParallelism(t *testing.T) {
 		release:     release,
 	}
 	engine.RegisterExecutor("step", tracker)
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[0,1,2,3,4]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `[0,1,2,3,4]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key":       "items",
+			"items_key":       "inputs.items",
 			"inline":          simpleInlineBlueprint(),
 			"batch_size":      1,
 			"max_concurrency": 0,
@@ -1325,14 +1428,14 @@ func TestMapExecutorFullParallelism(t *testing.T) {
 func TestMapExecutorOnErrorFailSkipsUnstartedBatches(t *testing.T) {
 	engine, _ := newMapTestEngine(1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `["a","b","c","d"]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `["a","b","c","d"]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key":       "items",
+			"items_key":       "inputs.items",
 			"inline":          simpleInlineBlueprint(),
 			"batch_size":      1,
 			"max_concurrency": 1,
@@ -1364,14 +1467,14 @@ func TestMapExecutorOnErrorFailSkipsUnstartedBatches(t *testing.T) {
 func TestMapExecutorOnErrorContinueRunsAllBatches(t *testing.T) {
 	engine, _ := newMapTestEngine(1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `["a","b","c"]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `["a","b","c"]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key":       "items",
+			"items_key":       "inputs.items",
 			"inline":          simpleInlineBlueprint(),
 			"batch_size":      1,
 			"max_concurrency": 1,
@@ -1397,14 +1500,14 @@ func TestMapExecutorOnErrorContinueRunsAllBatches(t *testing.T) {
 func TestMapExecutorEmptyArray(t *testing.T) {
 	engine, _ := newMapTestEngine(-1)
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[]`)
+	ctx := dag.NewInvocationFromInputs(nil)
+	ctx.Run.Inputs["items"] = `[]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
+			"items_key": "inputs.items",
 			"inline":    simpleInlineBlueprint(),
 		},
 	}
@@ -1424,20 +1527,20 @@ func TestMapExecutorEmptyArray(t *testing.T) {
 func TestMapExecutorInputMappings(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("step", &mapTestExecutor{outputs: map[string]string{}, failOnBatch: -1})
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(map[string]string{"shared_config": "abc123"})
-	ctx.Set("items", `["x"]`)
+	ctx := dag.NewInvocationFromInputs(map[string]string{"shared_config": "abc123"})
+	ctx.Run.Inputs["items"] = `["x"]`
 
 	node := dag.NodeDef{
 		ID:   "mapper",
 		Type: "map",
 		Config: map[string]interface{}{
-			"items_key": "items",
+			"items_key": "inputs.items",
 			"inline":    simpleInlineBlueprint(),
 			"input_mappings": map[string]interface{}{
-				"config": "shared_config",
+				"config": "inputs.shared_config",
 			},
-			"output_keys": []interface{}{"step.batch_echo", "step.status", "step.config_seen"},
 		},
 	}
 
@@ -1452,33 +1555,12 @@ func TestMapExecutorInputMappings(t *testing.T) {
 	if len(results) != 1 || results[0].Status != "completed" {
 		t.Fatalf("expected 1 completed result, got %+v", results)
 	}
-	if results[0].Outputs["step.config_seen"] != "abc123" {
-		t.Fatalf("mapped config = %q, want abc123", results[0].Outputs["step.config_seen"])
+	var returned map[string]string
+	if err := json.Unmarshal(results[0].Return, &returned); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestMapExecutorRejectsDeprecatedMode(t *testing.T) {
-	engine, _ := newMapTestEngine(-1)
-	exec := NewMapExecutor(engine)
-	ctx := dag.NewContext(nil)
-	ctx.Set("items", `[1]`)
-
-	node := dag.NodeDef{
-		ID:   "mapper",
-		Type: "map",
-		Config: map[string]interface{}{
-			"items_key": "items",
-			"inline":    simpleInlineBlueprint(),
-			"mode":      "parallel",
-		},
-	}
-
-	_, err := exec.Execute(context.Background(), node, ctx)
-	if err == nil {
-		t.Fatal("expected error for deprecated mode")
-	}
-	if !strings.Contains(err.Error(), "no longer supported") {
-		t.Fatalf("unexpected error: %v", err)
+	if returned["config_seen"] != "abc123" {
+		t.Fatalf("mapped config = %q, want abc123", returned["config_seen"])
 	}
 }
 

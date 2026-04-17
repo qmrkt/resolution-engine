@@ -53,7 +53,32 @@ type AgentLoopConfig struct {
 	AllowedOutcomesKey     string                  `json:"allowed_outcomes_key,omitempty"`
 	EnableDynamicBlueprint bool                    `json:"enable_dynamic_blueprints,omitempty"`
 	DynamicBlueprintPolicy *DynamicBlueprintPolicy `json:"dynamic_blueprint_policy,omitempty"`
+
+	// Async opts the agent into detached execution: the executor returns
+	// immediately with a dag.Suspension and the chat loop runs on an
+	// isolated goroutine. The goroutine resumes the node via a Signal
+	// delivered to the configured AgentSignalFn. Only supported under
+	// durable engines; the in-memory engine rejects the suspension.
+	Async bool `json:"async,omitempty"`
 }
+
+// AgentDoneSignalType is the signal type the async agent goroutine posts
+// back to resume the waiting node.
+const AgentDoneSignalType = "agent.done"
+
+// AgentLoopRecoveryOwner tags async agent_loop waits so the durable manager
+// can detect them on startup. The live goroutine that would deliver the
+// resolving signal does not survive a manager restart, so the manager fails
+// the wait immediately rather than parking it until timeout.
+const AgentLoopRecoveryOwner = "agent_loop"
+
+// AgentSignalFn delivers a completion signal for an async agent run. Usage is
+// carried out-of-band from payload so the durable manager can preserve token
+// accounting without leaking transport fields into node outputs.
+//
+// The durable engine host is expected to install this callback at
+// construction time.
+type AgentSignalFn func(runID, correlationKey string, payload map[string]string, usage dag.TokenUsage) error
 
 // AgentOutputToolConfig defines the synthetic tool used by structured outputs.
 type AgentOutputToolConfig struct {
@@ -71,7 +96,6 @@ type AgentToolConfig struct {
 	Parameters     json.RawMessage   `json:"parameters,omitempty"`
 	Inline         *dag.Blueprint    `json:"inline,omitempty"`
 	InputMappings  map[string]string `json:"input_mappings,omitempty"`
-	OutputKeys     []string          `json:"output_keys,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
 	MaxDepth       int               `json:"max_depth,omitempty"`
 }
@@ -85,7 +109,6 @@ type DynamicBlueprintPolicy struct {
 	MaxTotalTimeSeconds int      `json:"max_total_time_seconds,omitempty"`
 	MaxTotalTokens      int      `json:"max_total_tokens,omitempty"`
 	AllowAgentLoop      bool     `json:"allow_agent_loop,omitempty"`
-	AllowTerminalNodes  bool     `json:"allow_terminal_nodes,omitempty"`
 }
 
 type agentMessage struct {

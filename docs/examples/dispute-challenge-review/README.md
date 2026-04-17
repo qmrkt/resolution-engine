@@ -12,10 +12,10 @@ The reviewer can:
 flowchart LR
   review["Challenge Reviewer<br/>agent_loop"]
   admin["Admin Fallback<br/>await_signal"]
-  submitReview["Submit Reviewed Outcome<br/>submit_result"]
-  submitAdmin["Submit Admin Outcome<br/>submit_result"]
-  cancelReview["Cancel From Review<br/>cancel_market"]
-  cancelAdmin["Cancel From Admin Timeout<br/>cancel_market"]
+  submitReview["Submit Reviewed Outcome<br/>return"]
+  submitAdmin["Submit Admin Outcome<br/>return"]
+  cancelReview["Cancel From Review<br/>return"]
+  cancelAdmin["Cancel From Admin Timeout<br/>return"]
 
   review -->|"reaffirm"| submitReview
   review -->|"cancel"| cancelReview

@@ -27,8 +27,8 @@ The example assumes outcome indexes map as:
 flowchart LR
   resolver["Result Resolver<br/>agent_loop"]
   tool["verify_official_result<br/>blueprint-backed tool"]
-  submit["Submit Official Result<br/>submit_result"]
-  cancel["Cancel<br/>cancel_market"]
+  submit["Submit Official Result<br/>return"]
+  cancel["Cancel<br/>return"]
 
   resolver -. "calls" .-> tool
   resolver -->|"final verified outcome"| submit

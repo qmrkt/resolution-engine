@@ -12,7 +12,7 @@
         "output_mode": "structured",
         "max_steps": 8,
         "max_tool_calls": 6,
-        "prompt": "Draft a child resolution blueprint for this market.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\n\nPrefer primary sources, use redundancy when needed, defer rather than guess, keep the graph bounded, and end with submit_result or defer_resolution. Return the full child blueprint JSON string in blueprint_json.",
+        "prompt": "Draft a child resolution blueprint for this market.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nLive context JSON: {{inputs.market.context_json}}\nSuggested sources JSON: {{inputs.market.sources_json}}\nAllowed child node types JSON: {{inputs.yolo.allowed_node_types_json}}\nExample catalog JSON: {{inputs.yolo.examples_json}}\nSource pack catalog JSON: {{inputs.yolo.source_packs_json}}\n\nPrefer primary sources, use redundancy when needed, defer rather than guess, keep the graph bounded, and end with a return node whose payload records the final status and any outcome or reason. Return the full child blueprint JSON string in blueprint_json.",
         "output_tool": {
           "parameters": {
             "type": "object",
@@ -47,7 +47,7 @@
         "output_mode": "structured",
         "max_steps": 8,
         "max_tool_calls": 6,
-        "prompt": "Red-team and strengthen this drafted child resolution blueprint.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\nDraft child blueprint JSON: {{draft.output.blueprint_json}}\nDraft notes JSON: {{draft.output_json}}\n\nAssume the draft may trust weak sources, miss ambiguity, or have brittle fallbacks. Strengthen reliability and boundedness, and return the full revised child blueprint JSON string in blueprint_json.",
+        "prompt": "Red-team and strengthen this drafted child resolution blueprint.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nLive context JSON: {{inputs.market.context_json}}\nSuggested sources JSON: {{inputs.market.sources_json}}\nAllowed child node types JSON: {{inputs.yolo.allowed_node_types_json}}\nExample catalog JSON: {{inputs.yolo.examples_json}}\nSource pack catalog JSON: {{inputs.yolo.source_packs_json}}\nDraft child blueprint JSON: {{results.draft.output.blueprint_json}}\nDraft notes JSON: {{results.draft.output_json}}\n\nAssume the draft may trust weak sources, miss ambiguity, or have brittle fallbacks. Strengthen reliability and boundedness, and return the full revised child blueprint JSON string in blueprint_json.",
         "output_tool": {
           "parameters": {
             "type": "object",
@@ -78,8 +78,8 @@
       "type": "cel_eval",
       "config": {
         "expressions": {
-          "blueprint_json": "repair.output_json.blueprint_json != '' ? repair.output_json.blueprint_json : redteam.output_json.blueprint_json",
-          "source": "repair.output_json.blueprint_json != '' ? 'repair' : 'redteam'"
+          "blueprint_json": "results.repair.output_json.blueprint_json != '' ? results.repair.output_json.blueprint_json : results.redteam.output_json.blueprint_json",
+          "source": "results.repair.output_json.blueprint_json != '' ? 'repair' : 'redteam'"
         }
       }
     },
@@ -87,7 +87,7 @@
       "id": "validate",
       "type": "validate_blueprint",
       "config": {
-        "blueprint_json_key": "candidate.blueprint_json"
+        "blueprint_json_key": "results.candidate.blueprint_json"
       }
     },
     {
@@ -99,7 +99,7 @@
         "output_mode": "structured",
         "max_steps": 6,
         "max_tool_calls": 4,
-        "prompt": "Repair this child resolution blueprint so it passes validation.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nResolution rules: {{market.resolution_rules}}\nLive context JSON: {{market.context_json}}\nSuggested sources JSON: {{market.sources_json}}\nAllowed child node types JSON: {{yolo.allowed_node_types_json}}\nExample catalog JSON: {{yolo.examples_json}}\nSource pack catalog JSON: {{yolo.source_packs_json}}\nCurrent child blueprint JSON: {{candidate.blueprint_json}}\nValidation issues JSON: {{validate.issues_json}}\nValidation issues text:\n{{validate.issues_text}}\n\nFix only what is necessary, preserve conservative fallbacks, and return the full repaired child blueprint JSON string in blueprint_json.",
+        "prompt": "Repair this child resolution blueprint so it passes validation.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nLive context JSON: {{inputs.market.context_json}}\nSuggested sources JSON: {{inputs.market.sources_json}}\nAllowed child node types JSON: {{inputs.yolo.allowed_node_types_json}}\nExample catalog JSON: {{inputs.yolo.examples_json}}\nSource pack catalog JSON: {{inputs.yolo.source_packs_json}}\nCurrent child blueprint JSON: {{results.candidate.blueprint_json}}\nValidation issues JSON: {{results.validate.issues_json}}\nValidation issues text:\n{{results.validate.issues_text}}\n\nFix only what is necessary, preserve conservative fallbacks, and return the full repaired child blueprint JSON string in blueprint_json.",
         "output_tool": {
           "parameters": {
             "type": "object",
@@ -125,16 +125,15 @@
       "id": "run_child",
       "type": "gadget",
       "config": {
-        "blueprint_json_key": "candidate.blueprint_json",
-        "propagate_terminal": true,
+        "blueprint_json_key": "results.candidate.blueprint_json",
         "timeout_seconds": 600,
         "max_depth": 1,
         "input_mappings": {
-          "market.question": "market.question",
-          "market.outcomes_json": "market.outcomes_json",
-          "market.resolution_rules": "market.resolution_rules",
-          "market.context_json": "market.context_json",
-          "market.sources_json": "market.sources_json"
+          "market.question": "inputs.market.question",
+          "market.outcomes_json": "inputs.market.outcomes_json",
+          "market.resolution_rules": "inputs.market.resolution_rules",
+          "market.context_json": "inputs.market.context_json",
+          "market.sources_json": "inputs.market.sources_json"
         },
         "dynamic_blueprint_policy": {
           "allowed_node_types": [
@@ -142,8 +141,7 @@
             "llm_call",
             "agent_loop",
             "wait",
-            "defer_resolution",
-            "submit_result",
+            "return",
             "cel_eval",
             "map"
           ],
@@ -152,30 +150,35 @@
           "max_depth": 1,
           "max_total_time_seconds": 600,
           "max_total_tokens": 120000,
-          "allow_agent_loop": true,
-          "allow_terminal_nodes": true
+          "allow_agent_loop": true
         }
       }
     },
     {
-      "id": "submit",
-      "type": "submit_result",
+      "id": "return_result",
+      "type": "return",
       "config": {
-        "outcome_key": "run_child.outcome"
+        "from_key": "results.run_child.return_json"
       }
     },
     {
       "id": "defer_invalid",
-      "type": "defer_resolution",
+      "type": "return",
       "config": {
-        "reason": "The generated child blueprint could not be validated within the repair budget."
+        "value": {
+          "status": "deferred",
+          "reason": "The generated child blueprint could not be validated within the repair budget."
+        }
       }
     },
     {
       "id": "defer_runtime",
-      "type": "defer_resolution",
+      "type": "return",
       "config": {
-        "reason": "The generated child blueprint did not produce a conclusive bounded resolution."
+        "value": {
+          "status": "deferred",
+          "reason": "The generated child blueprint did not produce a conclusive bounded resolution."
+        }
       }
     }
   ],
@@ -195,12 +198,12 @@
     {
       "from": "validate",
       "to": "run_child",
-      "condition": "validate.valid == 'true'"
+      "condition": "results.validate.valid == 'true'"
     },
     {
       "from": "validate",
       "to": "repair",
-      "condition": "validate.valid != 'true' && size(validate._runs) < 2"
+      "condition": "results.validate.valid != 'true' && size(results.validate.history) < 2"
     },
     {
       "from": "repair",
@@ -210,17 +213,17 @@
     {
       "from": "validate",
       "to": "defer_invalid",
-      "condition": "validate.valid != 'true' && size(validate._runs) >= 2"
+      "condition": "results.validate.valid != 'true' && size(results.validate.history) >= 2"
     },
     {
       "from": "run_child",
-      "to": "submit",
-      "condition": "run_child.submitted == 'true'"
+      "to": "return_result",
+      "condition": "results.run_child.status == 'success' && results.run_child.run_status == 'completed'"
     },
     {
       "from": "run_child",
       "to": "defer_runtime",
-      "condition": "run_child.deferred == 'true' || run_child.status != 'success' || run_child.submitted != 'true'"
+      "condition": "results.run_child.status != 'success' || results.run_child.run_status != 'completed'"
     }
   ],
   "budget": {

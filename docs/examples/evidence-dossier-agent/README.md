@@ -12,8 +12,8 @@ The agent can:
 ```mermaid
 flowchart LR
   resolver["Evidence Resolver<br/>agent_loop"]
-  submit["Submit Resolution<br/>submit_result"]
-  cancel["Cancel Market<br/>cancel_market"]
+  submit["Submit Resolution<br/>return"]
+  cancel["Cancel Market<br/>return"]
 
   resolver -->|"resolved outcome"| submit
   resolver -->|"inconclusive or failed"| cancel

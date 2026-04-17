@@ -16,11 +16,37 @@ type mockExecutor struct {
 	err     error
 }
 
-func (m *mockExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (m *mockExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	if m.err != nil {
 		return dag.ExecutorResult{}, m.err
 	}
 	return dag.ExecutorResult{Outputs: m.outputs}, nil
+}
+
+// testResultValue reads `<nodeID>.<field>` from a RunState's Results.
+func testResultValue(run *dag.RunState, nodeID, field string) string {
+	if run == nil || run.Results == nil {
+		return ""
+	}
+	v, _ := run.Results.Get(nodeID, field)
+	return v
+}
+
+// testResultHistoryJSON returns the back-edge history of a node as a JSON
+// array string. Empty string when there is no history.
+func testResultHistoryJSON(run *dag.RunState, nodeID string) string {
+	if run == nil || run.Results == nil {
+		return ""
+	}
+	history := run.Results.History(nodeID)
+	if len(history) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(history)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // runBlueprintSync executes a blueprint JSON payload through the runner's

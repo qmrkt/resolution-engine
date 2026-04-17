@@ -38,6 +38,34 @@ type APIFetchExecutor struct {
 	AllowLocal bool // For testing only — allows localhost URLs
 }
 
+func (*APIFetchExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "required": ["url"],
+  "properties": {
+    "url": {"type": "string", "format": "uri", "description": "Absolute URL. Localhost/private IPs are blocked outside tests."},
+    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+    "body": {"type": "string", "description": "Request body. Interpolation applies (e.g. {{inputs.market.question}})."},
+    "basic_auth": {
+      "type": "object",
+      "properties": {
+        "username": {"type": "string"},
+        "password": {"type": "string"}
+      }
+    },
+    "json_path": {"type": "string", "description": "Dot-notation path into the response JSON. Empty returns the raw body."},
+    "outcome_mapping": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Maps the extracted value to an outcome index (as a string)."},
+    "timeout_seconds": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false
+}`)
+}
+
+func (*APIFetchExecutor) OutputKeys() []string {
+	return []string{"status", "outcome", "raw", "json_path_value", "error", "http_status"}
+}
+
 const maxResponseBytes int64 = MaxAPIResponseBytes
 
 var supportedAPIFetchMethods = map[string]struct{}{
@@ -111,13 +139,13 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 	return nil, fmt.Errorf("no safe IP addresses for %q", host)
 }
 
-func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	cfg, err := ParseConfig[APIFetchConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("api_fetch config: %w", err)
 	}
 
-	rawURL := execCtx.Interpolate(cfg.URL)
+	rawURL := inv.Interpolate(cfg.URL)
 	method, err := NormalizeAPIFetchMethod(cfg.Method)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("api_fetch config: %w", err)
@@ -141,7 +169,7 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	requestBody := execCtx.Interpolate(cfg.Body)
+	requestBody := inv.Interpolate(cfg.Body)
 	var bodyReader io.Reader
 	if requestBody != "" {
 		bodyReader = strings.NewReader(requestBody)
@@ -152,10 +180,10 @@ func (e *APIFetchExecutor) Execute(ctx context.Context, node dag.NodeDef, execCt
 		return dag.ExecutorResult{}, fmt.Errorf("create request: %w", err)
 	}
 	if cfg.BasicAuth != nil {
-		req.SetBasicAuth(execCtx.Interpolate(cfg.BasicAuth.Username), execCtx.Interpolate(cfg.BasicAuth.Password))
+		req.SetBasicAuth(inv.Interpolate(cfg.BasicAuth.Username), inv.Interpolate(cfg.BasicAuth.Password))
 	}
 	for k, v := range cfg.Headers {
-		req.Header.Set(k, execCtx.Interpolate(v))
+		req.Header.Set(k, inv.Interpolate(v))
 	}
 
 	client := e.Client

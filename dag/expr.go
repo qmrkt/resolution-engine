@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
@@ -37,30 +38,145 @@ type exprPlan struct {
 	candidates  []string // identifiers + every dotted prefix, for a single GetMulti call
 }
 
-// EvalCondition evaluates a CEL expression against context values and returns
+// EvalCondition evaluates a CEL expression against the invocation and returns
 // the result as a boolean.
-func EvalCondition(expression string, ctx *Context) (bool, error) {
-	val, err := evalCEL(expression, ctx)
+func EvalCondition(expression string, inv *Invocation) (bool, error) {
+	val, err := evalCEL(expression, invocationCELGetter(inv))
 	if err != nil {
 		return false, err
 	}
 	return celToBool(val), nil
 }
 
-// EvalExpression evaluates a CEL expression against context values and returns
+// EvalExpression evaluates a CEL expression against the invocation and returns
 // the result as a string.
-func EvalExpression(expression string, ctx *Context) (string, error) {
-	val, err := evalCEL(expression, ctx)
+func EvalExpression(expression string, inv *Invocation) (string, error) {
+	val, err := evalCEL(expression, invocationCELGetter(inv))
 	if err != nil {
 		return "", err
 	}
 	return celToString(val), nil
 }
 
+// celGetter resolves a namespaced CEL variable by exact key. Returns the
+// value and whether the key exists (matches the "present but empty vs
+// absent" distinction evalCEL needs for type inference).
+//
+// Replaces the previous eager flattenInvocationForCEL: evalCEL only calls
+// the getter for keys its plan actually references, so we never walk the
+// full invocation keyspace on hot edge-condition paths.
+type celGetter func(key string) (string, bool)
+
+// invocationCELGetter returns a getter that resolves namespaced CEL paths
+// directly against an invocation:
+//
+//	inputs.<key>            — caller input
+//	results.<node>.<field>  — recorded node output
+//	results.<node>.history  — back-edge history as JSON array
+//	run.id | run.blueprint_id | run.started_at
+//
+// Anything outside these forms returns ("", false) so CEL declares the
+// ident as an empty string (the previous flatten-then-filter behavior).
+func invocationCELGetter(inv *Invocation) celGetter {
+	if inv == nil {
+		return func(string) (string, bool) { return "", false }
+	}
+	return func(key string) (string, bool) {
+		switch key {
+		case "run.id":
+			return inv.Run.ID, true
+		case "run.blueprint_id":
+			return inv.Run.BlueprintID, true
+		case "run.started_at":
+			if inv.Run.StartedAt.IsZero() {
+				return "", false
+			}
+			return inv.Run.StartedAt.UTC().Format(time.RFC3339Nano), true
+		}
+		if strings.HasPrefix(key, "inputs.") {
+			v, ok := inv.Run.Inputs[strings.TrimPrefix(key, "inputs.")]
+			return v, ok
+		}
+		if strings.HasPrefix(key, "results.") {
+			rest := strings.TrimPrefix(key, "results.")
+			dot := strings.Index(rest, ".")
+			if dot < 0 {
+				return "", false
+			}
+			nodeID := rest[:dot]
+			field := rest[dot+1:]
+			if field == "history" {
+				history := inv.Results.History(nodeID)
+				if len(history) == 0 {
+					return "", false
+				}
+				data, err := json.Marshal(history)
+				if err != nil {
+					return "", false
+				}
+				return string(data), true
+			}
+			return inv.Results.Get(nodeID, field)
+		}
+		return "", false
+	}
+}
+
+// mapCELGetter wraps a pre-built flat map for callers and tests that
+// already materialized the keyspace (fuzz tests, backward-compat wrappers).
+// New code should prefer invocationCELGetter to avoid the eager flatten.
+func mapCELGetter(m map[string]string) celGetter {
+	return func(key string) (string, bool) {
+		v, ok := m[key]
+		return v, ok
+	}
+}
+
+// FlattenInvocation materializes the namespaced keyspace of an invocation
+// for observability snapshots (NodeTrace.InputSnapshot). Keys match the
+// CEL evaluation shape:
+//
+//	inputs.<key>
+//	results.<node>.<field>
+//	results.<node>.history          — JSON-encoded back-edge history
+//	run.id | run.blueprint_id | run.started_at
+//
+// This is the single canonical flatten shape for the engine. CEL eval uses
+// the lazy invocationCELGetter instead — only trace recording needs the
+// full map, and that's a per-node cost, not per-edge-condition.
+func FlattenInvocation(inv *Invocation) map[string]string {
+	if inv == nil {
+		return map[string]string{}
+	}
+	flat := make(map[string]string, len(inv.Run.Inputs)+8)
+	for k, v := range inv.Run.Inputs {
+		flat["inputs."+k] = v
+	}
+	for _, nodeID := range inv.Results.NodeIDs() {
+		for field, value := range inv.Results.OfNode(nodeID) {
+			flat["results."+nodeID+"."+field] = value
+		}
+		history := inv.Results.History(nodeID)
+		if len(history) > 0 {
+			if data, err := json.Marshal(history); err == nil {
+				flat["results."+nodeID+".history"] = string(data)
+			}
+		}
+	}
+	flat["run.id"] = inv.Run.ID
+	flat["run.blueprint_id"] = inv.Run.BlueprintID
+	if !inv.Run.StartedAt.IsZero() {
+		flat["run.started_at"] = inv.Run.StartedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return flat
+}
+
 // evalCEL is the shared CEL evaluation core. It resolves only the variables
-// the expression actually references, builds a typed activation, and caches
-// the compiled program by (expression, observed type signature).
-func evalCEL(expression string, ctx *Context) (ref.Val, error) {
+// the expression actually references through the getter, builds a typed
+// activation, and caches the compiled program by (expression, observed type
+// signature). The getter indirection keeps evaluation lazy — no eager
+// flatten of the whole invocation keyspace on every edge condition.
+func evalCEL(expression string, get celGetter) (ref.Val, error) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" {
 		return nil, fmt.Errorf("empty expression")
@@ -68,8 +184,17 @@ func evalCEL(expression string, ctx *Context) (ref.Val, error) {
 
 	plan := getOrBuildPlan(expression)
 
-	// One-shot, lock-consistent read of every key the expression might need.
-	raw := ctx.GetMulti(plan.candidates)
+	// Resolve only the candidate keys through the getter. Preserves the
+	// previous "present-but-empty vs missing" distinction via the (string, bool)
+	// return.
+	raw := make(map[string]string, len(plan.candidates))
+	if get != nil {
+		for _, key := range plan.candidates {
+			if v, ok := get(key); ok {
+				raw[key] = v
+			}
+		}
+	}
 
 	varDecls, activation, varSig := buildActivation(plan.identifiers, raw)
 
@@ -301,6 +426,15 @@ func celToString(val ref.Val) string {
 		}
 		return string(data)
 	}
+}
+
+// ExtractIdentifiers returns the free identifiers referenced in a CEL-style
+// expression, skipping CEL reserved words, numeric prefixes, and trailing
+// CEL method calls on dotted paths (e.g. "fetch.raw.size" → "fetch.raw").
+// Used by edge-condition diagnostics to flag references to unknown node
+// outputs.
+func ExtractIdentifiers(expression string) []string {
+	return extractIdentifiers(expression, nil)
 }
 
 func extractIdentifiers(expression string, known map[string]string) []string {

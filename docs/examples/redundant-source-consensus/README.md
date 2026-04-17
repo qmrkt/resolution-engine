@@ -15,8 +15,8 @@ This is a template seed. In production, the map child should receive per-item fi
 flowchart LR
   sources["Fetch Sources<br/>map(api_fetch)"]
   consensus["Consensus Judge<br/>agent_loop"]
-  submit["Submit Outcome<br/>submit_result"]
-  cancel["Cancel Market<br/>cancel_market"]
+  submit["Submit Outcome<br/>return"]
+  cancel["Cancel Market<br/>return"]
 
   sources --> consensus
   consensus -->|"coherent outcome"| submit

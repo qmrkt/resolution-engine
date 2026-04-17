@@ -4,21 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/qmrkt/resolution-engine/dag"
 )
 
 const agentRoleUser = "user"
 
-// AgentLoopExecutor runs a model-driven tool-calling loop inside a blueprint node.
+// AgentLoopExecutor runs a model-driven tool-calling loop inside a blueprint
+// node. Async mode (AgentLoopConfig.Async) dispatches the chat loop on a
+// goroutine, returns a dag.Suspension, and resumes the waiting node via
+// signalFn. See CancelCorrelation for the registry used by back-edge reset
+// and run-level cancellation.
 type AgentLoopExecutor struct {
 	client                *agentProviderClient
 	engine                *dag.Engine
 	AllowLocalSourceFetch bool
+
+	signalMu sync.RWMutex
+	signalFn AgentSignalFn
+
+	asyncBaseMu  sync.RWMutex
+	asyncBaseCtx context.Context
+
+	// cancellers maps correlation key → context.CancelFunc for in-flight
+	// async goroutines. Populated by dispatchAsync, cleared by the
+	// goroutine on natural completion, and invoked externally via
+	// CancelCorrelation when the engine needs to stop a superseded run.
+	cancellersMu sync.Mutex
+	cancellers   map[string]agentAsyncCanceller
 }
 
 type agentLoopSettings struct {
@@ -31,6 +50,11 @@ type agentLoopSettings struct {
 	toolTimeout        time.Duration
 	outputMode         string
 	outputToolName     string
+}
+
+type agentAsyncCanceller struct {
+	runID  string
+	cancel context.CancelFunc
 }
 
 type agentOutputSpec struct {
@@ -50,11 +74,7 @@ type agentResolutionOutput struct {
 }
 
 func (o agentResolutionOutput) confidenceString() string {
-	s := strings.Trim(string(o.Confidence), "\"")
-	if s == "" || s == "null" {
-		return "medium"
-	}
-	return s
+	return normalizeConfidenceString(o.Confidence)
 }
 
 // NewAgentLoopExecutorWithConfig creates an agent loop executor using the same
@@ -66,7 +86,210 @@ func NewAgentLoopExecutorWithConfig(cfg LLMCallExecutorConfig, engine *dag.Engin
 	}
 }
 
-func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+// SetSignalFn installs the callback used by async agent goroutines to deliver
+// their final outputs. Unset signalFn causes async dispatch to fail at request
+// time rather than silently drop results.
+func (e *AgentLoopExecutor) SetSignalFn(fn AgentSignalFn) {
+	if e == nil {
+		return
+	}
+	e.signalMu.Lock()
+	e.signalFn = fn
+	e.signalMu.Unlock()
+}
+
+func (e *AgentLoopExecutor) getSignalFn() AgentSignalFn {
+	e.signalMu.RLock()
+	defer e.signalMu.RUnlock()
+	return e.signalFn
+}
+
+// SetAsyncBaseContext installs the long-lived parent context for async agent
+// goroutines so manager shutdown cancels in-flight detached requests.
+func (e *AgentLoopExecutor) SetAsyncBaseContext(ctx context.Context) {
+	if e == nil {
+		return
+	}
+	e.asyncBaseMu.Lock()
+	e.asyncBaseCtx = ctx
+	e.asyncBaseMu.Unlock()
+}
+
+func (e *AgentLoopExecutor) getAsyncBaseContext() context.Context {
+	e.asyncBaseMu.RLock()
+	defer e.asyncBaseMu.RUnlock()
+	if e.asyncBaseCtx == nil {
+		return context.Background()
+	}
+	return e.asyncBaseCtx
+}
+
+func (e *AgentLoopExecutor) registerCanceller(runID, correlationKey string, cancel context.CancelFunc) {
+	if runID == "" || correlationKey == "" || cancel == nil {
+		return
+	}
+	e.cancellersMu.Lock()
+	if e.cancellers == nil {
+		e.cancellers = make(map[string]agentAsyncCanceller)
+	}
+	e.cancellers[correlationKey] = agentAsyncCanceller{runID: runID, cancel: cancel}
+	e.cancellersMu.Unlock()
+}
+
+// releaseCanceller removes the entry without invoking the cancel func.
+// Paired with natural goroutine completion.
+func (e *AgentLoopExecutor) releaseCanceller(correlationKey string) {
+	if correlationKey == "" {
+		return
+	}
+	e.cancellersMu.Lock()
+	delete(e.cancellers, correlationKey)
+	e.cancellersMu.Unlock()
+}
+
+// InFlightCount returns the number of async agent goroutines whose cancel
+// hooks are currently registered. Best-effort snapshot under concurrent
+// mutation; intended for tests and introspection.
+func (e *AgentLoopExecutor) InFlightCount() int {
+	if e == nil {
+		return 0
+	}
+	e.cancellersMu.Lock()
+	defer e.cancellersMu.Unlock()
+	return len(e.cancellers)
+}
+
+// drainCancellers atomically removes every registered canceller that matches
+// the predicate and returns their cancel funcs. The caller invokes the cancel
+// funcs outside the registry lock so a slow cancel can't block concurrent
+// register/release operations.
+func (e *AgentLoopExecutor) drainCancellers(match func(agentAsyncCanceller) bool) []context.CancelFunc {
+	e.cancellersMu.Lock()
+	defer e.cancellersMu.Unlock()
+	cancels := make([]context.CancelFunc, 0, len(e.cancellers))
+	for correlationKey, entry := range e.cancellers {
+		if !match(entry) {
+			continue
+		}
+		delete(e.cancellers, correlationKey)
+		cancels = append(cancels, entry.cancel)
+	}
+	return cancels
+}
+
+func invokeAll(cancels []context.CancelFunc) int {
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return len(cancels)
+}
+
+// CancelCorrelation cancels the in-flight async goroutine keyed by
+// correlationKey. Safe to call with unknown keys (no-op). Returns true if a
+// cancel was triggered.
+func (e *AgentLoopExecutor) CancelCorrelation(correlationKey string) bool {
+	if e == nil || correlationKey == "" {
+		return false
+	}
+	e.cancellersMu.Lock()
+	entry, ok := e.cancellers[correlationKey]
+	if ok {
+		delete(e.cancellers, correlationKey)
+	}
+	e.cancellersMu.Unlock()
+	if !ok {
+		return false
+	}
+	entry.cancel()
+	return true
+}
+
+// CancelRun cancels every in-flight async goroutine associated with runID.
+// Closes the pre-persist window where Cancel(runID) can race ahead of the
+// waiting entry reaching durable state.
+func (e *AgentLoopExecutor) CancelRun(runID string) int {
+	if e == nil || runID == "" {
+		return 0
+	}
+	return invokeAll(e.drainCancellers(func(entry agentAsyncCanceller) bool {
+		return entry.runID == runID
+	}))
+}
+
+// CancelAll cancels every registered async goroutine. Intended for durable
+// manager shutdown.
+func (e *AgentLoopExecutor) CancelAll() int {
+	if e == nil {
+		return 0
+	}
+	return invokeAll(e.drainCancellers(func(agentAsyncCanceller) bool { return true }))
+}
+
+// CanSuspend reports whether the agent_loop node would dispatch async. Only
+// configs with async=true return a Suspension; the default synchronous path
+// completes in-place and is safe for inline sub-blueprints.
+func (e *AgentLoopExecutor) CanSuspend(node dag.NodeDef) bool {
+	cfg, err := ParseConfig[AgentLoopConfig](node.Config)
+	if err != nil {
+		return false
+	}
+	return cfg.Async
+}
+
+func (*AgentLoopExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "required": ["prompt"],
+  "properties": {
+    "provider": {"type": "string", "enum": ["anthropic", "openai", "google"]},
+    "model": {"type": "string"},
+    "system_prompt": {"type": "string"},
+    "prompt": {"type": "string", "description": "User prompt. Supports {{key}} interpolation from the shared context."},
+    "timeout_seconds": {"type": "integer", "minimum": 0},
+    "tool_timeout_seconds": {"type": "integer", "minimum": 0},
+    "max_steps": {"type": "integer", "minimum": 0},
+    "max_tool_calls": {"type": "integer", "minimum": 0},
+    "max_tool_result_bytes": {"type": "integer", "minimum": 0},
+    "tool_result_history": {"type": "integer", "minimum": 1},
+    "max_history_messages": {"type": "integer", "minimum": 2},
+    "max_tokens": {"type": "integer", "minimum": 0},
+    "reasoning": {"type": "string", "description": "Provider-specific reasoning level (e.g. \"low\", \"medium\", \"high\")."},
+    "output_mode": {"type": "string", "enum": ["text", "structured", "resolution"], "default": "text", "description": "text returns free-form. structured requires output_tool.parameters. resolution uses the canonical resolution schema."},
+    "output_tool": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "parameters": {"type": "object", "description": "JSON Schema for the structured output. Required when output_mode is structured."}
+      }
+    },
+    "tools": {"type": "array", "items": {"type": "object", "description": "AgentToolConfig: name, kind (builtin|blueprint), inline blueprint, builtin id, parameters schema."}},
+    "context_allowlist": {"type": "array", "items": {"type": "string"}, "description": "Context keys the agent's tools may read. When empty, defaults to all non-internal keys."},
+    "allowed_outcomes_key": {"type": "string"},
+    "enable_dynamic_blueprints": {"type": "boolean", "description": "Allow the run_blueprint builtin tool. Off by default."},
+    "dynamic_blueprint_policy": {"type": "object"},
+    "async": {"type": "boolean", "description": "When true, dispatches the chat loop on a goroutine and returns a signal suspension. Only valid under the durable engine."}
+  },
+  "additionalProperties": false
+}`)
+}
+
+func (*AgentLoopExecutor) OutputKeys() []string {
+	// Shared across modes: status, error, diagnostics. Mode-specific keys:
+	// text: summary, text. structured: output_json, raw, output.<key> (dynamic).
+	// resolution: outcome, resolution_status, confidence, reasoning,
+	// output_json, raw, citations_json, citations_count.
+	return []string{
+		"status", "error", "outcome",
+		"summary", "text",
+		"output_json", "raw",
+		"resolution_status", "confidence", "reasoning",
+		"citations_json", "citations_count",
+		"tool_calls_count", "tool_calls_json", "steps_json", "transcript_tail",
+	}
+}
+
+func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	if e == nil || e.client == nil {
 		return dag.ExecutorResult{}, fmt.Errorf("agent_loop executor is not configured")
 	}
@@ -82,7 +305,7 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, execC
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
-	allowedOutcomes, err := allowedOutcomesFromContext(execCtx, cfg.AllowedOutcomesKey)
+	allowedOutcomes, err := allowedOutcomesFromContext(inv, cfg.AllowedOutcomesKey)
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
@@ -91,7 +314,7 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, execC
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
-	registry, err := e.buildToolRegistry(cfg, outputSpec, execCtx)
+	registry, err := e.buildToolRegistry(cfg, outputSpec, inv)
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
@@ -100,20 +323,136 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, execC
 	if timeout <= 0 {
 		timeout = time.Duration(defaultAgentLoopTimeoutSeconds) * time.Second
 	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
-	prompt := execCtx.Interpolate(cfg.Prompt)
-	system := buildAgentSystemPrompt(execCtx.Interpolate(cfg.SystemPrompt), outputSpec, allowedOutcomes)
+	prompt := inv.Interpolate(cfg.Prompt)
+	system := buildAgentSystemPrompt(inv.Interpolate(cfg.SystemPrompt), outputSpec, allowedOutcomes)
 
-	return e.runLoop(runCtx, agentProviderRequest{
+	req := agentProviderRequest{
 		Provider:  provider,
 		Model:     model,
 		System:    system,
 		Tools:     registry.defs(),
 		MaxTokens: settings.maxTokens,
 		Reasoning: cfg.Reasoning,
-	}, prompt, registry, settings, allowedOutcomes), nil
+	}
+
+	if cfg.Async {
+		return e.dispatchAsync(ctx, node, inv, req, prompt, registry, settings, allowedOutcomes, timeout)
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return e.runLoop(runCtx, req, prompt, registry, settings, allowedOutcomes), nil
+}
+
+// dispatchAsync spawns the chat loop on a goroutine and returns a signal-based
+// suspension. The goroutine posts the final outputs back through signalFn,
+// keyed on a per-invocation correlation key so stale results from a prior
+// iteration (back-edge re-entry) are rejected by the durable manager's
+// signal matcher.
+func (e *AgentLoopExecutor) dispatchAsync(
+	ctx context.Context,
+	node dag.NodeDef,
+	inv *dag.Invocation,
+	req agentProviderRequest,
+	prompt string,
+	registry *agentToolRegistry,
+	settings agentLoopSettings,
+	allowedOutcomes []string,
+	timeout time.Duration,
+) (dag.ExecutorResult, error) {
+	signalFn := e.getSignalFn()
+	if signalFn == nil {
+		return failureResult("agent_loop async requires a configured signal sink"), nil
+	}
+	runID := strings.TrimSpace(inv.Run.ID)
+	if runID == "" {
+		return failureResult("agent_loop async requires a non-empty Invocation.Run.ID"), nil
+	}
+
+	correlationKey := AutoCorrelationKey("", node.ID, inv) + ":" + uuid.NewString()
+
+	// The dispatched goroutine owns its own context — detached from the
+	// executor's ctx, which will be cancelled when Execute returns. Without
+	// detaching, the chat loop would be cancelled the moment we suspend.
+	// Cancellation reaches the goroutine via (a) the per-invocation timeout
+	// below, (b) CancelCorrelation / CancelRun triggered by the durable
+	// manager, and (c) manager shutdown through asyncBaseCtx.
+	goroutineCtx, cancelGoroutine := context.WithTimeout(e.getAsyncBaseContext(), timeout)
+	e.registerCanceller(runID, correlationKey, cancelGoroutine)
+
+	// Capture goroutine-independent state so the closure doesn't race with
+	// callers who might mutate inv after suspension.
+	reqCopy := req
+	settingsCopy := settings
+	allowed := append([]string(nil), allowedOutcomes...)
+
+	go func() {
+		defer func() {
+			cancelGoroutine()
+			e.releaseCanceller(correlationKey)
+		}()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Default().Error(
+					"async agent_loop panicked",
+					"node", node.ID,
+					"run", runID,
+					"panic", fmt.Sprintf("%v", r),
+				)
+				payload := map[string]string{
+					"status": "failed",
+					"error":  fmt.Sprintf("agent panicked: %v", r),
+				}
+				_ = signalFn(runID, correlationKey, payload, dag.TokenUsage{})
+			}
+		}()
+		result := e.runLoop(goroutineCtx, reqCopy, prompt, registry, settingsCopy, allowed)
+		// If the goroutine context was cancelled externally (back-edge
+		// reset or run cancel), drop the result on the floor — the
+		// waiting entry it belonged to is already gone and the
+		// correlation key will no longer match.
+		if goroutineCtx.Err() != nil {
+			slog.Default().Info(
+				"async agent_loop cancelled in flight",
+				"node", node.ID,
+				"run", runID,
+				"cause", goroutineCtx.Err(),
+			)
+			return
+		}
+		payload := make(map[string]string, len(result.Outputs))
+		for k, v := range result.Outputs {
+			payload[k] = v
+		}
+		if payload["status"] == "" {
+			payload["status"] = "success"
+		}
+		if err := signalFn(runID, correlationKey, payload, result.Usage); err != nil {
+			slog.Default().Warn(
+				"async agent_loop signal delivery failed",
+				"node", node.ID,
+				"run", runID,
+				"error", err,
+			)
+		}
+	}()
+
+	return dag.ExecutorResult{
+		Suspend: &dag.Suspension{
+			Kind:           dag.SuspensionKindSignal,
+			Reason:         "agent_loop async",
+			RecoveryOwner:  AgentLoopRecoveryOwner,
+			SignalType:     AgentDoneSignalType,
+			CorrelationKey: correlationKey,
+			ResumeAtUnix:   time.Now().Add(timeout).Unix(),
+			TimeoutOutputs: map[string]string{
+				"status":  "failed",
+				"error":   "agent_loop async timeout",
+				"outcome": "inconclusive",
+			},
+		},
+	}, nil
 }
 
 func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutputSpec, error) {
@@ -206,9 +545,9 @@ func buildResolutionOutputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"status":{"type":"string","enum":["success","inconclusive"],"description":"Use success when an outcome is determined, otherwise inconclusive."},"outcome_index":{"type":"integer","description":"Zero-based selected outcome index, or -1 when status is inconclusive."},"confidence":{"type":"string","enum":["high","medium","low"]},"reasoning":{"type":"string"},"citations":{"type":"array","items":{"type":"string"}}},"required":["outcome_index","confidence","reasoning"],"additionalProperties":false}`)
 }
 
-func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec agentOutputSpec, execCtx *dag.Context) (*agentToolRegistry, error) {
+func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec agentOutputSpec, inv *dag.Invocation) (*agentToolRegistry, error) {
 	registry := newAgentToolRegistry()
-	access := newContextAccess(execCtx, cfg.ContextAllowlist)
+	access := newContextAccess(inv, cfg.ContextAllowlist)
 
 	if len(cfg.Tools) == 0 {
 		for _, builtin := range []string{
@@ -217,13 +556,13 @@ func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec ag
 			AgentBuiltinSourceFetch,
 			AgentBuiltinJSONExtract,
 		} {
-			if err := registry.register(e.newBuiltinTool(builtin, AgentToolConfig{Name: builtin}, access, cfg, execCtx)); err != nil {
+			if err := registry.register(e.newBuiltinTool(builtin, AgentToolConfig{Name: builtin}, access, cfg, inv)); err != nil {
 				return nil, err
 			}
 		}
 	} else {
 		for _, toolCfg := range cfg.Tools {
-			tool, err := e.newConfiguredTool(toolCfg, access, cfg, execCtx)
+			tool, err := e.newConfiguredTool(toolCfg, access, cfg, inv)
 			if err != nil {
 				return nil, err
 			}
@@ -238,7 +577,7 @@ func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec ag
 			policy := defaultDynamicBlueprintPolicy(cfg.DynamicBlueprintPolicy)
 			if err := registry.register(&dynamicBlueprintTool{
 				engine:    e.engine,
-				parentCtx: execCtx,
+				parentCtx: inv,
 				policy:    policy,
 			}); err != nil {
 				return nil, err
@@ -262,7 +601,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 	toolCfg AgentToolConfig,
 	access contextAccess,
 	agentCfg AgentLoopConfig,
-	execCtx *dag.Context,
+	inv *dag.Invocation,
 ) (agentTool, error) {
 	kind := strings.ToLower(strings.TrimSpace(toolCfg.Kind))
 	if kind == "" {
@@ -281,7 +620,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 		if builtin == AgentBuiltinRunBlueprint && !agentCfg.EnableDynamicBlueprint {
 			return nil, fmt.Errorf("builtin tool %q requires enable_dynamic_blueprints", builtin)
 		}
-		tool := e.newBuiltinTool(builtin, toolCfg, access, agentCfg, execCtx)
+		tool := e.newBuiltinTool(builtin, toolCfg, access, agentCfg, inv)
 		if missing, ok := tool.(*missingConfiguredTool); ok {
 			return nil, fmt.Errorf("unknown builtin tool %q", missing.builtin)
 		}
@@ -293,7 +632,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 		if e == nil || e.engine == nil {
 			return nil, fmt.Errorf("blueprint tool %q requires an engine", toolCfg.Name)
 		}
-		if err := validateBlueprintTool(toolCfg.Inline); err != nil {
+		if err := validateBlueprintTool(e.engine, toolCfg.Inline); err != nil {
 			return nil, fmt.Errorf("blueprint tool %q: %w", toolCfg.Name, err)
 		}
 		return &blueprintTool{
@@ -302,11 +641,10 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 			parameters:     toolCfg.Parameters,
 			inline:         toolCfg.Inline,
 			inputMappings:  toolCfg.InputMappings,
-			outputKeys:     toolCfg.OutputKeys,
 			timeoutSeconds: toolCfg.TimeoutSeconds,
 			maxDepth:       toolCfg.MaxDepth,
 			engine:         e.engine,
-			parentCtx:      execCtx,
+			parentCtx:      inv,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported agent tool kind %q", toolCfg.Kind)
@@ -318,7 +656,7 @@ func (e *AgentLoopExecutor) newBuiltinTool(
 	toolCfg AgentToolConfig,
 	access contextAccess,
 	agentCfg AgentLoopConfig,
-	execCtx *dag.Context,
+	inv *dag.Invocation,
 ) agentTool {
 	var tool agentTool
 	switch strings.TrimSpace(builtin) {
@@ -333,7 +671,7 @@ func (e *AgentLoopExecutor) newBuiltinTool(
 	case AgentBuiltinRunBlueprint:
 		tool = &dynamicBlueprintTool{
 			engine:    e.engine,
-			parentCtx: execCtx,
+			parentCtx: inv,
 			policy:    defaultDynamicBlueprintPolicy(agentCfg.DynamicBlueprintPolicy),
 		}
 	default:
@@ -345,12 +683,11 @@ func (e *AgentLoopExecutor) newBuiltinTool(
 func defaultDynamicBlueprintPolicy(policy *DynamicBlueprintPolicy) DynamicBlueprintPolicy {
 	if policy == nil {
 		return DynamicBlueprintPolicy{
-			AllowedNodeTypes:    []string{"api_fetch", "cel_eval", "wait"},
+			AllowedNodeTypes:    []string{"api_fetch", "cel_eval", "wait", "return"},
 			MaxNodes:            8,
 			MaxEdges:            12,
 			MaxDepth:            1,
 			MaxTotalTimeSeconds: 30,
-			AllowTerminalNodes:  false,
 			AllowAgentLoop:      false,
 		}
 	}

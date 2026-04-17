@@ -23,7 +23,7 @@ type durableStubbornExecutor struct {
 	outputs     map[string]string
 }
 
-func (e *durableStubbornExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *durableStubbornExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	select {
 	case e.started <- struct{}{}:
 	default:
@@ -118,7 +118,7 @@ func TestDurableStaleWorkerCannotOverwriteCancelledRun(t *testing.T) {
 		release: make(chan struct{}),
 		outputs: map[string]string{"status": "success", "outcome": "1"},
 	}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": stubborn,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -165,7 +165,7 @@ func TestDurableStaleWorkerCannotOverwriteCancelledRun(t *testing.T) {
 func TestDurableEventLogFailureDoesNotFailRun(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -177,8 +177,8 @@ func TestDurableEventLogFailureDoesNotFailRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := waitForDurableStatus(t, manager, "event-log-down", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	events, err := manager.store.loadEvents("event-log-down")
 	if err != nil {
@@ -192,7 +192,7 @@ func TestDurableEventLogFailureDoesNotFailRun(t *testing.T) {
 func TestDurableCheckpointSaveFailureAfterNodeCompletedFailsFromStoredCheckpoint(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -241,7 +241,7 @@ func TestDurableCallbackDeliverySaveFailureRetriesPost(t *testing.T) {
 	defer callback.Close()
 
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -289,11 +289,11 @@ func TestDurableCallbackDeliverySaveFailureRetriesPost(t *testing.T) {
 // timer save that raced with the worker. The worker must reload the fresh
 // record, re-apply its captured completion outcome, and persist — without
 // calling the executor a second time (which would be catastrophic for
-// non-idempotent executors like submit_result or external API calls).
+// non-idempotent executors that do real side effects, e.g. external API calls).
 func TestDurableWorkerRetriesStaleCompletionWithoutReExecutingNode(t *testing.T) {
 	tmpDir := t.TempDir()
 	counter := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": counter,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -317,8 +317,8 @@ func TestDurableWorkerRetriesStaleCompletionWithoutReExecutingNode(t *testing.T)
 		t.Fatal(err)
 	}
 	result := waitForDurableStatus(t, manager, "stale-completion", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	if got := counter.Count(); got != 1 {
 		t.Fatalf("executor run count = %d, want 1 — stale save forced a re-execution", got)

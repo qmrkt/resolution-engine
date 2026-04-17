@@ -22,21 +22,13 @@ type BlueprintValidationResult struct {
 	Issues []BlueprintValidationIssue `json:"issues"`
 }
 
-var terminalNodeTypes = map[string]struct{}{
-	"submit_result":    {},
-	"cancel_market":    {},
-	"defer_resolution": {},
-}
-
 var knownNodeTypes = map[string]struct{}{
 	"api_fetch":          {},
 	"llm_call":           {},
 	"agent_loop":         {},
 	"await_signal":       {},
 	"wait":               {},
-	"defer_resolution":   {},
-	"submit_result":      {},
-	"cancel_market":      {},
+	"return":             {},
 	"ask_creator":        {},
 	"ask_market_admin":   {},
 	"cel_eval":           {},
@@ -92,186 +84,207 @@ func ValidateResolutionBlueprint(bp dag.Blueprint, rawJSON []byte) BlueprintVali
 		}
 	}
 
-	cycleResult := detectBlueprintCycles(bp)
-	if cycleResult.hasCycles {
-		for _, backEdgeID := range cycleResult.backEdgeIDs {
-			for _, edge := range bp.Edges {
-				if edge.From+"->"+edge.To == backEdgeID && edge.MaxTraversals <= 0 {
-					add("BACK_EDGE_MISSING_MAX_TRAVERSALS", fmt.Sprintf("Loop edge %q must set max traversals.", backEdgeID), backEdgeID)
-				}
-			}
+	scheduler := dag.NewScheduler(bp)
+	for _, edge := range bp.Edges {
+		if scheduler.IsBackEdge(edge.From, edge.To) && edge.MaxTraversals <= 0 {
+			edgeID := edge.From + "->" + edge.To
+			add("BACK_EDGE_MISSING_MAX_TRAVERSALS", fmt.Sprintf("Loop edge %q must set max traversals.", edgeID), edgeID)
 		}
 	}
 
-	roots := getRootNodes(bp)
-	if len(roots) == 0 && len(bp.Nodes) > 0 {
-		add("NO_ROOT", "Blueprint needs at least one root node.", "")
+	for _, issue := range executors.ValidateReturnContract(bp) {
+		issues = append(issues, BlueprintValidationIssue{
+			Code:     issue.Code,
+			Message:  issue.Message,
+			Target:   issue.Target,
+			Severity: issue.Severity,
+		})
 	}
 
-	terminals := 0
+	validateEdgeReferences(bp, &issues)
+
+	valid := true
+	for _, issue := range issues {
+		if strings.TrimSpace(issue.Severity) != "warning" {
+			valid = false
+			break
+		}
+	}
+	return BlueprintValidationResult{Valid: valid, Issues: issues}
+}
+
+// validateEdgeReferences scans each edge condition for identifiers of the
+// form `nodeID.key` and flags references to output keys the target node's
+// executor does not declare. Adds a typo suggestion (Levenshtein-closest
+// known key) when the miss is close to a real one. Runs as a warning-level
+// heuristic: diagnostics surface at blueprint-validation time rather than
+// at edge-evaluation time deep inside a run.
+func validateEdgeReferences(bp dag.Blueprint, issues *[]BlueprintValidationIssue) {
+	nodeTypes := make(map[string]string, len(bp.Nodes))
 	for _, node := range bp.Nodes {
-		if isTerminalType(node.Type) {
-			terminals++
-		}
+		nodeTypes[node.ID] = node.Type
 	}
-	if terminals == 0 {
-		add("NO_TERMINAL_NODE", "Blueprint needs at least one terminal node.", "")
-	}
-
-	adjacency := buildAdjacency(bp)
-	reachable := make(map[string]struct{}, len(bp.Nodes))
-	queue := append([]string(nil), roots...)
-	for len(queue) > 0 {
-		nodeID := queue[0]
-		queue = queue[1:]
-		if _, seen := reachable[nodeID]; seen {
+	for _, edge := range bp.Edges {
+		cond := strings.TrimSpace(edge.Condition)
+		if cond == "" {
 			continue
 		}
-		reachable[nodeID] = struct{}{}
-		queue = append(queue, adjacency[nodeID]...)
-	}
-	for _, node := range bp.Nodes {
-		if len(roots) > 0 {
-			if _, ok := reachable[node.ID]; !ok {
-				add("UNREACHABLE_NODE", fmt.Sprintf("Node %q is unreachable from the graph roots.", displayNode(node)), node.ID)
+		edgeID := edge.From + "->" + edge.To
+		for _, ident := range dag.ExtractIdentifiers(cond) {
+			// Only `results.<node>.<field>` references can flag an unknown
+			// output key. Other namespaces (`inputs.`, `run.`) and bare
+			// identifiers don't address node outputs.
+			if !strings.HasPrefix(ident, "results.") {
+				continue
 			}
-		}
-	}
-
-	outgoingByNode := make(map[string][]dag.EdgeDef, len(bp.Nodes))
-	for _, node := range bp.Nodes {
-		outgoingByNode[node.ID] = nil
-	}
-	for _, edge := range bp.Edges {
-		outgoingByNode[edge.From] = append(outgoingByNode[edge.From], edge)
-	}
-	for _, node := range bp.Nodes {
-		outgoing := outgoingByNode[node.ID]
-		if isTerminalType(node.Type) {
-			if len(outgoing) > 0 {
-				add("TERMINAL_HAS_OUTGOING", fmt.Sprintf("Terminal node %q cannot have outgoing edges.", displayNode(node)), node.ID)
+			rest := strings.TrimPrefix(ident, "results.")
+			dot := strings.IndexByte(rest, '.')
+			if dot <= 0 {
+				continue
 			}
-		} else if len(outgoing) == 0 {
-			add("NON_TERMINAL_LEAF", fmt.Sprintf("Node %q needs an outgoing path to a terminal node.", displayNode(node)), node.ID)
-		}
-	}
-
-	canReachTerminal := computeReachabilityToTerminal(bp)
-	for _, node := range bp.Nodes {
-		if _, ok := canReachTerminal[node.ID]; !ok {
-			add("NO_TERMINAL_PATH", fmt.Sprintf("Node %q does not lead to any terminal action.", displayNode(node)), node.ID)
-		}
-	}
-
-	return BlueprintValidationResult{Valid: len(issues) == 0, Issues: issues}
-}
-
-type cycleDetectionResult struct {
-	hasCycles   bool
-	backEdgeIDs []string
-}
-
-func detectBlueprintCycles(bp dag.Blueprint) cycleDetectionResult {
-	outgoing := make(map[string][]string, len(bp.Nodes))
-	for _, node := range bp.Nodes {
-		outgoing[node.ID] = nil
-	}
-	for _, edge := range bp.Edges {
-		outgoing[edge.From] = append(outgoing[edge.From], edge.To)
-	}
-	const (
-		white = 0
-		gray  = 1
-		black = 2
-	)
-	colors := make(map[string]int, len(bp.Nodes))
-	for _, node := range bp.Nodes {
-		colors[node.ID] = white
-	}
-	back := make([]string, 0)
-	var dfs func(string)
-	dfs = func(nodeID string) {
-		colors[nodeID] = gray
-		for _, next := range outgoing[nodeID] {
-			switch colors[next] {
-			case gray:
-				back = append(back, nodeID+"->"+next)
-			case white:
-				dfs(next)
+			nodeID := rest[:dot]
+			key := rest[dot+1:]
+			nodeType, ok := nodeTypes[nodeID]
+			if !ok {
+				continue
 			}
-		}
-		colors[nodeID] = black
-	}
-	for _, node := range bp.Nodes {
-		if colors[node.ID] == white {
-			dfs(node.ID)
-		}
-	}
-	return cycleDetectionResult{hasCycles: len(back) > 0, backEdgeIDs: back}
-}
-
-func getRootNodes(bp dag.Blueprint) []string {
-	hasIncoming := make(map[string]struct{}, len(bp.Edges))
-	for _, edge := range bp.Edges {
-		hasIncoming[edge.To] = struct{}{}
-	}
-	roots := make([]string, 0)
-	for _, node := range bp.Nodes {
-		if _, ok := hasIncoming[node.ID]; !ok {
-			roots = append(roots, node.ID)
-		}
-	}
-	return roots
-}
-
-func buildAdjacency(bp dag.Blueprint) map[string][]string {
-	adj := make(map[string][]string, len(bp.Nodes))
-	for _, node := range bp.Nodes {
-		adj[node.ID] = nil
-	}
-	for _, edge := range bp.Edges {
-		adj[edge.From] = append(adj[edge.From], edge.To)
-	}
-	return adj
-}
-
-func computeReachabilityToTerminal(bp dag.Blueprint) map[string]struct{} {
-	reverse := make(map[string][]string, len(bp.Nodes))
-	for _, node := range bp.Nodes {
-		reverse[node.ID] = nil
-	}
-	for _, edge := range bp.Edges {
-		reverse[edge.To] = append(reverse[edge.To], edge.From)
-	}
-	reachable := make(map[string]struct{}, len(bp.Nodes))
-	queue := make([]string, 0)
-	for _, node := range bp.Nodes {
-		if isTerminalType(node.Type) {
-			queue = append(queue, node.ID)
+			keys := canonicalOutputKeys(nodeType)
+			if len(keys) == 0 {
+				continue // executor didn't declare output keys, skip
+			}
+			if key == "status" || key == "history" {
+				continue // status is universal; history is the back-edge accessor
+			}
+			if indexOfString(keys, key) >= 0 {
+				continue
+			}
+			// Unknown key — check if it's a prefix match on a declared key
+			// (e.g. "fetch.raw" when the real key is "fetch.raw.body"):
+			// agents frequently reference nested paths under a declared
+			// string output, which CEL handles fine. Skip.
+			if hasKeyPrefix(keys, key) {
+				continue
+			}
+			msg := fmt.Sprintf("Edge %q references %q but %q does not declare that output key.", edgeID, ident, nodeType)
+			if suggestion := closestKey(key, keys); suggestion != "" {
+				msg += fmt.Sprintf(" Did you mean %q?", "results."+nodeID+"."+suggestion)
+			}
+			*issues = append(*issues, BlueprintValidationIssue{
+				Code:     "EDGE_UNKNOWN_OUTPUT_KEY",
+				Message:  msg,
+				Target:   edgeID,
+				Severity: "warning",
+			})
 		}
 	}
-	for len(queue) > 0 {
-		nodeID := queue[0]
-		queue = queue[1:]
-		if _, seen := reachable[nodeID]; seen {
-			continue
+}
+
+// canonicalOutputKeys returns the output keys declared by the production
+// executor for nodeType. Duplicates the runner's registration list, which is
+// intentional: this validator does not hold a live engine, and the runner's
+// engine isn't import-safe from this package.
+func canonicalOutputKeys(nodeType string) []string {
+	switch nodeType {
+	case "api_fetch":
+		return (&executors.APIFetchExecutor{}).OutputKeys()
+	case "llm_call":
+		return (&executors.LLMCallExecutor{}).OutputKeys()
+	case "agent_loop":
+		return (&executors.AgentLoopExecutor{}).OutputKeys()
+	case "return":
+		return (&executors.ReturnExecutor{}).OutputKeys()
+	case "await_signal":
+		return (&executors.AwaitSignalExecutor{}).OutputKeys()
+	case "wait":
+		return (&executors.WaitExecutor{}).OutputKeys()
+	case "cel_eval":
+		// cel_eval keys come from the user's expressions map, not from a
+		// static declaration. Skip the diagnostic for these.
+		return nil
+	case "map":
+		return (&executors.MapExecutor{}).OutputKeys()
+	case "gadget":
+		return (&executors.GadgetExecutor{}).OutputKeys()
+	case "validate_blueprint":
+		return (&executors.ValidateBlueprintExecutor{}).OutputKeys()
+	}
+	return nil
+}
+
+func indexOfString(values []string, target string) int {
+	for i, v := range values {
+		if v == target {
+			return i
 		}
-		reachable[nodeID] = struct{}{}
-		queue = append(queue, reverse[nodeID]...)
 	}
-	return reachable
+	return -1
 }
 
-func isTerminalType(nodeType string) bool {
-	_, ok := terminalNodeTypes[nodeType]
-	return ok
+func hasKeyPrefix(keys []string, candidate string) bool {
+	for _, k := range keys {
+		if candidate == k {
+			return true
+		}
+		if strings.HasPrefix(candidate, k+".") {
+			return true
+		}
+	}
+	return false
 }
 
-func displayNode(node dag.NodeDef) string {
-	if strings.TrimSpace(node.Label) != "" {
-		return node.Label
+// closestKey returns the declared key with the smallest edit distance to
+// candidate, or "" when no key is within 3 edits.
+func closestKey(candidate string, keys []string) string {
+	best := ""
+	bestDist := 4
+	for _, k := range keys {
+		d := levenshtein(candidate, k)
+		if d < bestDist {
+			best = k
+			bestDist = d
+		}
 	}
-	return node.ID
+	return best
+}
+
+func levenshtein(a, b string) int {
+	if a == b {
+		return 0
+	}
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
 }
 
 func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
@@ -282,45 +295,45 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 	case "api_fetch":
 		cfg, err := executors.ParseConfig[executors.APIFetchConfig](node.Config)
 		if err != nil {
-			add("API_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("API_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.URL) == "" {
-			add("API_URL_REQUIRED", fmt.Sprintf("Node %q needs a URL.", displayNode(node)))
+			add("API_URL_REQUIRED", fmt.Sprintf("Node %q needs a URL.", node.DisplayName()))
 		}
 		if strings.TrimSpace(cfg.URL) != "" {
 			if _, err := url.ParseRequestURI(cfg.URL); err != nil || !strings.Contains(cfg.URL, "://") {
-				add("API_URL_INVALID", fmt.Sprintf("Node %q needs a valid absolute URL.", displayNode(node)))
+				add("API_URL_INVALID", fmt.Sprintf("Node %q needs a valid absolute URL.", node.DisplayName()))
 			}
 		}
 		if strings.TrimSpace(cfg.Method) != "" {
 			if _, err := executors.NormalizeAPIFetchMethod(cfg.Method); err != nil {
-				add("API_METHOD_INVALID", fmt.Sprintf("Node %q uses an unsupported HTTP method.", displayNode(node)))
+				add("API_METHOD_INVALID", fmt.Sprintf("Node %q uses an unsupported HTTP method.", node.DisplayName()))
 			}
 		}
 		if cfg.TimeoutSeconds < 0 {
-			add("API_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a non-negative timeout.", displayNode(node)))
+			add("API_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a non-negative timeout.", node.DisplayName()))
 		}
 	case "llm_call":
 		cfg, err := executors.ParseConfig[executors.LLMCallConfig](node.Config)
 		if err != nil {
-			add("LLM_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("LLM_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.Prompt) == "" {
-			add("LLM_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", displayNode(node)))
+			add("LLM_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", node.DisplayName()))
 		}
 		if cfg.AllowedOutcomesKey != "" && strings.TrimSpace(cfg.AllowedOutcomesKey) == "" {
-			add("LLM_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", displayNode(node)))
+			add("LLM_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", node.DisplayName()))
 		}
 	case "agent_loop":
 		cfg, err := executors.ParseConfig[executors.AgentLoopConfig](node.Config)
 		if err != nil {
-			add("AGENT_LOOP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("AGENT_LOOP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.Prompt) == "" {
-			add("AGENT_LOOP_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", displayNode(node)))
+			add("AGENT_LOOP_PROMPT_REQUIRED", fmt.Sprintf("Node %q needs a prompt.", node.DisplayName()))
 		}
 		outputMode := strings.ToLower(strings.TrimSpace(cfg.OutputMode))
 		if outputMode == "" {
@@ -329,125 +342,124 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		switch outputMode {
 		case executors.AgentOutputModeText, executors.AgentOutputModeStructured, executors.AgentOutputModeResolution:
 		default:
-			add("AGENT_LOOP_OUTPUT_MODE_INVALID", fmt.Sprintf("Node %q has an unsupported output_mode.", displayNode(node)))
+			add("AGENT_LOOP_OUTPUT_MODE_INVALID", fmt.Sprintf("Node %q has an unsupported output_mode.", node.DisplayName()))
 		}
 		if outputMode == executors.AgentOutputModeStructured {
 			if cfg.OutputTool == nil || len(cfg.OutputTool.Parameters) == 0 {
-				add("AGENT_LOOP_OUTPUT_TOOL_REQUIRED", fmt.Sprintf("Node %q structured output needs output_tool.parameters.", displayNode(node)))
+				add("AGENT_LOOP_OUTPUT_TOOL_REQUIRED", fmt.Sprintf("Node %q structured output needs output_tool.parameters.", node.DisplayName()))
 			}
 		}
 		if cfg.OutputTool != nil && len(cfg.OutputTool.Parameters) > 0 && !json.Valid(cfg.OutputTool.Parameters) {
-			add("AGENT_LOOP_OUTPUT_TOOL_INVALID", fmt.Sprintf("Node %q output_tool.parameters must be valid JSON.", displayNode(node)))
+			add("AGENT_LOOP_OUTPUT_TOOL_INVALID", fmt.Sprintf("Node %q output_tool.parameters must be valid JSON.", node.DisplayName()))
 		}
 		if cfg.TimeoutSeconds < 0 || cfg.ToolTimeoutSeconds < 0 {
-			add("AGENT_LOOP_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs non-negative timeouts.", displayNode(node)))
+			add("AGENT_LOOP_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs non-negative timeouts.", node.DisplayName()))
 		}
 		if cfg.MaxSteps < 0 || cfg.MaxToolCalls < 0 || cfg.MaxToolResultBytes < 0 || cfg.MaxTokens < 0 {
-			add("AGENT_LOOP_LIMIT_INVALID", fmt.Sprintf("Node %q needs non-negative limits.", displayNode(node)))
+			add("AGENT_LOOP_LIMIT_INVALID", fmt.Sprintf("Node %q needs non-negative limits.", node.DisplayName()))
 		}
 		if cfg.AllowedOutcomesKey != "" && strings.TrimSpace(cfg.AllowedOutcomesKey) == "" {
-			add("AGENT_LOOP_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", displayNode(node)))
+			add("AGENT_LOOP_ALLOWED_OUTCOMES_KEY_INVALID", fmt.Sprintf("Node %q has an empty allowed outcomes key.", node.DisplayName()))
 		}
 		validateAgentLoopTools(node, cfg, add)
 	case "await_signal":
-		cfg, err := executors.ParseConfig[awaitSignalConfig](node.Config)
+		cfg, err := executors.ParseConfig[executors.AwaitSignalConfig](node.Config)
 		if err != nil {
-			add("AWAIT_SIGNAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("AWAIT_SIGNAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.SignalType) == "" {
-			add("AWAIT_SIGNAL_TYPE_REQUIRED", fmt.Sprintf("Node %q needs a signal_type.", displayNode(node)))
+			add("AWAIT_SIGNAL_TYPE_REQUIRED", fmt.Sprintf("Node %q needs a signal_type.", node.DisplayName()))
 		}
 		if cfg.TimeoutSeconds < 0 || cfg.TimeoutSeconds > 604800 {
-			add("AWAIT_SIGNAL_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a timeout between 0 and 604800 seconds.", displayNode(node)))
+			add("AWAIT_SIGNAL_TIMEOUT_INVALID", fmt.Sprintf("Node %q needs a timeout between 0 and 604800 seconds.", node.DisplayName()))
 		}
 		for _, key := range cfg.RequiredPayload {
 			if strings.TrimSpace(key) == "" {
-				add("AWAIT_SIGNAL_REQUIRED_PAYLOAD_INVALID", fmt.Sprintf("Node %q has an empty required payload key.", displayNode(node)))
+				add("AWAIT_SIGNAL_REQUIRED_PAYLOAD_INVALID", fmt.Sprintf("Node %q has an empty required payload key.", node.DisplayName()))
 			}
 		}
 	case "wait":
 		cfg, err := executors.ParseConfig[executors.WaitConfig](node.Config)
 		if err != nil {
-			add("WAIT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("WAIT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if cfg.DurationSeconds < 0 {
-			add("WAIT_DURATION_INVALID", fmt.Sprintf("Node %q needs a non-negative wait duration.", displayNode(node)))
+			add("WAIT_DURATION_INVALID", fmt.Sprintf("Node %q needs a non-negative wait duration.", node.DisplayName()))
 		}
 		if cfg.Mode != "" && cfg.Mode != "sleep" && cfg.Mode != "defer" {
-			add("WAIT_MODE_INVALID", fmt.Sprintf("Node %q must use either sleep or defer mode.", displayNode(node)))
+			add("WAIT_MODE_INVALID", fmt.Sprintf("Node %q must use either sleep or defer mode.", node.DisplayName()))
 		}
 		if cfg.StartFrom != "" && cfg.StartFrom != "now" && cfg.StartFrom != "deadline" && cfg.StartFrom != "resolution_pending_since" {
-			add("WAIT_START_FROM_INVALID", fmt.Sprintf("Node %q has an unsupported wait anchor.", displayNode(node)))
+			add("WAIT_START_FROM_INVALID", fmt.Sprintf("Node %q has an unsupported wait anchor.", node.DisplayName()))
 		}
 		if cfg.Mode == "defer" && cfg.StartFrom == "now" {
-			add("WAIT_DEFER_START_NOW_UNSUPPORTED", fmt.Sprintf("Node %q cannot use \"now\" with defer mode.", displayNode(node)))
+			add("WAIT_DEFER_START_NOW_UNSUPPORTED", fmt.Sprintf("Node %q cannot use \"now\" with defer mode.", node.DisplayName()))
 		}
-	case "submit_result":
-		cfg, err := executors.ParseConfig[executors.SubmitResultConfig](node.Config)
+		if cfg.MaxInlineSeconds > executors.MaxInlineWaitSecondsCap {
+			add("WAIT_MAX_INLINE_TOO_LARGE", fmt.Sprintf("Node %q max_inline_seconds must be <= %d (inline waits pin an executor goroutine).", node.DisplayName(), executors.MaxInlineWaitSecondsCap))
+		}
+	case "return":
+		cfg, err := executors.ParseConfig[executors.ReturnConfig](node.Config)
 		if err != nil {
-			add("SUBMIT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("RETURN_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
-		if strings.TrimSpace(cfg.OutcomeKey) == "" {
-			add("SUBMIT_OUTCOME_KEY_REQUIRED", fmt.Sprintf("Node %q needs an outcome source.", displayNode(node)))
+		if err := executors.ValidateReturnConfig(cfg); err != nil {
+			add("RETURN_CONFIG_INVALID", fmt.Sprintf("Node %q: %s", node.DisplayName(), err.Error()))
 		}
 	case "cel_eval":
 		cfg, err := executors.ParseConfig[executors.CelEvalConfig](node.Config)
 		if err != nil {
-			add("CEL_EVAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("CEL_EVAL_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if len(cfg.Expressions) == 0 {
-			add("CEL_EVAL_EXPRESSIONS_REQUIRED", fmt.Sprintf("Node %q needs at least one expression.", displayNode(node)))
+			add("CEL_EVAL_EXPRESSIONS_REQUIRED", fmt.Sprintf("Node %q needs at least one expression.", node.DisplayName()))
 		}
 	case "map":
-		if field, ok, err := executors.DeprecatedMapConfigField(node.Config); err != nil {
-			add("MAP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
-			return
-		} else if ok {
-			add("MAP_FIELD_REMOVED", fmt.Sprintf("Node %q uses removed map field %q; use batch_size and max_concurrency.", displayNode(node), field))
-		}
 		cfg, err := executors.ParseConfig[executors.MapConfig](node.Config)
 		if err != nil {
-			add("MAP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("MAP_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.ItemsKey) == "" {
-			add("MAP_ITEMS_KEY_REQUIRED", fmt.Sprintf("Node %q needs an items_key.", displayNode(node)))
+			add("MAP_ITEMS_KEY_REQUIRED", fmt.Sprintf("Node %q needs an items_key.", node.DisplayName()))
 		}
 		if cfg.Inline == nil || len(cfg.Inline.Nodes) == 0 {
-			add("MAP_INLINE_REQUIRED", fmt.Sprintf("Node %q needs an inline blueprint.", displayNode(node)))
+			add("MAP_INLINE_REQUIRED", fmt.Sprintf("Node %q needs an inline blueprint.", node.DisplayName()))
 		}
 		if cfg.Inline != nil {
 			if errs := dag.ValidateBlueprint(*cfg.Inline); len(errs) > 0 {
-				add("MAP_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint: %v", displayNode(node), errs[0]))
+				add("MAP_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint: %v", node.DisplayName(), errs[0]))
+			} else if err := executors.FirstReturnContractError(*cfg.Inline); err != nil {
+				add("MAP_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint: %v", node.DisplayName(), err))
 			}
 		}
 		if cfg.BatchSize < 0 {
-			add("MAP_BATCH_SIZE_INVALID", fmt.Sprintf("Node %q batch_size must be non-negative.", displayNode(node)))
+			add("MAP_BATCH_SIZE_INVALID", fmt.Sprintf("Node %q batch_size must be non-negative.", node.DisplayName()))
 		}
 		if cfg.MaxConcurrency != nil && *cfg.MaxConcurrency < 0 {
-			add("MAP_MAX_CONCURRENCY_INVALID", fmt.Sprintf("Node %q max_concurrency must be non-negative.", displayNode(node)))
+			add("MAP_MAX_CONCURRENCY_INVALID", fmt.Sprintf("Node %q max_concurrency must be non-negative.", node.DisplayName()))
 		}
 		if cfg.MaxItems < 0 {
-			add("MAP_MAX_ITEMS_INVALID", fmt.Sprintf("Node %q max_items must be non-negative.", displayNode(node)))
+			add("MAP_MAX_ITEMS_INVALID", fmt.Sprintf("Node %q max_items must be non-negative.", node.DisplayName()))
 		}
 		if cfg.MaxDepth < 0 {
-			add("MAP_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q max_depth must be non-negative.", displayNode(node)))
+			add("MAP_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q max_depth must be non-negative.", node.DisplayName()))
 		}
 		if cfg.PerBatchTimeoutSeconds < 0 {
-			add("MAP_TIMEOUT_INVALID", fmt.Sprintf("Node %q per_batch_timeout_seconds must be non-negative.", displayNode(node)))
+			add("MAP_TIMEOUT_INVALID", fmt.Sprintf("Node %q per_batch_timeout_seconds must be non-negative.", node.DisplayName()))
 		}
 		onError := strings.TrimSpace(cfg.OnError)
 		if onError != "" && onError != "fail" && onError != "continue" {
-			add("MAP_ON_ERROR_INVALID", fmt.Sprintf("Node %q on_error must be \"fail\" or \"continue\".", displayNode(node)))
+			add("MAP_ON_ERROR_INVALID", fmt.Sprintf("Node %q on_error must be \"fail\" or \"continue\".", node.DisplayName()))
 		}
 	case "gadget":
 		cfg, err := executors.ParseConfig[executors.GadgetConfig](node.Config)
 		if err != nil {
-			add("GADGET_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("GADGET_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		sourceCount := 0
@@ -462,15 +474,15 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 		}
 		switch {
 		case sourceCount == 0:
-			add("GADGET_BLUEPRINT_SOURCE_REQUIRED", fmt.Sprintf("Node %q needs exactly one of blueprint_json, blueprint_json_key, or inline.", displayNode(node)))
+			add("GADGET_BLUEPRINT_SOURCE_REQUIRED", fmt.Sprintf("Node %q needs exactly one of blueprint_json, blueprint_json_key, or inline.", node.DisplayName()))
 		case sourceCount > 1:
-			add("GADGET_BLUEPRINT_SOURCE_CONFLICT", fmt.Sprintf("Node %q can use only one of blueprint_json, blueprint_json_key, or inline.", displayNode(node)))
+			add("GADGET_BLUEPRINT_SOURCE_CONFLICT", fmt.Sprintf("Node %q can use only one of blueprint_json, blueprint_json_key, or inline.", node.DisplayName()))
 		}
 		if cfg.TimeoutSeconds < 0 {
-			add("GADGET_TIMEOUT_INVALID", fmt.Sprintf("Node %q timeout_seconds must be non-negative.", displayNode(node)))
+			add("GADGET_TIMEOUT_INVALID", fmt.Sprintf("Node %q timeout_seconds must be non-negative.", node.DisplayName()))
 		}
 		if cfg.MaxDepth < 0 {
-			add("GADGET_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q max_depth must be non-negative.", displayNode(node)))
+			add("GADGET_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q max_depth must be non-negative.", node.DisplayName()))
 		}
 		if policy := cfg.DynamicBlueprintPolicy; policy != nil {
 			if policy.MaxNodes < 0 ||
@@ -478,39 +490,39 @@ func validateNodeConfig(node dag.NodeDef, issues *[]BlueprintValidationIssue) {
 				policy.MaxDepth < 0 ||
 				policy.MaxTotalTimeSeconds < 0 ||
 				policy.MaxTotalTokens < 0 {
-				add("GADGET_DYNAMIC_POLICY_INVALID", fmt.Sprintf("Node %q dynamic blueprint policy limits must be non-negative.", displayNode(node)))
+				add("GADGET_DYNAMIC_POLICY_INVALID", fmt.Sprintf("Node %q dynamic blueprint policy limits must be non-negative.", node.DisplayName()))
 			}
 		}
 		if cfg.Inline != nil {
 			rawInline, err := json.Marshal(cfg.Inline)
 			if err != nil {
-				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint could not be serialized.", displayNode(node)))
+				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint could not be serialized.", node.DisplayName()))
 			} else if child := ValidateResolutionBlueprint(*cfg.Inline, rawInline); !child.Valid {
 				first := child.Issues[0]
-				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint is invalid: %s", displayNode(node), strings.TrimSpace(first.Message)))
+				add("GADGET_INLINE_INVALID", fmt.Sprintf("Node %q inline blueprint is invalid: %s", node.DisplayName(), strings.TrimSpace(first.Message)))
 			}
 		}
 		if raw := strings.TrimSpace(cfg.BlueprintJSON); raw != "" && !strings.Contains(raw, "{{") {
 			if !json.Valid([]byte(raw)) {
-				add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json must be valid JSON text.", displayNode(node)))
+				add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json must be valid JSON text.", node.DisplayName()))
 			} else {
 				var child dag.Blueprint
 				if err := json.Unmarshal([]byte(raw), &child); err != nil {
-					add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json could not be parsed.", displayNode(node)))
+					add("GADGET_BLUEPRINT_JSON_INVALID", fmt.Sprintf("Node %q blueprint_json could not be parsed.", node.DisplayName()))
 				} else if result := ValidateResolutionBlueprint(child, []byte(raw)); !result.Valid {
 					first := result.Issues[0]
-					add("GADGET_BLUEPRINT_INVALID", fmt.Sprintf("Node %q blueprint_json is invalid: %s", displayNode(node), strings.TrimSpace(first.Message)))
+					add("GADGET_BLUEPRINT_INVALID", fmt.Sprintf("Node %q blueprint_json is invalid: %s", node.DisplayName(), strings.TrimSpace(first.Message)))
 				}
 			}
 		}
 	case "validate_blueprint":
 		cfg, err := executors.ParseConfig[executors.ValidateBlueprintConfig](node.Config)
 		if err != nil {
-			add("VALIDATE_BLUEPRINT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", displayNode(node)))
+			add("VALIDATE_BLUEPRINT_CONFIG_INVALID", fmt.Sprintf("Node %q has invalid config.", node.DisplayName()))
 			return
 		}
 		if strings.TrimSpace(cfg.BlueprintJSONKey) == "" {
-			add("VALIDATE_BLUEPRINT_KEY_REQUIRED", fmt.Sprintf("Node %q needs a blueprint_json_key.", displayNode(node)))
+			add("VALIDATE_BLUEPRINT_KEY_REQUIRED", fmt.Sprintf("Node %q needs a blueprint_json_key.", node.DisplayName()))
 		}
 	}
 }
@@ -526,16 +538,16 @@ func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add
 	for _, tool := range cfg.Tools {
 		name := strings.TrimSpace(tool.Name)
 		if name == "" {
-			add("AGENT_LOOP_TOOL_NAME_REQUIRED", fmt.Sprintf("Node %q has an agent tool without a name.", displayNode(node)))
+			add("AGENT_LOOP_TOOL_NAME_REQUIRED", fmt.Sprintf("Node %q has an agent tool without a name.", node.DisplayName()))
 		}
 		if len(tool.Parameters) > 0 && !json.Valid(tool.Parameters) {
-			add("AGENT_LOOP_TOOL_PARAMETERS_INVALID", fmt.Sprintf("Node %q tool %q parameters must be valid JSON.", displayNode(node), name))
+			add("AGENT_LOOP_TOOL_PARAMETERS_INVALID", fmt.Sprintf("Node %q tool %q parameters must be valid JSON.", node.DisplayName(), name))
 		}
 		if tool.TimeoutSeconds < 0 {
-			add("AGENT_LOOP_TOOL_TIMEOUT_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative timeout.", displayNode(node), name))
+			add("AGENT_LOOP_TOOL_TIMEOUT_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative timeout.", node.DisplayName(), name))
 		}
 		if tool.MaxDepth < 0 {
-			add("AGENT_LOOP_TOOL_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative max_depth.", displayNode(node), name))
+			add("AGENT_LOOP_TOOL_MAX_DEPTH_INVALID", fmt.Sprintf("Node %q tool %q needs a non-negative max_depth.", node.DisplayName(), name))
 		}
 
 		kind := strings.ToLower(strings.TrimSpace(tool.Kind))
@@ -553,21 +565,23 @@ func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add
 				builtin = name
 			}
 			if _, ok := validBuiltins[builtin]; !ok {
-				add("AGENT_LOOP_BUILTIN_TOOL_INVALID", fmt.Sprintf("Node %q uses unknown builtin tool %q.", displayNode(node), builtin))
+				add("AGENT_LOOP_BUILTIN_TOOL_INVALID", fmt.Sprintf("Node %q uses unknown builtin tool %q.", node.DisplayName(), builtin))
 			}
 			if builtin == executors.AgentBuiltinRunBlueprint && !cfg.EnableDynamicBlueprint {
-				add("AGENT_LOOP_DYNAMIC_BLUEPRINT_DISABLED", fmt.Sprintf("Node %q tool %q requires enable_dynamic_blueprints.", displayNode(node), name))
+				add("AGENT_LOOP_DYNAMIC_BLUEPRINT_DISABLED", fmt.Sprintf("Node %q tool %q requires enable_dynamic_blueprints.", node.DisplayName(), name))
 			}
 		case executors.AgentToolKindBlueprint:
 			if tool.Inline == nil || len(tool.Inline.Nodes) == 0 {
-				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_REQUIRED", fmt.Sprintf("Node %q tool %q needs an inline blueprint.", displayNode(node), name))
+				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_REQUIRED", fmt.Sprintf("Node %q tool %q needs an inline blueprint.", node.DisplayName(), name))
 				continue
 			}
 			if errs := dag.ValidateBlueprint(*tool.Inline); len(errs) > 0 {
-				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_INVALID", fmt.Sprintf("Node %q tool %q inline blueprint: %v.", displayNode(node), name, errs[0]))
+				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_INVALID", fmt.Sprintf("Node %q tool %q inline blueprint: %v.", node.DisplayName(), name, errs[0]))
+			} else if err := executors.FirstReturnContractError(*tool.Inline); err != nil {
+				add("AGENT_LOOP_BLUEPRINT_TOOL_INLINE_INVALID", fmt.Sprintf("Node %q tool %q inline blueprint: %v.", node.DisplayName(), name, err))
 			}
 		default:
-			add("AGENT_LOOP_TOOL_KIND_INVALID", fmt.Sprintf("Node %q tool %q has unsupported kind %q.", displayNode(node), name, tool.Kind))
+			add("AGENT_LOOP_TOOL_KIND_INVALID", fmt.Sprintf("Node %q tool %q has unsupported kind %q.", node.DisplayName(), name, tool.Kind))
 		}
 	}
 
@@ -577,7 +591,7 @@ func validateAgentLoopTools(node dag.NodeDef, cfg executors.AgentLoopConfig, add
 			policy.MaxDepth < 0 ||
 			policy.MaxTotalTimeSeconds < 0 ||
 			policy.MaxTotalTokens < 0 {
-			add("AGENT_LOOP_DYNAMIC_POLICY_INVALID", fmt.Sprintf("Node %q dynamic blueprint policy limits must be non-negative.", displayNode(node)))
+			add("AGENT_LOOP_DYNAMIC_POLICY_INVALID", fmt.Sprintf("Node %q dynamic blueprint policy limits must be non-negative.", node.DisplayName()))
 		}
 	}
 }

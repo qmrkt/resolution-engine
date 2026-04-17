@@ -11,8 +11,8 @@ Required market-specific configuration:
 ```mermaid
 flowchart LR
   fetch["Fetch Canonical Source<br/>api_fetch"]
-  submit["Submit Outcome<br/>submit_result"]
-  cancel["Cancel Market<br/>cancel_market"]
+  submit["Submit Outcome<br/>return"]
+  cancel["Cancel Market<br/>return"]
 
   fetch -->|"success and outcome present"| submit
   fetch -->|"failed or unmapped"| cancel

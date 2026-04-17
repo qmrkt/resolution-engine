@@ -9,7 +9,7 @@
       "type": "api_fetch",
       "label": "Fetch Canonical Source",
       "config": {
-        "url": "https://api.example.com/markets/{{market.id}}/resolution",
+        "url": "https://api.example.com/markets/{{inputs.market.id}}/resolution",
         "method": "GET",
         "json_path": "data.outcome",
         "outcome_mapping": {
@@ -21,18 +21,24 @@
     },
     {
       "id": "submit",
-      "type": "submit_result",
+      "type": "return",
       "label": "Submit Outcome",
       "config": {
-        "outcome_key": "fetch.outcome"
+        "value": {
+          "status": "success",
+          "outcome": "{{results.fetch.outcome}}"
+        }
       }
     },
     {
       "id": "cancel",
-      "type": "cancel_market",
+      "type": "return",
       "label": "Cancel",
       "config": {
-        "reason": "The canonical API did not produce a valid mapped outcome."
+        "value": {
+          "status": "cancelled",
+          "reason": "The canonical API did not produce a valid mapped outcome."
+        }
       }
     }
   ],
@@ -40,12 +46,12 @@
     {
       "from": "fetch",
       "to": "submit",
-      "condition": "fetch.status == 'success' && fetch.outcome != ''"
+      "condition": "results.fetch.status == 'success' && results.fetch.outcome != ''"
     },
     {
       "from": "fetch",
       "to": "cancel",
-      "condition": "fetch.status != 'success' || fetch.outcome == ''"
+      "condition": "results.fetch.status != 'success' || results.fetch.outcome == ''"
     }
   ],
   "budget": {

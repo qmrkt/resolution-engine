@@ -20,7 +20,7 @@ type mockExecutor struct {
 	usage   TokenUsage
 }
 
-func (m *mockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (m *mockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
@@ -36,7 +36,7 @@ type concurrencyRecordingExecutor struct {
 	maxActive atomic.Int32
 }
 
-func (e *concurrencyRecordingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (e *concurrencyRecordingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
 	active := e.active.Add(1)
 	for {
 		maxActive := e.maxActive.Load()
@@ -54,8 +54,8 @@ func (e *concurrencyRecordingExecutor) Execute(ctx context.Context, node NodeDef
 // contextAwareExecutor reads context during execution.
 type contextAwareExecutor struct{}
 
-func (e *contextAwareExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
-	evidence := execCtx.Get("search.evidence")
+func (e *contextAwareExecutor) Execute(ctx context.Context, node NodeDef, inv *Invocation) (ExecutorResult, error) {
+	evidence, _ := inv.Results.Get("search", "evidence")
 	if evidence == "" {
 		return ExecutorResult{Outputs: map[string]string{"outcome": "inconclusive"}}, nil
 	}
@@ -64,12 +64,13 @@ func (e *contextAwareExecutor) Execute(ctx context.Context, node NodeDef, execCt
 
 type runIDInspectingExecutor struct{}
 
-func (e *runIDInspectingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (e *runIDInspectingExecutor) Execute(ctx context.Context, node NodeDef, inv *Invocation) (ExecutorResult, error) {
+	// All three output keys should carry inv.Run.ID.
 	return ExecutorResult{
 		Outputs: map[string]string{
-			"resolution_run_id": execCtx.Get("resolution_run_id"),
-			"input_run_id":      execCtx.Get("input.resolution_run_id"),
-			"internal_run_id":   execCtx.Get("__run_id"),
+			"resolution_run_id": inv.Run.ID,
+			"input_run_id":      inv.Run.ID,
+			"internal_run_id":   inv.Run.ID,
 		},
 	}, nil
 }
@@ -86,9 +87,65 @@ type loopCountingExecutor struct {
 	count int
 }
 
-func (e *loopCountingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (e *loopCountingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
 	e.count++
 	return ExecutorResult{Outputs: map[string]string{"count": fmt.Sprintf("%d", e.count)}}, nil
+}
+
+type suspendingExecutor struct {
+	suspension *Suspension
+}
+
+func (e *suspendingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
+	return ExecutorResult{Suspend: e.suspension}, nil
+}
+
+func TestSyncEngineRejectsSuspendedResult(t *testing.T) {
+	cases := []struct {
+		name       string
+		suspension *Suspension
+		wantKind   string
+	}{
+		{
+			name:       "timer_suspend",
+			suspension: &Suspension{Kind: SuspensionKindTimer, ResumeAtUnix: time.Now().Unix() + 60},
+			wantKind:   SuspensionKindTimer,
+		},
+		{
+			name:       "signal_suspend",
+			suspension: &Suspension{Kind: SuspensionKindSignal, SignalType: "x.y"},
+			wantKind:   SuspensionKindSignal,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := NewEngine(slog.Default())
+			engine.RegisterExecutor("suspend", &suspendingExecutor{suspension: tc.suspension})
+			bp := Blueprint{
+				ID:    "sync-rejects-suspend",
+				Nodes: []NodeDef{{ID: "s", Type: "suspend"}},
+			}
+			run, err := engine.Execute(context.Background(), bp, nil)
+			if err != nil {
+				// Failing a hard-failing node is surfaced via run.Status;
+				// engine.Execute returns a nil error in that case.
+				t.Fatalf("unexpected engine error: %v", err)
+			}
+			if run.Status != "failed" {
+				t.Fatalf("run status = %q, want failed", run.Status)
+			}
+			nodeState := run.NodeStates["s"]
+			if nodeState.Status != "failed" {
+				t.Fatalf("node status = %q, want failed", nodeState.Status)
+			}
+			if !strings.Contains(nodeState.Error, "not supported by the in-memory engine") {
+				t.Fatalf("node error missing expected phrase: %q", nodeState.Error)
+			}
+			if !strings.Contains(nodeState.Error, tc.wantKind) {
+				t.Fatalf("node error did not mention kind %q: %q", tc.wantKind, nodeState.Error)
+			}
+		})
+	}
 }
 
 func TestSingleNodeExecution(t *testing.T) {
@@ -109,8 +166,8 @@ func TestSingleNodeExecution(t *testing.T) {
 	if run.Status != "completed" {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
-	if run.Context["a.result"] != "hello" {
-		t.Fatalf("expected a.result=hello, got %q", run.Context["a.result"])
+	if resultValue(run, "a", "result") != "hello" {
+		t.Fatalf("expected a.result=hello, got %q", resultValue(run, "a", "result"))
 	}
 }
 
@@ -142,17 +199,12 @@ func TestRunStateCapturesDefinitionInputsAndCanonicalRunID(t *testing.T) {
 	if run.Inputs["market_app_id"] != "42" {
 		t.Fatalf("expected market_app_id input, got %q", run.Inputs["market_app_id"])
 	}
-	if run.Inputs["resolution_run_id"] != run.ID {
-		t.Fatalf("expected resolution_run_id=%q, got %q", run.ID, run.Inputs["resolution_run_id"])
-	}
-	if got := run.Context["step.resolution_run_id"]; got != run.ID {
-		t.Fatalf("expected step.resolution_run_id=%q, got %q", run.ID, got)
-	}
-	if got := run.Context["step.input_run_id"]; got != run.ID {
-		t.Fatalf("expected step.input_run_id=%q, got %q", run.ID, got)
-	}
-	if got := run.Context["step.internal_run_id"]; got != run.ID {
-		t.Fatalf("expected step.internal_run_id=%q, got %q", run.ID, got)
+	// runIDInspectingExecutor copies inv.Run.ID into these output keys.
+	for _, name := range []string{"resolution_run_id", "input_run_id", "internal_run_id"} {
+		got, _ := run.Results.Get("step", name)
+		if got != run.ID {
+			t.Fatalf("expected step.%s=%q from inv.Run.ID, got %q", name, run.ID, got)
+		}
 	}
 }
 
@@ -182,8 +234,8 @@ func TestLinearDAG(t *testing.T) {
 		t.Fatalf("expected completed, got %s", run.Status)
 	}
 	// Judge should see the search evidence
-	if run.Context["judge.outcome"] != "0" {
-		t.Fatalf("expected judge.outcome=0, got %q", run.Context["judge.outcome"])
+	if resultValue(run, "judge", "outcome") != "0" {
+		t.Fatalf("expected judge.outcome=0, got %q", resultValue(run, "judge", "outcome"))
 	}
 }
 
@@ -208,8 +260,8 @@ func TestConditionalBranching(t *testing.T) {
 			{ID: "fallback", Type: "fallback"},
 		},
 		Edges: []EdgeDef{
-			{From: "search", To: "judge", Condition: "search.status == 'success'"},
-			{From: "search", To: "fallback", Condition: "search.status != 'success'"},
+			{From: "search", To: "judge", Condition: "results.search.status == 'success'"},
+			{From: "search", To: "fallback", Condition: "results.search.status != 'success'"},
 		},
 	}
 
@@ -251,8 +303,8 @@ func TestFailureBranching(t *testing.T) {
 			{ID: "fallback", Type: "fallback"},
 		},
 		Edges: []EdgeDef{
-			{From: "search", To: "judge", Condition: "search.status == 'success'"},
-			{From: "search", To: "fallback", Condition: "search.status != 'success'"},
+			{From: "search", To: "judge", Condition: "results.search.status == 'success'"},
+			{From: "search", To: "fallback", Condition: "results.search.status != 'success'"},
 		},
 	}
 
@@ -264,8 +316,8 @@ func TestFailureBranching(t *testing.T) {
 	if run.NodeStates["fallback"].Status != "completed" {
 		t.Fatalf("expected fallback completed, got %s", run.NodeStates["fallback"].Status)
 	}
-	if run.Context["fallback.outcome"] != "manual" {
-		t.Fatalf("expected fallback.outcome=manual, got %q", run.Context["fallback.outcome"])
+	if resultValue(run, "fallback", "outcome") != "manual" {
+		t.Fatalf("expected fallback.outcome=manual, got %q", resultValue(run, "fallback", "outcome"))
 	}
 }
 
@@ -431,9 +483,9 @@ func TestExecuteWithObserverEmitsDefensiveSnapshots(t *testing.T) {
 }
 
 func TestContextInterpolation(t *testing.T) {
-	ctx := NewContext(map[string]string{"question": "Will BTC hit 100k?"})
+	ctx := NewInvocationFromInputs(map[string]string{"question": "Will BTC hit 100k?"})
 
-	result := ctx.Interpolate("Market: {{question}}")
+	result := ctx.Interpolate("Market: {{inputs.question}}")
 	if result != "Market: Will BTC hit 100k?" {
 		t.Fatalf("unexpected interpolation: %q", result)
 	}
@@ -443,7 +495,7 @@ func TestContextInterpolation(t *testing.T) {
 		t.Fatalf("unexpected: %q", result)
 	}
 
-	result = ctx.Interpolate("Missing: {{unknown}}")
+	result = ctx.Interpolate("Missing: {{inputs.unknown}}")
 	if result != "Missing: " {
 		t.Fatalf("unexpected: %q", result)
 	}
@@ -460,10 +512,10 @@ func TestResolutionWorkflow(t *testing.T) {
 		},
 	})
 	engine.RegisterExecutor("llm_call", &contextAwareExecutor{})
-	engine.RegisterExecutor("submit_result", &mockExecutor{
+	engine.RegisterExecutor("result_a", &mockExecutor{
 		outputs: map[string]string{"submitted": "true"},
 	})
-	engine.RegisterExecutor("cancel_market", &mockExecutor{
+	engine.RegisterExecutor("result_b", &mockExecutor{
 		outputs: map[string]string{"cancelled": "true"},
 	})
 
@@ -473,14 +525,14 @@ func TestResolutionWorkflow(t *testing.T) {
 		Nodes: []NodeDef{
 			{ID: "search", Type: "web_search"},
 			{ID: "judge", Type: "llm_call"},
-			{ID: "submit", Type: "submit_result"},
-			{ID: "fallback", Type: "cancel_market"},
+			{ID: "submit", Type: "result_a"},
+			{ID: "fallback", Type: "result_b"},
 		},
 		Edges: []EdgeDef{
-			{From: "search", To: "judge", Condition: "search.status == 'success'"},
-			{From: "search", To: "fallback", Condition: "search.status != 'success'"},
-			{From: "judge", To: "submit", Condition: "judge.outcome != 'inconclusive'"},
-			{From: "judge", To: "fallback", Condition: "judge.outcome == 'inconclusive'"},
+			{From: "search", To: "judge", Condition: "results.search.status == 'success'"},
+			{From: "search", To: "fallback", Condition: "results.search.status != 'success'"},
+			{From: "judge", To: "submit", Condition: "results.judge.outcome != 'inconclusive'"},
+			{From: "judge", To: "fallback", Condition: "results.judge.outcome == 'inconclusive'"},
 		},
 		Budget: &Budget{MaxTotalTimeSeconds: 60},
 	}
@@ -502,8 +554,8 @@ func TestResolutionWorkflow(t *testing.T) {
 		t.Fatalf("search not completed: %s", run.NodeStates["search"].Status)
 	}
 	// Judge should receive evidence and produce outcome
-	if run.Context["judge.outcome"] != "0" {
-		t.Fatalf("expected judge outcome=0, got %q", run.Context["judge.outcome"])
+	if resultValue(run, "judge", "outcome") != "0" {
+		t.Fatalf("expected judge outcome=0, got %q", resultValue(run, "judge", "outcome"))
 	}
 	// Submit should fire
 	if run.NodeStates["submit"].Status != "completed" {
@@ -544,7 +596,7 @@ func TestJoinNodeMarkedSkippedAfterUpstreamFailure(t *testing.T) {
 	if got := run.NodeStates["join"].Status; got != "skipped" {
 		t.Fatalf("expected join skipped, got %q", got)
 	}
-	if _, ok := run.Context["join.result"]; ok {
+	if _, ok := run.Results.Get("join", "result"); ok {
 		t.Fatal("join node should not have executed")
 	}
 }
@@ -643,7 +695,7 @@ func TestCELErrorFailsRun(t *testing.T) {
 		},
 		Edges: []EdgeDef{
 			// Malformed CEL expression: unbalanced parentheses
-			{From: "step", To: "next", Condition: "step.status == 'done'("},
+			{From: "step", To: "next", Condition: "results.step.status == 'done'("},
 		},
 	}
 
@@ -682,7 +734,7 @@ func TestOrphanedActivatedNodeFailsRun(t *testing.T) {
 		},
 		Edges: []EdgeDef{
 			// after depends on good, condition that always evaluates false
-			{From: "good", To: "after", Condition: "good.outcome == 'never'"},
+			{From: "good", To: "after", Condition: "results.good.outcome == 'never'"},
 		},
 	}
 
@@ -724,8 +776,8 @@ func TestConditionalBranchNonActivatedIsFine(t *testing.T) {
 			{ID: "sad", Type: "sad"},
 		},
 		Edges: []EdgeDef{
-			{From: "search", To: "happy", Condition: "search.status == 'success'"},
-			{From: "search", To: "sad", Condition: "search.status != 'success'"},
+			{From: "search", To: "happy", Condition: "results.search.status == 'success'"},
+			{From: "search", To: "sad", Condition: "results.search.status != 'success'"},
 		},
 	}
 
@@ -807,7 +859,7 @@ func TestBackEdgeSnapshotsNodeHistory(t *testing.T) {
 
 	// "a" is reset twice via back-edge, so a._runs should have 2 entries
 	// (snapshots from iterations 1 and 2; iteration 3 is the final value).
-	runsJSON := run.Context["a._runs"]
+	runsJSON := resultHistoryJSON(run, "a")
 	if runsJSON == "" {
 		t.Fatal("expected a._runs in context")
 	}
@@ -825,36 +877,36 @@ func TestBackEdgeSnapshotsNodeHistory(t *testing.T) {
 		t.Fatalf("expected second history count=3, got %q", history[1]["count"])
 	}
 	// Final value should be the last execution
-	if run.Context["a.count"] != "5" {
-		t.Fatalf("expected final a.count=5, got %q", run.Context["a.count"])
+	if resultValue(run, "a", "count") != "5" {
+		t.Fatalf("expected final a.count=5, got %q", resultValue(run, "a", "count"))
 	}
 }
 
 func TestTypedCELEvaluation(t *testing.T) {
-	ctx := NewContext(nil)
-	ctx.Set("fetch.status", "success")
-	ctx.Set("fetch.count", "42")
-	ctx.Set("fetch.active", "true")
+	ctx := NewInvocationFromInputs(nil)
+	ctx.Results.SetField("fetch", "status", "success")
+	ctx.Results.SetField("fetch", "count", "42")
+	ctx.Results.SetField("fetch", "active", "true")
 
 	// Scalar values stay as strings (executor outputs are map[string]string)
-	ok, err := EvalCondition("fetch.count == '42'", ctx)
+	ok, err := EvalCondition("results.fetch.count == '42'", ctx)
 	if err != nil {
 		t.Fatalf("string number eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected fetch.count == '42' to be true")
+		t.Fatal("expected results.fetch.count == '42' to be true")
 	}
 
-	ok, err = EvalCondition("fetch.active == 'true'", ctx)
+	ok, err = EvalCondition("results.fetch.active == 'true'", ctx)
 	if err != nil {
 		t.Fatalf("string bool eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected fetch.active == 'true' to be true")
+		t.Fatal("expected results.fetch.active == 'true' to be true")
 	}
 
 	// String comparison works as before
-	ok, err = EvalCondition("fetch.status == 'success'", ctx)
+	ok, err = EvalCondition("results.fetch.status == 'success'", ctx)
 	if err != nil {
 		t.Fatalf("string eval error: %v", err)
 	}
@@ -864,51 +916,53 @@ func TestTypedCELEvaluation(t *testing.T) {
 }
 
 func TestTypedCELListAccess(t *testing.T) {
-	ctx := NewContext(nil)
+	ctx := NewInvocationFromInputs(nil)
 	history := []map[string]string{
 		{"status": "waiting", "count": "1"},
 		{"status": "success", "count": "2"},
 	}
-	encoded, _ := json.Marshal(history)
-	ctx.Set("fetch._runs", string(encoded))
+	for _, snap := range history {
+		ctx.Results.MergeOutputs("fetch", snap)
+		ctx.Results.AppendHistory("fetch")
+	}
 
-	ok, err := EvalCondition("fetch._runs.size() == 2", ctx)
+	ok, err := EvalCondition("results.fetch.history.size() == 2", ctx)
 	if err != nil {
 		t.Fatalf("list size eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected fetch._runs.size() == 2")
+		t.Fatal("expected results.fetch.history.size() == 2")
 	}
 
-	ok, err = EvalCondition("fetch._runs.size() > 0", ctx)
+	ok, err = EvalCondition("results.fetch.history.size() > 0", ctx)
 	if err != nil {
 		t.Fatalf("list > 0 eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected fetch._runs.size() > 0")
+		t.Fatal("expected results.fetch.history.size() > 0")
 	}
 }
 
 func TestTypedCELMapAccess(t *testing.T) {
-	ctx := NewContext(nil)
+	ctx := NewInvocationFromInputs(nil)
 	obj := map[string]any{"outcome": "0", "confidence": 0.95}
 	encoded, _ := json.Marshal(obj)
-	ctx.Set("judge.details", string(encoded))
+	ctx.Results.SetField("judge", "details", string(encoded))
 
-	ok, err := EvalCondition("judge.details.outcome == '0'", ctx)
+	ok, err := EvalCondition("results.judge.details.outcome == '0'", ctx)
 	if err != nil {
 		t.Fatalf("map field eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected judge.details.outcome == '0'")
+		t.Fatal("expected results.judge.details.outcome == '0'")
 	}
 
-	ok, err = EvalCondition("judge.details.confidence > 0.5", ctx)
+	ok, err = EvalCondition("results.judge.details.confidence > 0.5", ctx)
 	if err != nil {
 		t.Fatalf("map number eval error: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected judge.details.confidence > 0.5")
+		t.Fatal("expected results.judge.details.confidence > 0.5")
 	}
 }
 
@@ -931,40 +985,40 @@ func TestCELExtStringsMethodsRoundTrip(t *testing.T) {
 		want       string
 	}{
 		// charAt
-		{"charAt", map[string]string{"v": "hello"}, "v.charAt(1)", "e"},
-		{"charAt dotted", map[string]string{"fetch.raw": "hello"}, "fetch.raw.charAt(0)", "h"},
+		{"charAt", map[string]string{"v": "hello"}, "inputs.v.charAt(1)", "e"},
+		{"charAt dotted", map[string]string{"fetch.raw": "hello"}, "inputs.fetch.raw.charAt(0)", "h"},
 		// format
-		{"format", map[string]string{"v": "hello %s"}, "v.format(['world'])", "hello world"},
-		{"format dotted", map[string]string{"fetch.tpl": "%d:%s"}, "fetch.tpl.format([7, 'ok'])", "7:ok"},
+		{"format", map[string]string{"v": "hello %s"}, "inputs.v.format(['world'])", "hello world"},
+		{"format dotted", map[string]string{"fetch.tpl": "%d:%s"}, "inputs.fetch.tpl.format([7, 'ok'])", "7:ok"},
 		// indexOf
-		{"indexOf", map[string]string{"v": "hello world"}, "v.indexOf('world')", "6"},
-		{"indexOf dotted", map[string]string{"fetch.raw": "abcdef"}, "fetch.raw.indexOf('cd')", "2"},
+		{"indexOf", map[string]string{"v": "hello world"}, "inputs.v.indexOf('world')", "6"},
+		{"indexOf dotted", map[string]string{"fetch.raw": "abcdef"}, "inputs.fetch.raw.indexOf('cd')", "2"},
 		// lastIndexOf
-		{"lastIndexOf", map[string]string{"v": "abcabc"}, "v.lastIndexOf('b')", "4"},
-		{"lastIndexOf dotted", map[string]string{"fetch.raw": "xyxyxy"}, "fetch.raw.lastIndexOf('y')", "5"},
+		{"lastIndexOf", map[string]string{"v": "abcabc"}, "inputs.v.lastIndexOf('b')", "4"},
+		{"lastIndexOf dotted", map[string]string{"fetch.raw": "xyxyxy"}, "inputs.fetch.raw.lastIndexOf('y')", "5"},
 		// lowerAscii
-		{"lowerAscii", map[string]string{"v": "HELLO"}, "v.lowerAscii()", "hello"},
-		{"lowerAscii dotted", map[string]string{"fetch.raw": "HI"}, "fetch.raw.lowerAscii()", "hi"},
+		{"lowerAscii", map[string]string{"v": "HELLO"}, "inputs.v.lowerAscii()", "hello"},
+		{"lowerAscii dotted", map[string]string{"fetch.raw": "HI"}, "inputs.fetch.raw.lowerAscii()", "hi"},
 		// replace
-		{"replace", map[string]string{"v": "ababab"}, "v.replace('a', 'X')", "XbXbXb"},
-		{"replace limit", map[string]string{"v": "ababab"}, "v.replace('a', 'X', 2)", "XbXbab"},
-		{"replace dotted", map[string]string{"fetch.raw": "foo"}, "fetch.raw.replace('f', 'b')", "boo"},
+		{"replace", map[string]string{"v": "ababab"}, "inputs.v.replace('a', 'X')", "XbXbXb"},
+		{"replace limit", map[string]string{"v": "ababab"}, "inputs.v.replace('a', 'X', 2)", "XbXbab"},
+		{"replace dotted", map[string]string{"fetch.raw": "foo"}, "inputs.fetch.raw.replace('f', 'b')", "boo"},
 		// split
-		{"split", map[string]string{"v": "a,b,c"}, "v.split(',')", `["a","b","c"]`},
-		{"split dotted", map[string]string{"fetch.raw": "x,y,z"}, "fetch.raw.split(',')", `["x","y","z"]`},
+		{"split", map[string]string{"v": "a,b,c"}, "inputs.v.split(',')", `["a","b","c"]`},
+		{"split dotted", map[string]string{"fetch.raw": "x,y,z"}, "inputs.fetch.raw.split(',')", `["x","y","z"]`},
 		// substring
-		{"substring from", map[string]string{"v": "abcdef"}, "v.substring(2)", "cdef"},
-		{"substring range", map[string]string{"v": "abcdef"}, "v.substring(1, 4)", "bcd"},
-		{"substring dotted", map[string]string{"fetch.raw": "hello"}, "fetch.raw.substring(1, 3)", "el"},
+		{"substring from", map[string]string{"v": "abcdef"}, "inputs.v.substring(2)", "cdef"},
+		{"substring range", map[string]string{"v": "abcdef"}, "inputs.v.substring(1, 4)", "bcd"},
+		{"substring dotted", map[string]string{"fetch.raw": "hello"}, "inputs.fetch.raw.substring(1, 3)", "el"},
 		// trim
-		{"trim", map[string]string{"v": "  hello  "}, "v.trim()", "hello"},
-		{"trim dotted", map[string]string{"fetch.raw": "  xx  "}, "fetch.raw.trim()", "xx"},
+		{"trim", map[string]string{"v": "  hello  "}, "inputs.v.trim()", "hello"},
+		{"trim dotted", map[string]string{"fetch.raw": "  xx  "}, "inputs.fetch.raw.trim()", "xx"},
 		// upperAscii
-		{"upperAscii", map[string]string{"v": "hello"}, "v.upperAscii()", "HELLO"},
-		{"upperAscii dotted", map[string]string{"fetch.raw": "hi"}, "fetch.raw.upperAscii()", "HI"},
+		{"upperAscii", map[string]string{"v": "hello"}, "inputs.v.upperAscii()", "HELLO"},
+		{"upperAscii dotted", map[string]string{"fetch.raw": "hi"}, "inputs.fetch.raw.upperAscii()", "HI"},
 		// reverse
-		{"reverse", map[string]string{"v": "abc"}, "v.reverse()", "cba"},
-		{"reverse dotted", map[string]string{"fetch.raw": "xyz"}, "fetch.raw.reverse()", "zyx"},
+		{"reverse", map[string]string{"v": "abc"}, "inputs.v.reverse()", "cba"},
+		{"reverse dotted", map[string]string{"fetch.raw": "xyz"}, "inputs.fetch.raw.reverse()", "zyx"},
 		// join — uses literal list so CEL doesn't need to coerce list<dyn>
 		// (the result of parsing a JSON array from context) into list<string>.
 		{"join", nil, "['a', 'b', 'c'].join()", "abc"},
@@ -973,9 +1027,9 @@ func TestCELExtStringsMethodsRoundTrip(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := NewContext(nil)
+			ctx := NewInvocationFromInputs(nil)
 			for k, v := range tc.values {
-				ctx.Set(k, v)
+				ctx.Run.Inputs[k] = v
 			}
 			got, err := EvalExpression(tc.expression, ctx)
 			if err != nil {
@@ -1033,5 +1087,199 @@ func TestExtractIdentifiersStripsCELMethods(t *testing.T) {
 				t.Fatalf("extractIdentifiers(%q) = %v, want [fetch.raw]", token, ids)
 			}
 		})
+	}
+}
+
+type cancellableMockExecutor struct {
+	calls    []string
+	hitKey   string
+	returned bool
+}
+
+func (c *cancellableMockExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
+	return ExecutorResult{}, nil
+}
+
+func (c *cancellableMockExecutor) CancelCorrelation(key string) bool {
+	c.calls = append(c.calls, key)
+	if key == c.hitKey {
+		c.returned = true
+		return true
+	}
+	return false
+}
+
+func TestEngineCancelCorrelationDispatchesToCancellableExecutors(t *testing.T) {
+	engine := NewEngine(nil)
+	cancellable := &cancellableMockExecutor{hitKey: "alpha"}
+	engine.RegisterExecutor("cancellable", cancellable)
+	// Non-cancellable executors must be skipped without error.
+	engine.RegisterExecutor("plain", &mockExecutor{})
+
+	if !engine.CancelCorrelation("alpha") {
+		t.Fatal("CancelCorrelation(matching key) = false, want true")
+	}
+	if engine.CancelCorrelation("beta") {
+		t.Fatal("CancelCorrelation(unknown key) = true, want false")
+	}
+	if engine.CancelCorrelation("") {
+		t.Fatal("CancelCorrelation(empty key) must short-circuit to false")
+	}
+	if got := cancellable.calls; !reflect.DeepEqual(got, []string{"alpha", "beta"}) {
+		t.Fatalf("executor received %v, want [alpha beta]", got)
+	}
+}
+
+func TestEngineCancelCorrelationNoCancellableExecutorsIsSafe(t *testing.T) {
+	engine := NewEngine(nil)
+	engine.RegisterExecutor("plain", &mockExecutor{})
+	if engine.CancelCorrelation("anything") {
+		t.Fatal("expected false when no executor implements CancellableExecutor")
+	}
+}
+
+func TestEngineCancelCorrelationNilReceiverIsSafe(t *testing.T) {
+	var engine *Engine
+	if engine.CancelCorrelation("key") {
+		t.Fatal("expected nil-receiver CancelCorrelation to return false")
+	}
+}
+
+type suspendableMock struct {
+	canSuspend bool
+	calls      []NodeDef
+}
+
+func (s *suspendableMock) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
+	return ExecutorResult{}, nil
+}
+
+func (s *suspendableMock) CanSuspend(node NodeDef) bool {
+	s.calls = append(s.calls, node)
+	return s.canSuspend
+}
+
+func TestEngineCanSuspendDelegatesToSuspendableExecutor(t *testing.T) {
+	engine := NewEngine(nil)
+	mock := &suspendableMock{canSuspend: true}
+	engine.RegisterExecutor("signal_node", mock)
+	engine.RegisterExecutor("plain_node", &mockExecutor{})
+
+	if !engine.CanSuspend(NodeDef{ID: "x", Type: "signal_node"}) {
+		t.Fatal("CanSuspend(suspendable) = false, want true")
+	}
+	if engine.CanSuspend(NodeDef{ID: "y", Type: "plain_node"}) {
+		t.Fatal("CanSuspend(non-SuspendableExecutor) = true, want false")
+	}
+	if engine.CanSuspend(NodeDef{ID: "z", Type: "unknown"}) {
+		t.Fatal("CanSuspend(unknown type) = true, want false")
+	}
+	if len(mock.calls) != 1 || mock.calls[0].ID != "x" {
+		t.Fatalf("suspendable mock received %v, want one call with ID=x", mock.calls)
+	}
+}
+
+func TestEngineCanSuspendNilReceiverIsSafe(t *testing.T) {
+	var engine *Engine
+	if engine.CanSuspend(NodeDef{Type: "anything"}) {
+		t.Fatal("expected nil-receiver CanSuspend to return false")
+	}
+}
+
+func TestEngineValidateNoSuspensionCapableNodesListsSortedOffenders(t *testing.T) {
+	engine := NewEngine(nil)
+	engine.RegisterExecutor("suspender", &suspendableMock{canSuspend: true})
+	engine.RegisterExecutor("plain", &mockExecutor{})
+
+	bp := Blueprint{
+		Nodes: []NodeDef{
+			{ID: "zeta", Type: "suspender"},
+			{ID: "alpha", Type: "suspender"},
+			{ID: "gamma", Type: "plain"},
+		},
+	}
+	err := engine.ValidateNoSuspensionCapableNodes(bp)
+	if err == nil {
+		t.Fatal("expected error listing suspending offenders")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "alpha (suspender), zeta (suspender)") {
+		t.Fatalf("offender list missing or out of order: %q", msg)
+	}
+	if strings.Contains(msg, "gamma") {
+		t.Fatalf("non-suspending node reported as offender: %q", msg)
+	}
+}
+
+func TestEngineValidateNoSuspensionCapableNodesAcceptsCleanBlueprint(t *testing.T) {
+	engine := NewEngine(nil)
+	engine.RegisterExecutor("plain", &mockExecutor{})
+	engine.RegisterExecutor("nonsuspendable", &suspendableMock{canSuspend: false})
+
+	bp := Blueprint{
+		Nodes: []NodeDef{
+			{ID: "a", Type: "plain"},
+			{ID: "b", Type: "nonsuspendable"},
+		},
+	}
+	if err := engine.ValidateNoSuspensionCapableNodes(bp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEngineValidateNoSuspensionCapableNodesNilReceiverIsSafe(t *testing.T) {
+	var engine *Engine
+	if err := engine.ValidateNoSuspensionCapableNodes(Blueprint{}); err != nil {
+		t.Fatalf("nil-receiver returned err: %v", err)
+	}
+}
+
+type describedMock struct {
+	schema json.RawMessage
+	keys   []string
+}
+
+func (d *describedMock) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
+	return ExecutorResult{}, nil
+}
+
+func (d *describedMock) ConfigSchema() json.RawMessage { return d.schema }
+
+func (d *describedMock) OutputKeys() []string { return d.keys }
+
+func TestEngineConfigSchemaForAndOutputKeysFor(t *testing.T) {
+	engine := NewEngine(nil)
+	schema := json.RawMessage(`{"type":"object"}`)
+	keys := []string{"status", "outcome"}
+	engine.RegisterExecutor("described", &describedMock{schema: schema, keys: keys})
+	engine.RegisterExecutor("plain", &mockExecutor{})
+
+	if got := engine.ConfigSchemaFor("described"); string(got) != string(schema) {
+		t.Fatalf("ConfigSchemaFor(described) = %s, want %s", got, schema)
+	}
+	if got := engine.OutputKeysFor("described"); !reflect.DeepEqual(got, keys) {
+		t.Fatalf("OutputKeysFor(described) = %v, want %v", got, keys)
+	}
+	if got := engine.ConfigSchemaFor("plain"); got != nil {
+		t.Fatalf("ConfigSchemaFor(non-implementer) = %s, want nil", got)
+	}
+	if got := engine.OutputKeysFor("plain"); got != nil {
+		t.Fatalf("OutputKeysFor(non-implementer) = %v, want nil", got)
+	}
+	if got := engine.ConfigSchemaFor("unknown"); got != nil {
+		t.Fatalf("ConfigSchemaFor(unknown) = %s, want nil", got)
+	}
+	if got := engine.OutputKeysFor("unknown"); got != nil {
+		t.Fatalf("OutputKeysFor(unknown) = %v, want nil", got)
+	}
+}
+
+func TestEngineCatalogLookupsNilReceiverIsSafe(t *testing.T) {
+	var engine *Engine
+	if got := engine.ConfigSchemaFor("whatever"); got != nil {
+		t.Fatalf("nil-receiver ConfigSchemaFor returned %s", got)
+	}
+	if got := engine.OutputKeysFor("whatever"); got != nil {
+		t.Fatalf("nil-receiver OutputKeysFor returned %v", got)
 	}
 }

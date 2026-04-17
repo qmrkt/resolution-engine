@@ -21,7 +21,9 @@ type signalRequest struct {
 	SignalType     string            `json:"signal_type"`
 	CorrelationKey string            `json:"correlation_key"`
 	ObservedAt     string            `json:"observed_at,omitempty"`
+	ConsumedAt     string            `json:"consumed_at,omitempty"`
 	Payload        map[string]string `json:"payload,omitempty"`
+	Usage          dag.TokenUsage    `json:"usage,omitempty"`
 }
 
 type signalResult struct {
@@ -42,11 +44,36 @@ type durableRunRecord struct {
 	CreatedAt         string                   `json:"created_at"`
 	UpdatedAt         string                   `json:"updated_at"`
 	CompletedAt       string                   `json:"completed_at,omitempty"`
+	// scheduler caches the per-record DAG scheduler. It is rebuilt on reload.
+	scheduler *dag.Scheduler
+}
+
+// ensureScheduler lazily rebuilds the cached scheduler from the record.
+func (r *durableRunRecord) ensureScheduler() *dag.Scheduler {
+	if r == nil || r.Checkpoint.Run == nil {
+		return nil
+	}
+	if r.scheduler != nil {
+		return r.scheduler
+	}
+	s := dag.NewScheduler(r.Checkpoint.Run.Definition)
+	s.RestoreTraversals(r.Checkpoint.EdgeTraversals)
+	for nodeID := range r.Checkpoint.Skipped {
+		s.Skipped[nodeID] = struct{}{}
+	}
+	r.scheduler = s
+	return s
+}
+
+// clearScheduler drops the cached scheduler.
+func (r *durableRunRecord) clearScheduler() {
+	if r != nil {
+		r.scheduler = nil
+	}
 }
 
 type durableCheckpoint struct {
 	Run            *dag.RunState                 `json:"run"`
-	Context        map[string]string             `json:"context"`
 	Completed      map[string]bool               `json:"completed,omitempty"`
 	Failed         map[string]bool               `json:"failed,omitempty"`
 	Activated      map[string]bool               `json:"activated,omitempty"`
@@ -57,19 +84,12 @@ type durableCheckpoint struct {
 }
 
 type durableWaitingNode struct {
-	NodeID          string            `json:"node_id"`
-	Kind            string            `json:"kind"`
-	Reason          string            `json:"reason,omitempty"`
-	SignalType      string            `json:"signal_type,omitempty"`
-	CorrelationKey  string            `json:"correlation_key,omitempty"`
-	ResumeAtUnix    int64             `json:"resume_at_unix,omitempty"`
-	RequiredPayload []string          `json:"required_payload,omitempty"`
-	DefaultOutputs  map[string]string `json:"default_outputs,omitempty"`
-	Outputs         map[string]string `json:"outputs,omitempty"`
-	TimeoutOutputs  map[string]string `json:"timeout_outputs,omitempty"`
-	StartedAt       string            `json:"started_at,omitempty"`
-	InputSnapshot   map[string]string `json:"input_snapshot,omitempty"`
-	Iteration       int               `json:"iteration,omitempty"`
+	NodeID         string            `json:"node_id"`
+	dag.Suspension                   // fields promoted at top level via JSON embedding
+	Usage          dag.TokenUsage    `json:"usage,omitempty"`
+	StartedAt      string            `json:"started_at,omitempty"`
+	InputSnapshot  map[string]string `json:"input_snapshot,omitempty"`
+	Iteration      int               `json:"iteration,omitempty"`
 }
 
 type durableEvent struct {
@@ -301,9 +321,6 @@ func ensureDurableRecordMaps(record *durableRunRecord) {
 		record.Signals = make(map[string]signalRequest)
 	}
 	cp := &record.Checkpoint
-	if cp.Context == nil {
-		cp.Context = make(map[string]string)
-	}
 	if cp.Completed == nil {
 		cp.Completed = make(map[string]bool)
 	}
@@ -332,8 +349,8 @@ func ensureDurableRecordMaps(record *durableRunRecord) {
 		if cp.Run.EdgeTraversals == nil {
 			cp.Run.EdgeTraversals = make(map[string]int)
 		}
-		if cp.Run.Context == nil {
-			cp.Run.Context = make(map[string]string)
+		if cp.Run.Results == nil {
+			cp.Run.Results = dag.NewResults()
 		}
 	}
 }

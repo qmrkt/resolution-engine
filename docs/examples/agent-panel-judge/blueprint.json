@@ -14,7 +14,7 @@
         "output_mode": "structured",
         "max_steps": 4,
         "max_tool_calls": 4,
-        "prompt": "Analyze the market wording and resolution rules. Identify what facts are needed, what would make the market unanswerable, and which outcome labels are valid.\n\nQuestion: {{market.question}}\nRules: {{market.resolution_rules}}\nOutcomes JSON: {{market.outcomes_json}}",
+        "prompt": "Analyze the market wording and resolution rules. Identify what facts are needed, what would make the market unanswerable, and which outcome labels are valid.\n\nQuestion: {{inputs.market.question}}\nRules: {{inputs.market.resolution_rules}}\nOutcomes JSON: {{inputs.market.outcomes_json}}",
         "output_tool": {
           "parameters": {
             "type": "object",
@@ -39,7 +39,7 @@
         "output_mode": "structured",
         "max_steps": 7,
         "max_tool_calls": 12,
-        "prompt": "Gather and summarize evidence relevant to this market.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nSuggested sources JSON: {{market.sources_json}}",
+        "prompt": "Gather and summarize evidence relevant to this market.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nSuggested sources JSON: {{inputs.market.sources_json}}",
         "tools": [
           { "name": "source_fetch", "kind": "builtin" },
           { "name": "json_extract", "kind": "builtin" },
@@ -70,7 +70,7 @@
         "output_mode": "structured",
         "max_steps": 4,
         "max_tool_calls": 4,
-        "prompt": "Review the rule analysis and evidence for reasons not to resolve yet.\n\nRules report JSON: {{rules_agent.output_json}}\nEvidence report JSON: {{evidence_agent.output_json}}\n\nIdentify conflicts, missing primary evidence, alternate outcome interpretations, and cancellation risks.",
+        "prompt": "Review the rule analysis and evidence for reasons not to resolve yet.\n\nRules report JSON: {{results.rules_agent.output_json}}\nEvidence report JSON: {{results.evidence_agent.output_json}}\n\nIdentify conflicts, missing primary evidence, alternate outcome interpretations, and cancellation risks.",
         "output_tool": {
           "parameters": {
             "type": "object",
@@ -93,27 +93,35 @@
         "provider": "openai",
         "model": "gpt-5.4",
         "output_mode": "resolution",
-        "allowed_outcomes_key": "market.outcomes_json",
+        "allowed_outcomes_key": "inputs.market.outcomes_json",
         "reasoning": "medium",
         "max_steps": 5,
         "max_tool_calls": 4,
-        "prompt": "Make the final resolution decision using the panel reports.\n\nQuestion: {{market.question}}\nOutcomes JSON: {{market.outcomes_json}}\nRules report JSON: {{rules_agent.output_json}}\nEvidence report JSON: {{evidence_agent.output_json}}\nSkeptic report JSON: {{skeptic_agent.output_json}}\n\nResolve only if evidence and rules support one outcome. If unresolved or materially ambiguous, return inconclusive."
+        "prompt": "Make the final resolution decision using the panel reports.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nRules report JSON: {{results.rules_agent.output_json}}\nEvidence report JSON: {{results.evidence_agent.output_json}}\nSkeptic report JSON: {{results.skeptic_agent.output_json}}\n\nResolve only if evidence and rules support one outcome. If unresolved or materially ambiguous, return inconclusive."
       }
     },
     {
       "id": "submit",
-      "type": "submit_result",
+      "type": "return",
       "label": "Submit",
       "config": {
-        "outcome_key": "judge_agent.outcome"
+        "value": {
+          "status": "success",
+          "outcome": "{{results.judge_agent.outcome}}",
+          "confidence": "{{results.judge_agent.confidence}}",
+          "reasoning": "{{results.judge_agent.reasoning}}"
+        }
       }
     },
     {
       "id": "cancel",
-      "type": "cancel_market",
+      "type": "return",
       "label": "Cancel",
       "config": {
-        "reason": "The agent panel judge was inconclusive."
+        "value": {
+          "status": "cancelled",
+          "reason": "The agent panel judge was inconclusive."
+        }
       }
     }
   ],
@@ -124,12 +132,12 @@
     {
       "from": "judge_agent",
       "to": "submit",
-      "condition": "judge_agent.status == 'success' && judge_agent.outcome != 'inconclusive' && judge_agent.outcome != ''"
+      "condition": "results.judge_agent.status == 'success' && results.judge_agent.outcome != 'inconclusive' && results.judge_agent.outcome != ''"
     },
     {
       "from": "judge_agent",
       "to": "cancel",
-      "condition": "judge_agent.outcome == 'inconclusive' || judge_agent.status != 'success'"
+      "condition": "results.judge_agent.outcome == 'inconclusive' || results.judge_agent.status != 'success'"
     }
   ],
   "budget": {

@@ -25,7 +25,7 @@ func smallBlueprint() Blueprint {
 		Nodes: []NodeDef{
 			{ID: "fetch", Type: "api_fetch"},
 			{ID: "judge", Type: "llm_call"},
-			{ID: "submit", Type: "submit_result"},
+			{ID: "submit", Type: "return"},
 		},
 		Edges: []EdgeDef{
 			{From: "fetch", To: "judge"},
@@ -44,7 +44,7 @@ func mediumBlueprint() Blueprint {
 		}
 	}
 	// Add a branch
-	edges = append(edges, EdgeDef{From: "n2", To: "n7", Condition: `n2.status == "completed"`})
+	edges = append(edges, EdgeDef{From: "n2", To: "n7", Condition: `results.n2.status == "completed"`})
 	return Blueprint{ID: "bench-medium", Nodes: nodes, Edges: edges}
 }
 
@@ -65,12 +65,12 @@ func largeBlueprint() Blueprint {
 	return Blueprint{ID: "bench-large", Nodes: nodes, Edges: edges}
 }
 
-func contextWithKeys(n int) *Context {
+func contextWithKeys(n int) *Invocation {
 	inputs := make(map[string]string, n)
 	for i := 0; i < n; i++ {
 		inputs[fmt.Sprintf("key_%d", i)] = fmt.Sprintf("value_%d", i)
 	}
-	return NewContext(inputs)
+	return NewInvocationFromInputs(inputs)
 }
 
 // --- Scheduler benchmarks ---
@@ -124,98 +124,107 @@ func BenchmarkReadyNodes_Large(b *testing.B) {
 func BenchmarkEvaluateEdges(b *testing.B) {
 	bp := mediumBlueprint()
 	s := NewScheduler(bp)
-	ctx := contextWithKeys(20)
-	ctx.Set("n2.status", "completed")
+	inv := contextWithKeys(20)
+	inv.Results.SetField("n2", "status", "completed")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = s.EvaluateEdges("n2", ctx)
+		_, _ = s.EvaluateEdges("n2", inv)
 	}
 }
 
 // --- CEL evaluation benchmarks ---
 
 func BenchmarkEvalCondition_Simple(b *testing.B) {
-	ctx := NewContext(map[string]string{"status": "completed"})
+	inv := NewInvocationFromInputs(map[string]string{"status": "completed"})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = EvalCondition(`status == "completed"`, ctx)
+		_, _ = EvalCondition(`inputs.status == "completed"`, inv)
 	}
 }
 
 func BenchmarkEvalCondition_Complex(b *testing.B) {
-	ctx := NewContext(map[string]string{
+	inv := NewInvocationFromInputs(map[string]string{
 		"fetch.status":     "success",
 		"judge.outcome":    "0",
 		"judge.confidence": "high",
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = EvalCondition(`fetch.status == "success" && judge.outcome != "inconclusive"`, ctx)
+		_, _ = EvalCondition(`inputs.fetch.status == "success" && inputs.judge.outcome != "inconclusive"`, inv)
 	}
 }
 
 func BenchmarkEvalCondition_WithList(b *testing.B) {
-	ctx := NewContext(map[string]string{
-		"fetch._runs": `[{"status":"success"},{"status":"failed"},{"status":"success"}]`,
+	inv := NewInvocationFromInputs(map[string]string{
+		"fetch_runs": `[{"status":"success"},{"status":"failed"},{"status":"success"}]`,
 	})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = EvalCondition(`fetch._runs.size() >= 2`, ctx)
+		_, _ = EvalCondition(`inputs.fetch_runs.size() >= 2`, inv)
 	}
 }
 
-// --- Context benchmarks ---
+// --- Invocation benchmarks ---
 
-func BenchmarkContextSet(b *testing.B) {
-	ctx := NewContext(nil)
+func BenchmarkInvocationResultsSetField(b *testing.B) {
+	inv := NewInvocationFromInputs(nil)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Set(fmt.Sprintf("key_%d", i%100), "value")
+		inv.Results.SetField("node", fmt.Sprintf("key_%d", i%100), "value")
 	}
 }
 
-func BenchmarkContextGet(b *testing.B) {
-	ctx := contextWithKeys(100)
+func BenchmarkInvocationResultsGet(b *testing.B) {
+	inv := NewInvocationFromInputs(nil)
+	for i := 0; i < 100; i++ {
+		inv.Results.SetField("node", fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i))
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Get(fmt.Sprintf("key_%d", i%100))
+		inv.Results.Get("node", fmt.Sprintf("key_%d", i%100))
 	}
 }
 
-func BenchmarkContextSnapshot_20(b *testing.B) {
-	ctx := contextWithKeys(20)
+func BenchmarkInvocationResultsSnapshot_20(b *testing.B) {
+	inv := NewInvocationFromInputs(nil)
+	for i := 0; i < 20; i++ {
+		inv.Results.SetField(fmt.Sprintf("node_%d", i), "value", fmt.Sprintf("v_%d", i))
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Snapshot()
+		inv.Results.Snapshot()
 	}
 }
 
-func BenchmarkContextSnapshot_100(b *testing.B) {
-	ctx := contextWithKeys(100)
+func BenchmarkInvocationResultsSnapshot_100(b *testing.B) {
+	inv := NewInvocationFromInputs(nil)
+	for i := 0; i < 100; i++ {
+		inv.Results.SetField(fmt.Sprintf("node_%d", i), "value", fmt.Sprintf("v_%d", i))
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Snapshot()
+		inv.Results.Snapshot()
 	}
 }
 
-func BenchmarkContextInterpolate_Simple(b *testing.B) {
-	ctx := NewContext(map[string]string{"name": "world"})
+func BenchmarkInvocationInterpolate_Simple(b *testing.B) {
+	inv := NewInvocationFromInputs(map[string]string{"name": "world"})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Interpolate("hello {{name}}")
+		inv.Interpolate("hello {{inputs.name}}")
 	}
 }
 
-func BenchmarkContextInterpolate_Multi(b *testing.B) {
-	ctx := NewContext(map[string]string{
+func BenchmarkInvocationInterpolate_Multi(b *testing.B) {
+	inv := NewInvocationFromInputs(map[string]string{
 		"question": "Will BTC hit 100k?",
 		"evidence": "Market data shows...",
 		"outcomes": "[\"Yes\",\"No\"]",
 	})
-	template := "Question: {{question}}\nEvidence: {{evidence}}\nOutcomes: {{outcomes}}"
+	template := "Question: {{inputs.question}}\nEvidence: {{inputs.evidence}}\nOutcomes: {{inputs.outcomes}}"
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx.Interpolate(template)
+		inv.Interpolate(template)
 	}
 }
 
@@ -227,7 +236,7 @@ func BenchmarkCloneRunState_Small(b *testing.B) {
 		ID:             "bench",
 		Definition:     bp,
 		NodeStates:     make(map[string]NodeState, 3),
-		Context:        make(map[string]string, 20),
+		Results:        NewResults(),
 		Inputs:         make(map[string]string, 5),
 		EdgeTraversals: make(map[string]int, 2),
 	}
@@ -235,7 +244,7 @@ func BenchmarkCloneRunState_Small(b *testing.B) {
 		run.NodeStates[n.ID] = NodeState{Status: "completed"}
 	}
 	for i := 0; i < 20; i++ {
-		run.Context[fmt.Sprintf("k%d", i)] = fmt.Sprintf("v%d", i)
+		run.Results.SetField("bench", fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -249,7 +258,7 @@ func BenchmarkCloneRunState_Large(b *testing.B) {
 		ID:             "bench",
 		Definition:     bp,
 		NodeStates:     make(map[string]NodeState, 16),
-		Context:        make(map[string]string, 200),
+		Results:        NewResults(),
 		Inputs:         make(map[string]string, 10),
 		EdgeTraversals: make(map[string]int, 30),
 		NodeTraces:     make([]NodeTrace, 16),
@@ -258,7 +267,7 @@ func BenchmarkCloneRunState_Large(b *testing.B) {
 		run.NodeStates[n.ID] = NodeState{Status: "completed"}
 	}
 	for i := 0; i < 200; i++ {
-		run.Context[fmt.Sprintf("k%d", i)] = fmt.Sprintf("v%d", i)
+		run.Results.SetField("bench", fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 	}
 	for i := 0; i < 16; i++ {
 		run.NodeTraces[i] = NodeTrace{
@@ -295,7 +304,7 @@ func BenchmarkValidateBlueprint_Large(b *testing.B) {
 
 type noopExecutor struct{}
 
-func (e *noopExecutor) Execute(_ context.Context, _ NodeDef, _ *Context) (ExecutorResult, error) {
+func (e *noopExecutor) Execute(_ context.Context, _ NodeDef, _ *Invocation) (ExecutorResult, error) {
 	return ExecutorResult{Outputs: map[string]string{"status": "success"}}, nil
 }
 
@@ -303,13 +312,13 @@ func BenchmarkEngineExecute_3Nodes(b *testing.B) {
 	engine := NewEngine(slog.New(slog.NewTextHandler(nopWriter{}, nil)))
 	engine.RegisterExecutor("api_fetch", &noopExecutor{})
 	engine.RegisterExecutor("llm_call", &noopExecutor{})
-	engine.RegisterExecutor("submit_result", &noopExecutor{})
+	engine.RegisterExecutor("return", &noopExecutor{})
 	bp := smallBlueprint()
-	ctx := context.Background()
+	inv := context.Background()
 	inputs := map[string]string{"market_app_id": "1"}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = engine.Execute(ctx, bp, inputs)
+		_, _ = engine.Execute(inv, bp, inputs)
 	}
 }
 
@@ -317,11 +326,11 @@ func BenchmarkEngineExecute_10Nodes(b *testing.B) {
 	engine := NewEngine(slog.New(slog.NewTextHandler(nopWriter{}, nil)))
 	engine.RegisterExecutor("step", &noopExecutor{})
 	bp := mediumBlueprint()
-	ctx := context.Background()
+	inv := context.Background()
 	inputs := map[string]string{"market_app_id": "1"}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = engine.Execute(ctx, bp, inputs)
+		_, _ = engine.Execute(inv, bp, inputs)
 	}
 }
 
@@ -349,15 +358,14 @@ func loadYoloBlueprint(tb testing.TB) Blueprint {
 // reference on the happy path — validate.valid, validate._runs (list),
 // run_child.submitted / deferred / status — so EvaluateEdges exercises the
 // full conditional surface rather than short-circuiting on empty strings.
-func yoloPopulatedContext() *Context {
-	ctx := NewContext(nil)
-	ctx.Set("validate.valid", "true")
-	ctx.Set("validate._runs", `[{"valid":"true"}]`)
-	ctx.Set("run_child.submitted", "true")
-	ctx.Set("run_child.deferred", "false")
-	ctx.Set("run_child.status", "success")
-	ctx.Set("candidate.blueprint_json", `{"id":"child","nodes":[],"edges":[]}`)
-	return ctx
+func yoloPopulatedContext() *Invocation {
+	inv := NewInvocationFromInputs(nil)
+	inv.Results.SetField("validate", "valid", "true")
+	inv.Results.SetField("run_child", "submitted", "true")
+	inv.Results.SetField("run_child", "deferred", "false")
+	inv.Results.SetField("run_child", "status", "success")
+	inv.Run.Inputs["candidate.blueprint_json"] = `{"id":"child","nodes":[],"edges":[]}`
+	return inv
 }
 
 func BenchmarkYolo_NewScheduler(b *testing.B) {
@@ -383,7 +391,7 @@ func BenchmarkYolo_ValidateBlueprint(b *testing.B) {
 func BenchmarkYolo_EvaluateAllEdges(b *testing.B) {
 	bp := loadYoloBlueprint(b)
 	s := NewScheduler(bp)
-	ctx := yoloPopulatedContext()
+	inv := yoloPopulatedContext()
 	nodeIDs := make([]string, 0, len(bp.Nodes))
 	for _, n := range bp.Nodes {
 		nodeIDs = append(nodeIDs, n.ID)
@@ -391,7 +399,7 @@ func BenchmarkYolo_EvaluateAllEdges(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, id := range nodeIDs {
-			_, _ = s.EvaluateEdges(id, ctx)
+			_, _ = s.EvaluateEdges(id, inv)
 		}
 	}
 }
@@ -401,7 +409,7 @@ func BenchmarkYolo_EvaluateAllEdges(b *testing.B) {
 // run_child (submitted) → submit. Everything else returns empty.
 type yoloNodeScriptedExecutor struct{}
 
-func (e *yoloNodeScriptedExecutor) Execute(_ context.Context, node NodeDef, _ *Context) (ExecutorResult, error) {
+func (e *yoloNodeScriptedExecutor) Execute(_ context.Context, node NodeDef, _ *Invocation) (ExecutorResult, error) {
 	switch node.ID {
 	case "validate":
 		return ExecutorResult{Outputs: map[string]string{
@@ -442,13 +450,13 @@ func BenchmarkYolo_EngineExecute_HappyPath(b *testing.B) {
 	// Register noop executors for every node type the yolo blueprint uses.
 	for _, t := range []string{
 		"agent_loop", "cel_eval", "validate_blueprint",
-		"gadget", "submit_result", "defer_resolution",
+		"gadget", "return",
 	} {
 		engine.RegisterExecutor(t, scripted)
 	}
 
 	bp := loadYoloBlueprint(b)
-	ctx := context.Background()
+	inv := context.Background()
 	inputs := map[string]string{
 		"market.question":         "Will X happen?",
 		"market.outcomes_json":    `["Yes","No"]`,
@@ -458,6 +466,6 @@ func BenchmarkYolo_EngineExecute_HappyPath(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = engine.Execute(ctx, bp, inputs)
+		_, _ = engine.Execute(inv, bp, inputs)
 	}
 }

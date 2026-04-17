@@ -11,8 +11,8 @@ The expected signal payload includes:
 flowchart LR
   brief["Prepare Evidence Brief<br/>agent_loop"]
   human["Human Signoff<br/>await_signal"]
-  submit["Submit Human Outcome<br/>submit_result"]
-  defer["Defer Resolution<br/>defer_resolution"]
+  submit["Submit Human Outcome<br/>return"]
+  defer["Defer Resolution<br/>return"]
 
   brief --> human
   human -->|"responded with outcome"| submit

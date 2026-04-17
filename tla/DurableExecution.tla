@@ -7,8 +7,20 @@ the Go runtime coordinates runs, workers, durable waiting state, resume signals,
 timers, restart recovery, and callback delivery.
 
 It intentionally abstracts away executor internals, CEL, JSON persistence, HTTP,
-and full DAG evaluation. Each run has one abstract suspendable node. Once that
-node is completed by a timer or signal resume, it is not run again in this model.
+and full DAG evaluation. Each run has one abstract suspendable node.
+
+A waiting node resolves in one of three ways:
+  1. TimerResume        — its timer fires and the node completes.
+  2. SignalArrives      — a matching signal resolves it and the node completes.
+  3. ExternalReset      — a back-edge from another part of the DAG lands on the
+                          node while it is still waiting; the pending suspension
+                          is abandoned and the node is re-queued to run again.
+                          nodeDone is NOT set: the suspension never completed.
+
+After ExternalReset the node may subsequently suspend again and eventually
+complete via TimerResume / SignalArrives or terminate via CompleteRun / FailRun.
+The nodeDone flag therefore stays monotonic — it tracks whether the node's
+suspension has ever been resolved, not how many times the node has run.
 *)
 
 CONSTANTS
@@ -300,6 +312,30 @@ SignalArrives(run, signal) ==
         /\ UNCHANGED << status, waitingKind, dueTimers, needsEnqueue, nodeDone >>
     /\ UNCHANGED << queue, workerRun, callbackPending, callbackDelivered >>
 
+\* ExternalReset models a back-edge from elsewhere in the DAG landing on a
+\* node that is currently waiting. The pending suspension (timer or signal)
+\* is abandoned and the node is re-queued. This is the durable manager's
+\* evaluateOutgoingEdges reset-while-waiting path: the executor-side cancel
+\* hook (tracked below the abstraction level) releases any in-flight work
+\* keyed on the abandoned correlation.
+\*
+\* Crucially, ExternalReset does NOT set nodeDone. The suspension did not
+\* resolve; it was discarded. nodeDone stays monotonic, reflecting only
+\* resume-based completion.
+ExternalReset(run) ==
+    /\ status[run] = "waiting"
+    /\ status' = [status EXCEPT ![run] = "queued"]
+    /\ waitingKind' = [waitingKind EXCEPT ![run] = "none"]
+    /\ dueTimers' = dueTimers \ {run}
+    /\ needsEnqueue' = needsEnqueue \cup {run}
+    /\ UNCHANGED
+        << queue,
+           workerRun,
+           seenSignals,
+           nodeDone,
+           callbackPending,
+           callbackDelivered >>
+
 Cancel(run) ==
     /\ status[run] \notin TerminalStatuses
     /\ status[run] # "absent"
@@ -352,6 +388,7 @@ Next ==
     \/ \E run \in Runs : TimerBecomesDue(run)
     \/ \E run \in Runs : TimerResume(run)
     \/ \E run \in Runs, signal \in Signals : SignalArrives(run, signal)
+    \/ \E run \in Runs : ExternalReset(run)
     \/ \E run \in Runs : Cancel(run)
     \/ Restart
     \/ \E run \in Runs : DeliverCallback(run)

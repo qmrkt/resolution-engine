@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +50,11 @@ type DurableRunManager struct {
 	// enqueue bursts so the channel and blocked senders stay bounded.
 	queued     map[string]bool
 	runCancels map[string]context.CancelFunc
+	// index is the in-memory projection of the run store's hot-path
+	// metadata. Populated on startup by recoverRuns and kept in sync by
+	// every successful persist. Eliminates O(H) directory scans on
+	// Submit / Signal / timer paths.
+	index *durableRunIndex
 }
 
 type queueFullError struct {
@@ -58,6 +62,29 @@ type queueFullError struct {
 }
 
 var errDurableManagerShuttingDown = errors.New("run manager is shutting down")
+
+// durableInvocationFromRecord builds a typed Invocation from a durable
+// checkpoint. Inputs come from the persisted run inputs; Results are loaded
+// directly from the typed Checkpoint.Run.Results.
+func durableInvocationFromRecord(record *durableRunRecord) *dag.Invocation {
+	if record == nil || record.Checkpoint.Run == nil {
+		return dag.NewInvocation(dag.Run{})
+	}
+	startedAt, _ := time.Parse(time.RFC3339Nano, record.Checkpoint.Run.StartedAt)
+	if startedAt.IsZero() {
+		startedAt, _ = time.Parse(time.RFC3339, record.Checkpoint.Run.StartedAt)
+	}
+	inv := dag.NewInvocation(dag.Run{
+		ID:          record.Checkpoint.Run.ID,
+		BlueprintID: record.Checkpoint.Run.BlueprintID,
+		StartedAt:   startedAt,
+		Inputs:      cloneStringMap(record.Checkpoint.Run.Inputs),
+	})
+	if record.Checkpoint.Run.Results != nil {
+		inv.Results.LoadSnapshot(record.Checkpoint.Run.Results.Snapshot())
+	}
+	return inv
+}
 
 func (e *queueFullError) Error() string {
 	return fmt.Sprintf("workflow queue full: max queued runs %d", e.MaxQueueSize)
@@ -100,10 +127,15 @@ func NewDurableRunManager(runner *Runner, dataDir string, client *http.Client, c
 		pending:       make(map[string]bool),
 		queued:        make(map[string]bool),
 		runCancels:    make(map[string]context.CancelFunc),
+		index:         newDurableRunIndex(),
 	}
 	if err := manager.recoverRuns(); err != nil {
 		cancel()
 		return nil, err
+	}
+	if agent := runner.AgentExecutor(); agent != nil {
+		agent.SetSignalFn(manager.deliverAgentSignal)
+		agent.SetAsyncBaseContext(manager.ctx)
 	}
 	for i := 0; i < manager.maxWorkers; i++ {
 		manager.wg.Add(1)
@@ -113,6 +145,34 @@ func NewDurableRunManager(runner *Runner, dataDir string, client *http.Client, c
 	go manager.timerLoop()
 	go manager.outboxLoop()
 	return manager, nil
+}
+
+// deliverAgentSignal forwards async-agent completion through Signal.
+func (m *DurableRunManager) deliverAgentSignal(runID, correlationKey string, payload map[string]string, usage dag.TokenUsage) error {
+	if m == nil {
+		return errors.New("durable run manager is nil")
+	}
+	const maxAttempts = 8
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, err := m.Signal(signalRequest{
+			IdempotencyKey: correlationKey,
+			RunID:          runID,
+			SignalType:     executors.AgentDoneSignalType,
+			CorrelationKey: correlationKey,
+			Payload:        payload,
+			Usage:          usage,
+		})
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errDurableStaleRecord) {
+			return err
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return lastErr
 }
 
 func (m *DurableRunManager) Close() {
@@ -128,8 +188,7 @@ func (m *DurableRunManager) Close() {
 	m.wg.Wait()
 }
 
-// BeginShutdown stops accepting new mutating work and cancels the manager
-// context so workers, timers, and callback delivery unwind promptly.
+// BeginShutdown stops new mutating work and cancels the manager context.
 func (m *DurableRunManager) BeginShutdown() {
 	if m == nil {
 		return
@@ -137,6 +196,7 @@ func (m *DurableRunManager) BeginShutdown() {
 	m.mu.Lock()
 	m.shuttingDown = true
 	m.mu.Unlock()
+	m.cancelAllAsyncExecutors()
 	m.cancel()
 }
 
@@ -162,32 +222,28 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 		return RunResult{}, fmt.Errorf("blueprint validation failed: %v", errs[0])
 	}
 	for _, node := range bp.Nodes {
-		if _, ok := m.runner.engine.ExecutorFor(node.Type); !ok && !isDurableSuspendNode(node.Type) {
+		if _, ok := m.runner.engine.ExecutorFor(node.Type); !ok {
 			return RunResult{}, fmt.Errorf("no executor registered for node type %q", node.Type)
 		}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	inputs := map[string]string{"market_app_id": strconv.Itoa(req.AppID)}
+	inputs := make(map[string]string, len(req.Inputs))
 	for key, value := range req.Inputs {
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
 		inputs[key] = value
 	}
-	execCtx := dag.NewContext(inputs)
-	execCtx.Set("resolution_run_id", req.RunID)
-	execCtx.Set("input.resolution_run_id", req.RunID)
-	execCtx.Set("__run_id", req.RunID)
 	scheduler := dag.NewScheduler(bp)
 	run := &dag.RunState{
 		ID:             req.RunID,
 		BlueprintID:    bp.ID,
 		Definition:     bp,
 		Status:         string(RunStatusQueued),
-		Inputs:         execCtx.Snapshot(),
+		Inputs:         cloneStringMap(inputs),
 		NodeStates:     make(map[string]dag.NodeState, len(bp.Nodes)),
-		Context:        execCtx.Snapshot(),
+		Results:        dag.NewResults(),
 		EdgeTraversals: make(map[string]int),
 		StartedAt:      now,
 	}
@@ -201,12 +257,10 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 			AppID:         req.AppID,
 			BlueprintPath: strings.TrimSpace(req.BlueprintPath),
 			Status:        RunStatusQueued,
-			Action:        RunActionNone,
 			RunState:      run,
 		},
 		Checkpoint: durableCheckpoint{
 			Run:            run,
-			Context:        execCtx.Snapshot(),
 			Completed:      make(map[string]bool),
 			Failed:         make(map[string]bool),
 			Activated:      boolMapFromSet(scheduler.InitialActivatedNodes()),
@@ -273,19 +327,35 @@ func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
 		return cloneRunResult(record.Result), true
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	record.Result.Status = RunStatusCancelled
-	record.Result.Action = RunActionNone
-	record.Result.Error = "run cancelled"
-	record.CompletedAt = now
-	record.Checkpoint.Waiting = make(map[string]durableWaitingNode)
-	if record.Checkpoint.Run != nil {
-		record.Checkpoint.Run.Status = string(RunStatusCancelled)
-		record.Checkpoint.Run.Error = "run cancelled"
-		record.Checkpoint.Run.CompletedAt = now
-		record.Result.RunState = record.Checkpoint.Run
+	m.cancelAsyncRun(runID)
+	applyCancel := func(r *durableRunRecord) error {
+		if r == nil {
+			return errors.New("run record is required")
+		}
+		ensureDurableRecordMaps(r)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		r.Result.Status = RunStatusCancelled
+		r.Result.Return = nil
+		r.Result.Error = "run cancelled"
+		r.CompletedAt = now
+		// Cancel in-flight work before clearing Waiting.
+		for _, waiting := range r.Checkpoint.Waiting {
+			m.cancelInFlightExecutor(waiting)
+		}
+		r.Checkpoint.Waiting = make(map[string]durableWaitingNode)
+		if r.Checkpoint.Run != nil {
+			r.Checkpoint.Run.Status = string(RunStatusCancelled)
+			r.Checkpoint.Run.Error = "run cancelled"
+			r.Checkpoint.Run.CompletedAt = now
+			r.Result.RunState = r.Checkpoint.Run
+		}
+		return nil
 	}
-	if err := m.persist(record); err != nil {
+	if err := applyCancel(record); err != nil {
+		m.mu.Unlock()
+		return RunResult{}, false
+	}
+	if err := m.persistWithRetry(record, applyCancel); err != nil {
 		m.mu.Unlock()
 		return RunResult{}, false
 	}
@@ -298,17 +368,10 @@ func (m *DurableRunManager) Cancel(runID string) (RunResult, bool) {
 }
 
 func (m *DurableRunManager) ActiveCount() int {
-	runs, err := m.store.listRuns()
-	if err != nil {
+	if m == nil {
 		return 0
 	}
-	count := 0
-	for _, run := range runs {
-		if !isTerminalStatus(run.Result.Status) {
-			count++
-		}
-	}
-	return count
+	return m.index.ActiveCount()
 }
 
 func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
@@ -359,12 +422,15 @@ func (m *DurableRunManager) Signal(req signalRequest) (signalResult, error) {
 				m.mu.Unlock()
 				return signalResult{}, err
 			}
-			if err := m.completeWaitingNode(record, nodeID, outputsForSignal(waiting, req)); err != nil {
+			if err := m.completeWaitingNode(record, nodeID, outputsForSignal(waiting, req), req.Usage); err != nil {
 				m.mu.Unlock()
 				return signalResult{}, err
 			}
 			matched = true
 		}
+	}
+	if matched {
+		consumeSignal(record.Signals, req.IdempotencyKey, time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	if matched && !isTerminalStatus(record.Result.Status) {
 		record.Result.Status = RunStatusQueued
@@ -499,24 +565,44 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 			return m.completeRun(record)
 		}
 
-		nodeID := ready[0]
-		exec, err := m.executeNode(ctx, record, nodeID)
-		if err != nil {
-			return err
-		}
+		execs, err := m.executeReadyBatch(ctx, record, ready)
 		applyFn := func(r *durableRunRecord) error {
-			return m.applyNodeExecution(r, exec)
+			return applyBatchExecutions(m, r, execs)
+		}
+		if err != nil {
+			// Persist any sibling outcomes that finished before interruption.
+			if len(execs) > 0 {
+				if err := applyFn(record); err != nil {
+					return err
+				}
+				for i := range execs {
+					m.logNodeExecution(record, execs[i])
+				}
+				if err := m.persistWithRetry(record, applyFn); err != nil {
+					return err
+				}
+			}
+			return err
 		}
 		if err := applyFn(record); err != nil {
 			return err
 		}
-		// Emit the audit event before persisting: the event log must survive
-		// a stale-record abort or an injected store failure.
-		m.logNodeExecution(record, exec)
+		for i := range execs {
+			m.logNodeExecution(record, execs[i])
+		}
 		if err := m.persistWithRetry(record, applyFn); err != nil {
 			return err
 		}
 		if isTerminalStatus(record.Result.Status) {
+			for i := range execs {
+				if execs[i].EarlyReturn != nil {
+					_ = m.store.appendEvent(runID, "RunCompletedViaReturn", map[string]interface{}{
+						"node_id": execs[i].NodeID,
+						"return":  cloneJSONRawMessage(*execs[i].EarlyReturn),
+					})
+					break
+				}
+			}
 			return nil
 		}
 		if len(record.Checkpoint.Waiting) > 0 {
@@ -534,10 +620,27 @@ func (m *DurableRunManager) advanceRun(ctx context.Context, runID string) error 
 	}
 }
 
-// nodeExecution is the outcome of a node attempt, carried from executeNode
-// to the caller so record mutation and persistence can happen separately —
-// which is what persistWithRetry needs to re-apply after a stale reload
-// without re-running the executor.
+// applyBatchExecutions applies non-return outcomes before early returns.
+func applyBatchExecutions(m *DurableRunManager, record *durableRunRecord, execs []nodeExecution) error {
+	earlyReturns := make([]int, 0, len(execs))
+	for i := range execs {
+		if execs[i].EarlyReturn != nil {
+			earlyReturns = append(earlyReturns, i)
+			continue
+		}
+		if err := m.applyNodeExecution(record, execs[i]); err != nil {
+			return err
+		}
+	}
+	for _, i := range earlyReturns {
+		if err := m.applyNodeExecution(record, execs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// nodeExecution is the outcome of a node attempt.
 type nodeExecution struct {
 	NodeID        string
 	Node          dag.NodeDef
@@ -545,28 +648,128 @@ type nodeExecution struct {
 	CompletedAt   string
 	InputSnapshot map[string]string
 	Iteration     int
-	// Kind is one of "completed", "failed", "suspended".
-	Kind    string
-	Outputs map[string]string
-	Usage   dag.TokenUsage
-	Err     error
-	Waiting durableWaitingNode
+	Kind          nodeExecutionKind
+	Outputs       map[string]string
+	Usage         dag.TokenUsage
+	EarlyReturn   *json.RawMessage
+	Err           error
+	Waiting       durableWaitingNode
+	MatchedSignal string
 }
 
-// executeNode runs one attempt of a node and returns the outcome. Callers
-// apply the outcome via applyNodeExecution and emit the terminal event via
-// logNodeExecution; keeping those separate is what lets persistWithRetry
-// re-apply on stale without duplicating events.
-func (m *DurableRunManager) executeNode(ctx context.Context, record *durableRunRecord, nodeID string) (nodeExecution, error) {
+type nodeExecutionKind string
+
+const (
+	nodeExecCompleted nodeExecutionKind = "completed"
+	nodeExecFailed    nodeExecutionKind = "failed"
+	nodeExecSuspended nodeExecutionKind = "suspended"
+)
+
+// executeReadyBatch runs every ready node concurrently and returns outcomes in input order.
+func (m *DurableRunManager) executeReadyBatch(ctx context.Context, record *durableRunRecord, ready []string) ([]nodeExecution, error) {
+	if len(ready) == 0 {
+		return nil, nil
+	}
+
+	execs := make([]nodeExecution, len(ready))
+	executors := make([]dag.Executor, len(ready))
+	invs := make([]*dag.Invocation, len(ready))
+	for i, nodeID := range ready {
+		inv := durableInvocationFromRecord(record)
+		exec, executor, err := m.prepareNodeExecution(record, nodeID, inv)
+		if err != nil {
+			return nil, err
+		}
+		execs[i] = exec
+		executors[i] = executor
+		invs[i] = inv
+	}
+	record.Result.RunState = record.Checkpoint.Run
+	if err := m.persist(record); err != nil {
+		return nil, err
+	}
+	for i, nodeID := range ready {
+		_ = m.store.appendEvent(record.Request.RunID, "NodeStarted", map[string]interface{}{
+			"node_id":   nodeID,
+			"iteration": execs[i].Iteration,
+		})
+	}
+
+	type batchResult struct {
+		index int
+		exec  nodeExecution
+		err   error
+	}
+
+	batchCtx, cancelBatch := context.WithCancel(ctx)
+	defer cancelBatch()
+	results := make(chan batchResult, len(ready))
+	var wg sync.WaitGroup
+	for i := range ready {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			result := batchResult{index: i}
+			defer func() {
+				if r := recover(); r != nil {
+					result.exec = execs[i]
+					result.exec.Kind = nodeExecFailed
+					result.exec.Err = fmt.Errorf("executor panicked: %v", r)
+					result.exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+					results <- result
+				}
+			}()
+			result.exec, result.err = m.runNodeExecutor(batchCtx, execs[i], executors[i], invs[i], record)
+			results <- result
+		}(i)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	earlyReturnWinner := -1
+	var interruptedErr error
+	for result := range results {
+		// First early return wins.
+		if earlyReturnWinner >= 0 && result.index != earlyReturnWinner {
+			continue
+		}
+
+		execs[result.index] = result.exec
+		if result.exec.EarlyReturn != nil && earlyReturnWinner < 0 {
+			earlyReturnWinner = result.index
+			cancelBatch()
+			continue
+		}
+
+		if result.err != nil && errors.Is(result.err, context.Canceled) {
+			// Ignore sibling cancellation after an early return.
+			if ctx.Err() != nil {
+				interruptedErr = result.err
+			}
+		}
+	}
+	if interruptedErr != nil {
+		return execs, interruptedErr
+	}
+	return execs, nil
+}
+
+// prepareNodeExecution marks a node running and returns its seed execution.
+func (m *DurableRunManager) prepareNodeExecution(record *durableRunRecord, nodeID string, inv *dag.Invocation) (nodeExecution, dag.Executor, error) {
 	node, ok := nodeByID(record.Checkpoint.Run.Definition, nodeID)
 	if !ok {
-		return nodeExecution{}, fmt.Errorf("node %q not found", nodeID)
+		return nodeExecution{}, nil, fmt.Errorf("node %q not found", nodeID)
 	}
-	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
+	executor, ok := m.runner.engine.ExecutorFor(node.Type)
+	if !ok {
+		return nodeExecution{}, nil, fmt.Errorf("no executor registered for node type %q", node.Type)
+	}
 	record.Checkpoint.IterationCount[nodeID]++
 	iteration := record.Checkpoint.IterationCount[nodeID]
 	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	inputSnapshot := execCtx.Snapshot()
+	inputSnapshot := dag.FlattenInvocation(inv)
 	state := record.Checkpoint.Run.NodeStates[nodeID]
 	state.Status = "running"
 	state.StartedAt = startedAt
@@ -574,167 +777,101 @@ func (m *DurableRunManager) executeNode(ctx context.Context, record *durableRunR
 	state.Error = ""
 	state.Usage = dag.TokenUsage{}
 	record.Checkpoint.Run.NodeStates[nodeID] = state
-	record.Result.RunState = record.Checkpoint.Run
-	if err := m.persist(record); err != nil {
-		return nodeExecution{}, err
-	}
-	_ = m.store.appendEvent(record.Request.RunID, "NodeStarted", map[string]interface{}{"node_id": nodeID, "iteration": iteration})
-
-	exec := nodeExecution{
+	return nodeExecution{
 		NodeID:        nodeID,
 		Node:          node,
 		StartedAt:     startedAt,
 		InputSnapshot: inputSnapshot,
 		Iteration:     iteration,
-	}
+	}, executor, nil
+}
 
-	kind, waiting, outputs, failErr := m.classifySuspension(record, node, execCtx, startedAt, inputSnapshot, iteration)
-	switch kind {
-	case "fail":
-		exec.Kind = "failed"
-		exec.Err = failErr
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		return exec, nil
-	case "immediate", "signal-match":
-		exec.Kind = "completed"
-		exec.Outputs = outputs
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		return exec, nil
-	case "suspend":
-		exec.Kind = "suspended"
-		exec.Waiting = waiting
-		return exec, nil
-	}
-	// kind == "normal" — run the node's executor.
-
-	executor, ok := m.runner.engine.ExecutorFor(node.Type)
-	if !ok {
-		return nodeExecution{}, fmt.Errorf("no executor registered for node type %q", node.Type)
-	}
-	result, err := executor.Execute(ctx, node, execCtx)
+// runNodeExecutor executes a node without mutating the record.
+func (m *DurableRunManager) runNodeExecutor(ctx context.Context, exec nodeExecution, executor dag.Executor, inv *dag.Invocation, record *durableRunRecord) (nodeExecution, error) {
+	result, err := executor.Execute(ctx, exec.Node, inv)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return exec, err
 		}
-		exec.Kind = "failed"
+		exec.Kind = nodeExecFailed
 		exec.Err = err
 		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		return exec, nil
 	}
-	exec.Kind = "completed"
+
+	if result.EarlyReturn != nil {
+		exec.Kind = nodeExecCompleted
+		exec.EarlyReturn = cloneJSONRawMessagePtr(result.EarlyReturn)
+		exec.Usage = result.Usage
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return exec, nil
+	}
+
+	if result.Suspend != nil {
+		waiting := waitingFromSuspension(result.Suspend, result.Usage, exec.NodeID, exec.StartedAt, exec.InputSnapshot, exec.Iteration)
+		if signalKey, outputs, usage, ok := findMatchingSignal(record.Signals, waiting); ok {
+			exec.Kind = nodeExecCompleted
+			exec.MatchedSignal = signalKey
+			exec.Outputs = outputs
+			exec.Usage = mergeTokenUsage(result.Usage, usage)
+			exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			return exec, nil
+		}
+		exec.Kind = nodeExecSuspended
+		exec.Waiting = waiting
+		exec.Usage = result.Usage
+		return exec, nil
+	}
+
+	exec.Kind = nodeExecCompleted
 	exec.Outputs = result.Outputs
 	exec.Usage = result.Usage
 	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return exec, nil
 }
 
-// classifySuspension inspects a suspension-capable node and returns how it
-// should resolve this attempt. It does not mutate the record.
-//
-// Kinds:
-//   - "normal": regular executor node; caller should run exec.Execute.
-//   - "immediate": wait-mode defer anchor is already in the past.
-//   - "signal-match": an earlier signal already matches this suspension.
-//   - "suspend": register the waiting entry.
-//   - "fail": config error; fail the node.
-func (m *DurableRunManager) classifySuspension(record *durableRunRecord, node dag.NodeDef, execCtx *dag.Context, startedAt string, inputSnapshot map[string]string, iteration int) (string, durableWaitingNode, map[string]string, error) {
-	waiting := durableWaitingNode{
-		NodeID:        node.ID,
+// waitingFromSuspension adds engine bookkeeping to a suspension.
+func waitingFromSuspension(s *dag.Suspension, usage dag.TokenUsage, nodeID, startedAt string, inputSnapshot map[string]string, iteration int) durableWaitingNode {
+	return durableWaitingNode{
+		NodeID:        nodeID,
+		Suspension:    *s.Clone(),
+		Usage:         usage,
 		StartedAt:     startedAt,
 		InputSnapshot: inputSnapshot,
 		Iteration:     iteration,
 	}
-	switch node.Type {
-	case "wait":
-		outputs, waitUntil, done, err := durableWaitDecision(node, execCtx)
-		if err != nil {
-			return "fail", durableWaitingNode{}, nil, err
-		}
-		if done {
-			return "immediate", durableWaitingNode{}, outputs, nil
-		}
-		waiting.Kind = "timer"
-		waiting.Reason = "timer"
-		waiting.ResumeAtUnix = waitUntil
-		waiting.Outputs = outputs
-	case "await_signal":
-		cfg, err := executors.ParseConfig[awaitSignalConfig](node.Config)
-		if err != nil {
-			return "fail", durableWaitingNode{}, nil, err
-		}
-		signalType := strings.TrimSpace(cfg.SignalType)
-		if signalType == "" {
-			return "fail", durableWaitingNode{}, nil, errors.New("await_signal signal_type is required")
-		}
-		timeoutSeconds := cfg.TimeoutSeconds
-		if timeoutSeconds <= 0 {
-			timeoutSeconds = DefaultDurableAwaitSignalTimeout
-		}
-		correlationKey := strings.TrimSpace(cfg.CorrelationKey)
-		if correlationKey == "" || correlationKey == "auto" {
-			correlationKey = fmt.Sprintf("%d:%s:%s", record.Request.AppID, record.Request.RunID, node.ID)
-		}
-		timeoutOutputs := cloneStringMap(cfg.TimeoutOutputs)
-		if len(timeoutOutputs) == 0 {
-			timeoutOutputs = map[string]string{"status": "timeout"}
-		}
-		waiting.Kind = "signal"
-		waiting.Reason = strings.TrimSpace(cfg.Reason)
-		if waiting.Reason == "" {
-			waiting.Reason = "await signal"
-		}
-		waiting.SignalType = signalType
-		waiting.CorrelationKey = correlationKey
-		waiting.ResumeAtUnix = time.Now().Add(time.Duration(timeoutSeconds) * time.Second).Unix()
-		waiting.RequiredPayload = normalizedRequiredPayload(cfg.RequiredPayload)
-		waiting.DefaultOutputs = cloneStringMap(cfg.DefaultOutputs)
-		waiting.TimeoutOutputs = timeoutOutputs
-	case "defer_resolution":
-		cfg, _ := executors.ParseConfig[durableDeferResolutionConfig](node.Config)
-		reason := strings.TrimSpace(cfg.Reason)
-		if reason == "" {
-			reason = "resolution deferred"
-		}
-		waiting.Kind = "signal"
-		waiting.Reason = reason
-		waiting.SignalType = strings.TrimSpace(cfg.ResumeSignal)
-		if waiting.SignalType == "" {
-			waiting.SignalType = "defer_resolution.resume"
-		}
-		waiting.CorrelationKey = strings.TrimSpace(cfg.CorrelationKey)
-		if waiting.CorrelationKey == "" {
-			waiting.CorrelationKey = fmt.Sprintf("%d:%s:%s", record.Request.AppID, record.Request.RunID, node.ID)
-		}
-	default:
-		return "normal", durableWaitingNode{}, nil, nil
-	}
-
-	for _, signal := range sortedSignals(record.Signals) {
-		if waitingMatchesSignal(waiting, signal) {
-			if err := validateSignalForWaiting(waiting, signal); err != nil {
-				continue
-			}
-			return "signal-match", durableWaitingNode{}, outputsForSignal(waiting, signal), nil
-		}
-	}
-	return "suspend", waiting, nil, nil
 }
 
-// applyNodeExecution folds the outcome into the record. Safe to re-apply
-// after a stale reload: a fresh on-disk record cannot contain our
-// uncommitted mutations (only a successful persist would have written them),
-// so re-applying on top produces the same final state — no double-counted
-// usage, no duplicated trace entry.
+// findMatchingSignal returns the first pending signal that matches waiting.
+func findMatchingSignal(signals map[string]signalRequest, waiting durableWaitingNode) (string, map[string]string, dag.TokenUsage, bool) {
+	for _, signal := range sortedSignals(signals) {
+		if signalConsumed(signal) {
+			continue
+		}
+		if !waitingMatchesSignal(waiting, signal) {
+			continue
+		}
+		if err := validateSignalForWaiting(waiting, signal); err != nil {
+			continue
+		}
+		return signal.IdempotencyKey, outputsForSignal(waiting, signal), signal.Usage, true
+	}
+	return "", nil, dag.TokenUsage{}, false
+}
+
+// applyNodeExecution is safe to re-apply after a stale reload.
 func (m *DurableRunManager) applyNodeExecution(record *durableRunRecord, exec nodeExecution) error {
 	switch exec.Kind {
-	case "completed":
+	case nodeExecCompleted:
+		if exec.EarlyReturn != nil {
+			return m.applyEarlyReturn(record, exec)
+		}
 		return m.applyCompletion(record, exec)
-	case "failed":
+	case nodeExecFailed:
 		m.applyFailure(record, exec)
 		return nil
-	case "suspended":
-		m.applySuspension(record, exec)
-		return nil
+	case nodeExecSuspended:
+		return m.applySuspension(record, exec)
 	}
 	return nil
 }
@@ -744,12 +881,15 @@ func (m *DurableRunManager) applyCompletion(record *durableRunRecord, exec nodeE
 	if outputs == nil {
 		outputs = map[string]string{}
 	}
-	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
-	for key, value := range outputs {
-		execCtx.Set(exec.Node.ID+"."+key, value)
+	if exec.MatchedSignal != "" {
+		consumeSignal(record.Signals, exec.MatchedSignal, exec.CompletedAt)
 	}
-	if execCtx.Get(exec.Node.ID+".status") == "" {
-		execCtx.Set(exec.Node.ID+".status", "completed")
+	if record.Checkpoint.Run.Results == nil {
+		record.Checkpoint.Run.Results = dag.NewResults()
+	}
+	record.Checkpoint.Run.Results.MergeOutputs(exec.Node.ID, outputs)
+	if status, _ := record.Checkpoint.Run.Results.Get(exec.Node.ID, "status"); status == "" {
+		record.Checkpoint.Run.Results.SetField(exec.Node.ID, "status", "completed")
 	}
 
 	completedAt := exec.CompletedAt
@@ -779,20 +919,44 @@ func (m *DurableRunManager) applyCompletion(record *durableRunRecord, exec nodeE
 	record.Checkpoint.Completed[exec.Node.ID] = true
 	delete(record.Checkpoint.Failed, exec.Node.ID)
 	delete(record.Checkpoint.Waiting, exec.Node.ID)
-	snap := execCtx.Snapshot()
-	record.Checkpoint.Context = snap
-	record.Checkpoint.Run.Context = cloneStringMap(snap)
-	if err := m.evaluateOutgoingEdges(record, exec.Node.ID, execCtx); err != nil {
+	if err := m.evaluateOutgoingEdges(record, exec.Node.ID); err != nil {
 		return err
 	}
 	record.Result.RunState = record.Checkpoint.Run
 	return nil
 }
 
+func (m *DurableRunManager) applyEarlyReturn(record *durableRunRecord, exec nodeExecution) error {
+	if err := m.applyCompletion(record, exec); err != nil {
+		return err
+	}
+	completedAt := exec.CompletedAt
+	if completedAt == "" {
+		completedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	for _, waiting := range record.Checkpoint.Waiting {
+		m.cancelInFlightExecutor(waiting)
+	}
+	record.Checkpoint.Waiting = make(map[string]durableWaitingNode)
+	m.cancelAsyncRun(record.Request.RunID)
+	markDurableSkippedNodes(record, completedAt)
+	record.Checkpoint.Run.Return = cloneJSONRawMessage(*exec.EarlyReturn)
+	record.Checkpoint.Run.Status = "completed"
+	record.Checkpoint.Run.Error = ""
+	record.Checkpoint.Run.CompletedAt = completedAt
+	record.Result = buildRunResult(record.Request, record.Checkpoint.Run, nil)
+	record.Result.Status = RunStatusCompleted
+	record.Result.RunState = record.Checkpoint.Run
+	record.CompletedAt = completedAt
+	return nil
+}
+
 func (m *DurableRunManager) applyFailure(record *durableRunRecord, exec nodeExecution) {
-	execCtx := dag.NewContextFromSnapshot(record.Checkpoint.Context)
-	execCtx.Set(exec.Node.ID+".status", "failed")
-	execCtx.Set(exec.Node.ID+".error", exec.Err.Error())
+	if record.Checkpoint.Run.Results == nil {
+		record.Checkpoint.Run.Results = dag.NewResults()
+	}
+	record.Checkpoint.Run.Results.SetField(exec.Node.ID, "status", "failed")
+	record.Checkpoint.Run.Results.SetField(exec.Node.ID, "error", exec.Err.Error())
 	completedAt := exec.CompletedAt
 	if completedAt == "" {
 		completedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -813,9 +977,6 @@ func (m *DurableRunManager) applyFailure(record *durableRunRecord, exec nodeExec
 		StartedAt:     exec.StartedAt,
 		CompletedAt:   completedAt,
 	})
-	snap := execCtx.Snapshot()
-	record.Checkpoint.Context = snap
-	record.Checkpoint.Run.Context = cloneStringMap(snap)
 	if exec.Node.OnError == "continue" {
 		record.Checkpoint.Completed[exec.Node.ID] = true
 	} else {
@@ -824,29 +985,38 @@ func (m *DurableRunManager) applyFailure(record *durableRunRecord, exec nodeExec
 	record.Result.RunState = record.Checkpoint.Run
 }
 
-func (m *DurableRunManager) applySuspension(record *durableRunRecord, exec nodeExecution) {
+func (m *DurableRunManager) applySuspension(record *durableRunRecord, exec nodeExecution) error {
+	if signalKey, outputs, usage, ok := findMatchingSignal(record.Signals, exec.Waiting); ok {
+		exec.Kind = nodeExecCompleted
+		exec.MatchedSignal = signalKey
+		exec.Outputs = outputs
+		exec.Usage = mergeTokenUsage(exec.Usage, usage)
+		if exec.CompletedAt == "" {
+			exec.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		return m.applyCompletion(record, exec)
+	}
 	state := record.Checkpoint.Run.NodeStates[exec.Node.ID]
 	state.Status = "waiting"
+	state.Usage = exec.Usage
 	record.Checkpoint.Run.NodeStates[exec.Node.ID] = state
 	record.Checkpoint.Waiting[exec.Node.ID] = exec.Waiting
 	record.Result.RunState = record.Checkpoint.Run
+	return nil
 }
 
 func (m *DurableRunManager) logNodeExecution(record *durableRunRecord, exec nodeExecution) {
 	switch exec.Kind {
-	case "completed":
+	case nodeExecCompleted:
 		_ = m.store.appendEvent(record.Request.RunID, "NodeCompleted", map[string]interface{}{"node_id": exec.Node.ID, "outputs": exec.Outputs})
-	case "failed":
+	case nodeExecFailed:
 		_ = m.store.appendEvent(record.Request.RunID, "NodeFailed", map[string]interface{}{"node_id": exec.Node.ID, "error": exec.Err.Error()})
-	case "suspended":
+	case nodeExecSuspended:
 		_ = m.store.appendEvent(record.Request.RunID, "NodeSuspended", exec.Waiting)
 	}
 }
 
-// persistWithRetry persists the record; on errDurableStaleRecord it reloads,
-// re-applies the caller's mutation to the fresh record, and retries up to
-// maxAttempts. If the fresh record is terminal (e.g. Cancel raced in), the
-// mutation is abandoned and the caller's record is set to the fresh state.
+// persistWithRetry reloads and reapplies on errDurableStaleRecord.
 func (m *DurableRunManager) persistWithRetry(record *durableRunRecord, reapply func(*durableRunRecord) error) error {
 	const maxAttempts = 5
 	var lastErr error
@@ -876,10 +1046,8 @@ func (m *DurableRunManager) persistWithRetry(record *durableRunRecord, reapply f
 	return lastErr
 }
 
-// completeWaitingNode resumes a waiting node after an external event
-// (signal handler or timer loop). Mutates in place under the caller's lock;
-// persistence is the caller's responsibility.
-func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID string, outputs map[string]string) error {
+// completeWaitingNode resumes a waiting node in place.
+func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID string, outputs map[string]string, resumeUsage dag.TokenUsage) error {
 	waiting, ok := record.Checkpoint.Waiting[nodeID]
 	if !ok {
 		return nil
@@ -894,8 +1062,9 @@ func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID
 		StartedAt:     waiting.StartedAt,
 		InputSnapshot: waiting.InputSnapshot,
 		Iteration:     waiting.Iteration,
-		Kind:          "completed",
+		Kind:          nodeExecCompleted,
 		Outputs:       outputs,
+		Usage:         mergeTokenUsage(waiting.Usage, resumeUsage),
 		CompletedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if err := m.applyCompletion(record, exec); err != nil {
@@ -905,10 +1074,10 @@ func (m *DurableRunManager) completeWaitingNode(record *durableRunRecord, nodeID
 	return nil
 }
 
-func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, nodeID string, execCtx *dag.Context) error {
-	scheduler := dag.NewScheduler(record.Checkpoint.Run.Definition)
-	scheduler.RestoreTraversals(record.Checkpoint.EdgeTraversals)
-	edges, err := scheduler.EvaluateEdges(nodeID, execCtx)
+func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, nodeID string) error {
+	inv := durableInvocationFromRecord(record)
+	scheduler := record.ensureScheduler()
+	edges, err := scheduler.EvaluateEdges(nodeID, inv)
 	if err != nil {
 		return err
 	}
@@ -916,7 +1085,10 @@ func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, node
 		scheduler.TrackTraversal(edge.From, edge.To)
 		record.Checkpoint.Activated[edge.To] = true
 		if record.Checkpoint.Completed[edge.To] {
-			execCtx.AppendNodeHistory(edge.To)
+			if record.Checkpoint.Run.Results != nil {
+				record.Checkpoint.Run.Results.AppendHistory(edge.To)
+				record.Checkpoint.Run.Results.Reset(edge.To)
+			}
 			delete(record.Checkpoint.Completed, edge.To)
 			state := record.Checkpoint.Run.NodeStates[edge.To]
 			state.Status = "pending"
@@ -925,18 +1097,78 @@ func (m *DurableRunManager) evaluateOutgoingEdges(record *durableRunRecord, node
 			state.Usage = dag.TokenUsage{}
 			record.Checkpoint.Run.NodeStates[edge.To] = state
 		}
+		// Back-edge re-entry cancels the old wait and resets the node.
+		if waiting, ok := record.Checkpoint.Waiting[edge.To]; ok {
+			if record.Checkpoint.Run.Results != nil {
+				record.Checkpoint.Run.Results.AppendHistory(edge.To)
+				record.Checkpoint.Run.Results.Reset(edge.To)
+			}
+			m.cancelInFlightExecutor(waiting)
+			delete(record.Checkpoint.Waiting, edge.To)
+			state := record.Checkpoint.Run.NodeStates[edge.To]
+			state.Status = "pending"
+			state.CompletedAt = ""
+			state.Error = ""
+			state.Usage = dag.TokenUsage{}
+			record.Checkpoint.Run.NodeStates[edge.To] = state
+			_ = m.store.appendEvent(record.Request.RunID, "NodeResetFromWaiting", map[string]interface{}{
+				"node_id":         edge.To,
+				"correlation_key": waiting.CorrelationKey,
+			})
+		}
 	}
 	record.Checkpoint.EdgeTraversals = scheduler.TraversalSnapshot()
 	record.Checkpoint.Run.EdgeTraversals = cloneIntMap(record.Checkpoint.EdgeTraversals)
-	snap := execCtx.Snapshot()
-	record.Checkpoint.Context = snap
-	record.Checkpoint.Run.Context = cloneStringMap(snap)
 	return nil
+}
+
+// cancelInFlightExecutor invokes the correlation-keyed cancel on any
+// registered CancellableExecutor. No-op for waiting entries whose signal
+// correlation has no in-flight goroutine behind it (wait, await_signal).
+func (m *DurableRunManager) cancelInFlightExecutor(waiting durableWaitingNode) {
+	if m == nil || m.runner == nil || m.runner.engine == nil {
+		return
+	}
+	m.runner.engine.CancelCorrelation(waiting.CorrelationKey)
+}
+
+func (m *DurableRunManager) cancelAsyncRun(runID string) {
+	if m == nil || m.runner == nil {
+		return
+	}
+	if agent := m.runner.AgentExecutor(); agent != nil {
+		agent.CancelRun(runID)
+	}
+}
+
+func (m *DurableRunManager) cancelAllAsyncExecutors() {
+	if m == nil || m.runner == nil {
+		return
+	}
+	if agent := m.runner.AgentExecutor(); agent != nil {
+		agent.CancelAll()
+	}
+}
+
+func markDurableSkippedNodes(record *durableRunRecord, completedAt string) {
+	if record == nil || record.Checkpoint.Run == nil {
+		return
+	}
+	for nodeID, state := range record.Checkpoint.Run.NodeStates {
+		switch state.Status {
+		case "pending", "waiting", "running":
+			state.Status = "skipped"
+			state.CompletedAt = completedAt
+			state.Error = ""
+			record.Checkpoint.Run.NodeStates[nodeID] = state
+			record.Checkpoint.Skipped[nodeID] = true
+			delete(record.Checkpoint.Waiting, nodeID)
+		}
+	}
 }
 
 func (m *DurableRunManager) completeRun(record *durableRunRecord) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	record.Checkpoint.Run.Context = cloneStringMap(record.Checkpoint.Context)
 	record.Checkpoint.Run.EdgeTraversals = cloneIntMap(record.Checkpoint.EdgeTraversals)
 	record.Checkpoint.Run.CompletedAt = now
 	if len(record.Checkpoint.Failed) > 0 {
@@ -946,14 +1178,14 @@ func (m *DurableRunManager) completeRun(record *durableRunRecord) error {
 		}
 		record.Result = buildRunResult(record.Request, record.Checkpoint.Run, errors.New(record.Checkpoint.Run.Error))
 	} else {
-		record.Checkpoint.Run.Status = "completed"
-		record.Checkpoint.Run.Error = ""
-		record.Result = buildRunResult(record.Request, record.Checkpoint.Run, nil)
-		if validationErr := validateTerminalRunResult(record.Result); validationErr != nil {
-			record.Result.Status = RunStatusFailed
-			record.Result.Error = validationErr.Error()
+		if len(record.Checkpoint.Run.Return) == 0 && m.runner.engine.BlueprintRequiresTerminalFire(record.Checkpoint.Run.Definition) {
 			record.Checkpoint.Run.Status = "failed"
-			record.Checkpoint.Run.Error = validationErr.Error()
+			record.Checkpoint.Run.Error = "blueprint completed without firing return"
+			record.Result = buildRunResult(record.Request, record.Checkpoint.Run, errors.New(record.Checkpoint.Run.Error))
+		} else {
+			record.Checkpoint.Run.Status = "completed"
+			record.Checkpoint.Run.Error = ""
+			record.Result = buildRunResult(record.Request, record.Checkpoint.Run, nil)
 		}
 	}
 	record.Result.RunState = record.Checkpoint.Run
@@ -962,16 +1194,12 @@ func (m *DurableRunManager) completeRun(record *durableRunRecord) error {
 	if err := m.persist(record); err != nil {
 		return err
 	}
-	_ = m.store.appendEvent(record.Request.RunID, "RunCompleted", map[string]interface{}{"status": record.Result.Status, "action": record.Result.Action})
+	_ = m.store.appendEvent(record.Request.RunID, "RunCompleted", map[string]interface{}{"status": record.Result.Status})
 	return nil
 }
 
 func (m *DurableRunManager) readyNodes(record *durableRunRecord) []string {
-	scheduler := dag.NewScheduler(record.Checkpoint.Run.Definition)
-	scheduler.RestoreTraversals(record.Checkpoint.EdgeTraversals)
-	for nodeID := range record.Checkpoint.Skipped {
-		scheduler.Skipped[nodeID] = struct{}{}
-	}
+	scheduler := record.ensureScheduler()
 	ready := scheduler.ReadyNodes(setFromBoolMap(record.Checkpoint.Completed), setFromBoolMap(record.Checkpoint.Failed), nil)
 	for nodeID := range scheduler.Skipped {
 		if !record.Checkpoint.Skipped[nodeID] {
@@ -1008,12 +1236,13 @@ func (m *DurableRunManager) timerLoop() {
 }
 
 func (m *DurableRunManager) wakeDueRuns() error {
-	runs, err := m.store.listRuns()
-	if err != nil {
-		return err
-	}
 	now := time.Now().Unix()
-	for _, record := range runs {
+	for _, runID := range m.index.DueTimerRunIDs(now) {
+		record, err := m.store.loadRun(runID)
+		if err != nil {
+			return err
+		}
+		ensureDurableRecordMaps(record)
 		if isTerminalStatus(record.Result.Status) || !hasDueWaiting(record.Checkpoint.Waiting, now) {
 			continue
 		}
@@ -1036,18 +1265,27 @@ func (m *DurableRunManager) wakeDueRuns() error {
 }
 
 func (m *DurableRunManager) applyDueWaiting(record *durableRunRecord, now int64) error {
-	for nodeID, waiting := range cloneWaitingMap(record.Checkpoint.Waiting) {
+	// Snapshot keys so completion can delete from Waiting safely.
+	dueNodeIDs := make([]string, 0, len(record.Checkpoint.Waiting))
+	for nodeID := range record.Checkpoint.Waiting {
+		dueNodeIDs = append(dueNodeIDs, nodeID)
+	}
+	for _, nodeID := range dueNodeIDs {
+		waiting, ok := record.Checkpoint.Waiting[nodeID]
+		if !ok {
+			continue
+		}
 		if waiting.ResumeAtUnix <= 0 || waiting.ResumeAtUnix > now {
 			continue
 		}
 		outputs := waiting.Outputs
-		if waiting.Kind == "signal" && len(waiting.TimeoutOutputs) > 0 {
+		if waiting.Kind == dag.SuspensionKindSignal && len(waiting.TimeoutOutputs) > 0 {
 			outputs = waiting.TimeoutOutputs
 		}
 		if outputs == nil {
 			continue
 		}
-		if err := m.completeWaitingNode(record, nodeID, outputs); err != nil {
+		if err := m.completeWaitingNode(record, nodeID, outputs, dag.TokenUsage{}); err != nil {
 			return err
 		}
 		_ = m.store.appendEvent(record.Request.RunID, "TimerFired", map[string]interface{}{"node_id": nodeID})
@@ -1070,12 +1308,12 @@ func (m *DurableRunManager) outboxLoop() {
 }
 
 func (m *DurableRunManager) deliverCallbacks() error {
-	runs, err := m.store.listRuns()
-	if err != nil {
-		return err
-	}
 	now := time.Now().UTC()
-	for _, record := range runs {
+	for _, runID := range m.index.PendingCallbackRunIDs() {
+		record, err := m.store.loadRun(runID)
+		if err != nil {
+			return err
+		}
 		if !isTerminalStatus(record.Result.Status) || record.CallbackDelivered || strings.TrimSpace(record.Request.CallbackURL) == "" {
 			continue
 		}
@@ -1092,7 +1330,9 @@ func (m *DurableRunManager) deliverCallbacks() error {
 				delay = DefaultCallbackMaxBackoff
 			}
 			record.NextCallbackAt = now.Add(delay).Format(time.RFC3339Nano)
-			_ = m.store.saveRun(record)
+			if err := m.store.saveRun(record); err == nil {
+				m.index.Upsert(record)
+			}
 			_ = m.store.appendEvent(record.Request.RunID, "CallbackFailed", map[string]string{"error": err.Error()})
 			continue
 		}
@@ -1101,6 +1341,7 @@ func (m *DurableRunManager) deliverCallbacks() error {
 		if err := m.store.saveRun(record); err != nil {
 			return err
 		}
+		m.index.Upsert(record)
 		_ = m.store.appendEvent(record.Request.RunID, "CallbackDelivered", nil)
 	}
 	return nil
@@ -1136,7 +1377,23 @@ func (m *DurableRunManager) recoverRuns() error {
 		return err
 	}
 	for _, record := range runs {
-		if record.Result.Status == RunStatusRunning {
+		// Index every run (including terminal ones) so callback delivery
+		// and signal lookup can query the index instead of re-scanning
+		// the directory.
+		m.index.Upsert(record)
+		if isTerminalStatus(record.Result.Status) {
+			continue
+		}
+		ensureDurableRecordMaps(record)
+
+		// Fail waits whose in-process backing died with the previous process.
+		interrupted, err := m.failInterruptedWaits(record)
+		if err != nil {
+			return err
+		}
+
+		// Re-queue interrupted runs and runs with failed waits.
+		if record.Result.Status == RunStatusRunning || interrupted > 0 {
 			record.Result.Status = RunStatusQueued
 			if record.Checkpoint.Run != nil {
 				record.Checkpoint.Run.Status = string(RunStatusQueued)
@@ -1145,8 +1402,11 @@ func (m *DurableRunManager) recoverRuns() error {
 			if err := m.persist(record); err != nil {
 				return err
 			}
-			_ = m.store.appendEvent(record.Request.RunID, "RunRecovered", nil)
+			_ = m.store.appendEvent(record.Request.RunID, "RunRecovered", map[string]interface{}{
+				"interrupted_waits": interrupted,
+			})
 		}
+
 		if record.Result.Status == RunStatusQueued {
 			m.enqueue(record.Request.RunID)
 		}
@@ -1154,44 +1414,87 @@ func (m *DurableRunManager) recoverRuns() error {
 	return nil
 }
 
+// failInterruptedWaits fails waits backed by in-process state that died on restart.
+func (m *DurableRunManager) failInterruptedWaits(record *durableRunRecord) (int, error) {
+	if record == nil || len(record.Checkpoint.Waiting) == 0 {
+		return 0, nil
+	}
+	type interruptedWait struct {
+		nodeID         string
+		owner          string
+		correlationKey string
+	}
+	// Snapshot first: completeWaitingNode mutates Checkpoint.Waiting.
+	toFail := make([]interruptedWait, 0, len(record.Checkpoint.Waiting))
+	for nodeID, waiting := range record.Checkpoint.Waiting {
+		owner := strings.TrimSpace(waiting.RecoveryOwner)
+		if owner == "" {
+			continue
+		}
+		toFail = append(toFail, interruptedWait{
+			nodeID:         nodeID,
+			owner:          owner,
+			correlationKey: waiting.CorrelationKey,
+		})
+	}
+	for _, w := range toFail {
+		outputs := waitingInterruptedByRestartOutputs(w.owner)
+		if err := m.completeWaitingNode(record, w.nodeID, outputs, dag.TokenUsage{}); err != nil {
+			return 0, fmt.Errorf("recover run %s: fail interrupted wait on node %s: %w", record.Request.RunID, w.nodeID, err)
+		}
+		_ = m.store.appendEvent(record.Request.RunID, "WaitingNodeInterruptedByRestart", map[string]interface{}{
+			"node_id":         w.nodeID,
+			"owner":           w.owner,
+			"correlation_key": w.correlationKey,
+		})
+	}
+	return len(toFail), nil
+}
+
+// waitingInterruptedByRestartOutputs returns the failure payload for restart-lost waits.
+func waitingInterruptedByRestartOutputs(owner string) map[string]string {
+	return map[string]string{
+		"status":  "failed",
+		"error":   fmt.Sprintf("%s wait interrupted by manager restart", owner),
+		"outcome": "inconclusive",
+	}
+}
+
 func (m *DurableRunManager) activeRunForApp(appID int) (*durableRunRecord, bool, error) {
-	runs, err := m.store.listRuns()
+	runID := m.index.ActiveRunIDForApp(appID)
+	if runID == "" {
+		return nil, false, nil
+	}
+	record, err := m.store.loadRun(runID)
 	if err != nil {
 		return nil, false, err
 	}
-	for _, run := range runs {
-		if run.Request.AppID == appID && !isTerminalStatus(run.Result.Status) {
-			return run, true, nil
-		}
+	// Defensive: the index is updated after every persist, but a read
+	// here might race a concurrent terminal transition. Re-check.
+	if record == nil || isTerminalStatus(record.Result.Status) {
+		return nil, false, nil
 	}
-	return nil, false, nil
+	return record, true, nil
 }
 
 func (m *DurableRunManager) queuedRunCount() (int, error) {
-	runs, err := m.store.listRuns()
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	for _, run := range runs {
-		if run.Result.Status == RunStatusQueued {
-			count++
-		}
-	}
-	return count, nil
+	return m.index.QueuedCount(), nil
 }
 
 func (m *DurableRunManager) findSignalTarget(req signalRequest) (*durableRunRecord, error) {
 	if strings.TrimSpace(req.RunID) != "" {
 		return m.store.loadRun(req.RunID)
 	}
-	runs, err := m.store.listRuns()
-	if err != nil {
-		return nil, err
+	var candidates []string
+	if req.AppID > 0 {
+		candidates = m.index.ActiveRunIDsByApp(req.AppID)
+	} else {
+		candidates = m.index.allActiveRunIDs()
 	}
-	for _, run := range runs {
-		if req.AppID > 0 && run.Request.AppID != req.AppID {
-			continue
+	for _, runID := range candidates {
+		run, err := m.store.loadRun(runID)
+		if err != nil {
+			return nil, err
 		}
 		for _, waiting := range run.Checkpoint.Waiting {
 			if waitingMatchesSignal(waiting, req) {
@@ -1220,10 +1523,7 @@ func (m *DurableRunManager) handleInterruptedRun(runID string, err error) error 
 	return err
 }
 
-// enqueue dispatches runID to a worker, deduping against runs already in the
-// channel or currently being processed. The dedup keeps bursts of signals or
-// rapid timer ticks from stacking channel sends or spawning an unbounded
-// number of goroutines under a saturated queue.
+// enqueue dispatches runID to a worker with per-run dedup.
 func (m *DurableRunManager) enqueue(runID string) {
 	m.mu.Lock()
 	if m.queued[runID] {
@@ -1243,8 +1543,7 @@ func (m *DurableRunManager) enqueue(runID string) {
 	case <-m.ctx.Done():
 		m.clearQueued(runID)
 	default:
-		// Channel saturated; blocked sender is bounded to one per runID by
-		// dedup.
+		// At most one blocked sender per runID.
 		go func() {
 			select {
 			case m.queue <- runID:
@@ -1255,14 +1554,15 @@ func (m *DurableRunManager) enqueue(runID string) {
 	}
 }
 
-// persist saves the record through the durable store and, on success, emits
-// a trace snapshot for observability. Use persist for state-advancing saves
-// so the trace stream matches the durable state machine. Bookkeeping-only
-// saves (e.g. callback delivery metadata) should call store.saveRun directly.
+// persist saves the record, updates the in-memory index, and emits a trace
+// snapshot. Bookkeeping-only saves that live outside this function (e.g.
+// callback delivery retry metadata) must call m.index.Upsert themselves
+// after a successful saveRun.
 func (m *DurableRunManager) persist(record *durableRunRecord) error {
 	if err := m.store.saveRun(record); err != nil {
 		return err
 	}
+	m.index.Upsert(record)
 	m.emitTrace(record)
 	return nil
 }
@@ -1311,92 +1611,6 @@ func (m *DurableRunManager) unmarkProcessing(runID string) bool {
 	return false
 }
 
-type durableWaitConfig struct {
-	DurationSeconds int    `json:"duration_seconds"`
-	Mode            string `json:"mode,omitempty"`
-	StartFrom       string `json:"start_from,omitempty"`
-}
-
-type awaitSignalConfig struct {
-	Reason          string            `json:"reason,omitempty"`
-	SignalType      string            `json:"signal_type"`
-	CorrelationKey  string            `json:"correlation_key,omitempty"`
-	TimeoutSeconds  int               `json:"timeout_seconds,omitempty"`
-	RequiredPayload []string          `json:"required_payload,omitempty"`
-	DefaultOutputs  map[string]string `json:"default_outputs,omitempty"`
-	TimeoutOutputs  map[string]string `json:"timeout_outputs,omitempty"`
-}
-
-type durableDeferResolutionConfig struct {
-	Reason         string `json:"reason,omitempty"`
-	ResumeSignal   string `json:"resume_signal,omitempty"`
-	CorrelationKey string `json:"correlation_key,omitempty"`
-}
-
-func durableWaitDecision(node dag.NodeDef, execCtx *dag.Context) (map[string]string, int64, bool, error) {
-	cfg, err := executors.ParseConfig[durableWaitConfig](node.Config)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	mode := strings.TrimSpace(cfg.Mode)
-	if mode == "" {
-		mode = "sleep"
-	}
-	duration := cfg.DurationSeconds
-	if duration < 0 {
-		duration = 0
-	}
-	if mode == "defer" {
-		startFrom := strings.TrimSpace(cfg.StartFrom)
-		if startFrom == "" {
-			startFrom = "deadline"
-		}
-		nowTS, err := parseDurableInt64(execCtx.Get("market.now_ts"), "market.now_ts")
-		if err != nil {
-			return nil, 0, false, err
-		}
-		anchorTS, err := parseDurableInt64(execCtx.Get("market."+startFrom), "market."+startFrom)
-		if err != nil {
-			return nil, 0, false, err
-		}
-		readyAt := anchorTS + int64(duration)
-		outputs := map[string]string{
-			"status":            "success",
-			"mode":              "defer",
-			"start_from":        startFrom,
-			"anchor_ts":         strconv.FormatInt(anchorTS, 10),
-			"ready_at":          strconv.FormatInt(readyAt, 10),
-			"waited":            strconv.Itoa(duration),
-			"remaining_seconds": "0",
-		}
-		if nowTS >= readyAt {
-			return outputs, 0, true, nil
-		}
-		return outputs, readyAt, false, nil
-	}
-	outputs := map[string]string{
-		"status": "success",
-		"waited": strconv.Itoa(duration),
-		"mode":   mode,
-	}
-	if duration == 0 {
-		return outputs, 0, true, nil
-	}
-	return outputs, time.Now().Add(time.Duration(duration) * time.Second).Unix(), false, nil
-}
-
-func parseDurableInt64(raw string, name string) (int64, error) {
-	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s: %w", name, err)
-	}
-	return value, nil
-}
-
-func isDurableSuspendNode(nodeType string) bool {
-	return nodeType == "wait" || nodeType == "await_signal" || nodeType == "defer_resolution"
-}
-
 func isTerminalStatus(status RunStatus) bool {
 	return status == RunStatusCompleted || status == RunStatusFailed || status == RunStatusCancelled
 }
@@ -1437,19 +1651,6 @@ func hasDueWaiting(waiting map[string]durableWaitingNode, now int64) bool {
 	return false
 }
 
-func cloneWaitingMap(values map[string]durableWaitingNode) map[string]durableWaitingNode {
-	out := make(map[string]durableWaitingNode, len(values))
-	for key, value := range values {
-		value.RequiredPayload = append([]string(nil), value.RequiredPayload...)
-		value.DefaultOutputs = cloneStringMap(value.DefaultOutputs)
-		value.Outputs = cloneStringMap(value.Outputs)
-		value.TimeoutOutputs = cloneStringMap(value.TimeoutOutputs)
-		value.InputSnapshot = cloneStringMap(value.InputSnapshot)
-		out[key] = value
-	}
-	return out
-}
-
 func sortedSignals(signals map[string]signalRequest) []signalRequest {
 	keys := make([]string, 0, len(signals))
 	for key := range signals {
@@ -1464,7 +1665,7 @@ func sortedSignals(signals map[string]signalRequest) []signalRequest {
 }
 
 func waitingMatchesSignal(waiting durableWaitingNode, signal signalRequest) bool {
-	if waiting.Kind != "signal" {
+	if waiting.Kind != dag.SuspensionKindSignal {
 		return false
 	}
 	if waiting.CorrelationKey != "" && signal.CorrelationKey != waiting.CorrelationKey {
@@ -1488,6 +1689,25 @@ func validateSignalForWaiting(waiting durableWaitingNode, signal signalRequest) 
 	return nil
 }
 
+func signalConsumed(signal signalRequest) bool {
+	return strings.TrimSpace(signal.ConsumedAt) != ""
+}
+
+func consumeSignal(signals map[string]signalRequest, key string, consumedAt string) {
+	if signals == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	signal, ok := signals[key]
+	if !ok || signalConsumed(signal) {
+		return
+	}
+	if strings.TrimSpace(consumedAt) == "" {
+		consumedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	signal.ConsumedAt = consumedAt
+	signals[key] = signal
+}
+
 func outputsForSignal(waiting durableWaitingNode, signal signalRequest) map[string]string {
 	outputs := cloneStringMap(waiting.DefaultOutputs)
 	if outputs == nil {
@@ -1496,37 +1716,14 @@ func outputsForSignal(waiting durableWaitingNode, signal signalRequest) map[stri
 	for key, value := range signal.Payload {
 		outputs[key] = value
 	}
-	switch waiting.SignalType {
-	case "defer_resolution.resume":
-		if outputs["status"] == "" {
-			outputs["status"] = "success"
-		}
-		outputs["resumed"] = "true"
-	default:
-		if outputs["status"] == "" {
-			outputs["status"] = "success"
-		}
+	if outputs["status"] == "" {
+		outputs["status"] = "success"
 	}
 	return outputs
 }
 
-func normalizedRequiredPayload(required []string) []string {
-	if len(required) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(required))
-	normalized := make([]string, 0, len(required))
-	for _, key := range required {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		normalized = append(normalized, key)
-	}
-	sort.Strings(normalized)
-	return normalized
+func mergeTokenUsage(base, extra dag.TokenUsage) dag.TokenUsage {
+	base.InputTokens += extra.InputTokens
+	base.OutputTokens += extra.OutputTokens
+	return base
 }

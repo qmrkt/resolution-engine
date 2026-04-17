@@ -34,9 +34,7 @@ func newTestRunner(anthropicKey, dataDir string) *Runner {
 	}, engine)
 	agentExec.AllowLocalSourceFetch = true
 	engine.RegisterExecutor("agent_loop", agentExec)
-	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
-	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
-	engine.RegisterExecutor("defer_resolution", executors.NewDeferResolutionExecutor())
+	engine.RegisterExecutor("return", executors.NewReturnExecutor())
 	engine.RegisterExecutor("wait", executors.NewWaitExecutor())
 	engine.RegisterExecutor("cel_eval", executors.NewCelEvalExecutor())
 	engine.RegisterExecutor("map", executors.NewMapExecutor(engine))
@@ -68,22 +66,28 @@ func buildAPIFetchBlueprint(fetchURL string) []byte {
 			},
 			{
 				ID:   "submit",
-				Type: "submit_result",
+				Type: "return",
 				Config: map[string]interface{}{
-					"outcome_key": "fetch.outcome",
+					"value": map[string]interface{}{
+						"status":  "success",
+						"outcome": "{{results.fetch.outcome}}",
+					},
 				},
 			},
 			{
 				ID:   "cancel",
-				Type: "cancel_market",
+				Type: "return",
 				Config: map[string]interface{}{
-					"reason": "api fetch did not succeed",
+					"value": map[string]interface{}{
+						"status": "cancelled",
+						"reason": "api fetch did not succeed",
+					},
 				},
 			},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "fetch", To: "submit", Condition: "fetch.status == 'success'"},
-			{From: "fetch", To: "cancel", Condition: "fetch.status != 'success'"},
+			{From: "fetch", To: "submit", Condition: "results.fetch.status == 'success'"},
+			{From: "fetch", To: "cancel", Condition: "results.fetch.status != 'success'"},
 		},
 	}
 	data, _ := json.Marshal(bp)
@@ -105,22 +109,30 @@ func buildLLMCallBlueprint() []byte {
 			},
 			{
 				ID:   "submit",
-				Type: "submit_result",
+				Type: "return",
 				Config: map[string]interface{}{
-					"outcome_key": "llm.outcome",
+					"value": map[string]interface{}{
+						"status":     "success",
+						"outcome":    "{{results.llm.outcome}}",
+						"confidence": "{{results.llm.confidence}}",
+						"reasoning":  "{{results.llm.reasoning}}",
+					},
 				},
 			},
 			{
 				ID:   "cancel",
-				Type: "cancel_market",
+				Type: "return",
 				Config: map[string]interface{}{
-					"reason": "LLM call did not succeed",
+					"value": map[string]interface{}{
+						"status": "cancelled",
+						"reason": "LLM call did not succeed",
+					},
 				},
 			},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "llm", To: "submit", Condition: "llm.status == 'success'"},
-			{From: "llm", To: "cancel", Condition: "llm.status != 'success'"},
+			{From: "llm", To: "submit", Condition: "results.llm.status == 'success'"},
+			{From: "llm", To: "cancel", Condition: "results.llm.status != 'success'"},
 		},
 	}
 	data, _ := json.Marshal(bp)
@@ -170,13 +182,12 @@ func TestE2EAPIFetchResolution(t *testing.T) {
 	}
 
 	// Outcome should be "0" (Yes -> 0 via mapping)
-	outcome := run.Context["submit.outcome"]
-	if outcome != "0" {
-		t.Fatalf("expected outcome=0, got %q", outcome)
+	if got := returnStringField(t, run.Return, "outcome"); got != "0" {
+		t.Fatalf("expected return.outcome=0, got %q", got)
 	}
 
 	// Verify the raw extracted value
-	extracted := run.Context["fetch.extracted"]
+	extracted := testResultValue(run, "fetch", "extracted")
 	if extracted != "Yes" {
 		t.Fatalf("expected extracted=Yes, got %q", extracted)
 	}
@@ -247,18 +258,17 @@ func TestE2ELLMCallResolution(t *testing.T) {
 	}
 
 	// Outcome should be "1" (from outcome_index)
-	outcome := run.Context["submit.outcome"]
-	if outcome != "1" {
-		t.Fatalf("expected outcome=1, got %q", outcome)
+	if got := returnStringField(t, run.Return, "outcome"); got != "1" {
+		t.Fatalf("expected return.outcome=1, got %q", got)
 	}
 
 	// Verify LLM metadata in context
-	confidence := run.Context["llm.confidence"]
+	confidence := testResultValue(run, "llm", "confidence")
 	if confidence != "high" {
 		t.Fatalf("expected confidence=high, got %q", confidence)
 	}
 
-	reasoning := run.Context["llm.reasoning"]
+	reasoning := testResultValue(run, "llm", "reasoning")
 	if reasoning == "" {
 		t.Fatal("expected non-empty reasoning")
 	}
@@ -280,14 +290,17 @@ func TestE2EYOLOAutoResolutionExample(t *testing.T) {
 				},
 			},
 			{
-				ID:   "submit",
-				Type: "submit_result",
+				ID:   "done",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "pick.outcome",
+					"value": map[string]any{
+						"status":  "success",
+						"outcome": "{{results.pick.outcome}}",
+					},
 				},
 			},
 		},
-		Edges: []dag.EdgeDef{{From: "pick", To: "submit"}},
+		Edges: []dag.EdgeDef{{From: "pick", To: "done"}},
 	}
 	invalidChild := dag.Blueprint{
 		ID:      "child-invalid",
@@ -407,7 +420,7 @@ func TestE2EYOLOAutoResolutionExample(t *testing.T) {
 		"market.resolution_rules":      "Resolve to the most truthful outcome. Defer if evidence is inconclusive.",
 		"market.context_json":          `{"test_mode":true}`,
 		"market.sources_json":          `[]`,
-		"yolo.allowed_node_types_json": `["api_fetch","llm_call","agent_loop","wait","defer_resolution","submit_result","cel_eval","map"]`,
+		"yolo.allowed_node_types_json": `["api_fetch","llm_call","agent_loop","wait","return","cel_eval","map"]`,
 		"yolo.examples_json":           `[]`,
 		"yolo.source_packs_json":       `[]`,
 	})
@@ -430,25 +443,28 @@ func TestE2EYOLOAutoResolutionExample(t *testing.T) {
 	if run.NodeStates["run_child"].Status != "completed" {
 		t.Fatalf("expected gadget node completed, got %+v", run.NodeStates["run_child"])
 	}
-	if run.NodeStates["submit"].Status != "completed" {
-		t.Fatalf("expected submit node completed, got %+v", run.NodeStates["submit"])
+	if run.NodeStates["return_result"].Status != "completed" {
+		t.Fatalf("expected return_result node completed, got %+v", run.NodeStates["return_result"])
 	}
 	if run.NodeStates["defer_invalid"].Status == "completed" || run.NodeStates["defer_runtime"].Status == "completed" {
 		t.Fatalf("unexpected defer path in successful yolo run: %+v", run.NodeStates)
 	}
-	if run.Context["candidate.source"] != "repair" {
-		t.Fatalf("expected repaired child blueprint to be selected, got %q", run.Context["candidate.source"])
+	if testResultValue(run, "candidate", "source") != "repair" {
+		t.Fatalf("expected repaired child blueprint to be selected, got %q", testResultValue(run, "candidate", "source"))
 	}
-	if run.Context["run_child.submitted"] != "true" {
-		t.Fatalf("expected gadget to propagate child submission, got %q", run.Context["run_child.submitted"])
+	if testResultValue(run, "run_child", "return_json") == "" {
+		t.Fatal("expected gadget to surface child return_json")
 	}
-	if run.Context["submit.outcome"] != "1" {
-		t.Fatalf("expected final outcome 1, got %q", run.Context["submit.outcome"])
+	if returnStringField(t, json.RawMessage(testResultValue(run, "run_child", "return_json")), "outcome") != "1" {
+		t.Fatalf("expected child outcome 1, got %q", testResultValue(run, "run_child", "return_json"))
 	}
-	if run.Context["validate.valid"] != "true" {
-		t.Fatalf("expected final validate.valid=true, got %q", run.Context["validate.valid"])
+	if returnStringField(t, run.Return, "outcome") != "1" {
+		t.Fatalf("expected final outcome 1, got %s", string(run.Return))
 	}
-	if run.Context["validate._runs"] == "" {
+	if testResultValue(run, "validate", "valid") != "true" {
+		t.Fatalf("expected final validate.valid=true, got %q", testResultValue(run, "validate", "valid"))
+	}
+	if testResultHistoryJSON(run, "validate") == "" {
 		t.Fatal("expected validate node history to show at least one repair loop")
 	}
 }

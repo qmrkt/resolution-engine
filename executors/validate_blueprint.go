@@ -36,7 +36,22 @@ func NewValidateBlueprintExecutor(validate BlueprintValidatorFunc) *ValidateBlue
 	return &ValidateBlueprintExecutor{Validate: validate}
 }
 
-func (e *ValidateBlueprintExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (*ValidateBlueprintExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "required": ["blueprint_json_key"],
+  "properties": {
+    "blueprint_json_key": {"type": "string", "description": "Namespaced lookup path (inputs.X / results.<node>.<field>) holding a blueprint JSON string to validate."}
+  },
+  "additionalProperties": false
+}`)
+}
+
+func (*ValidateBlueprintExecutor) OutputKeys() []string {
+	return []string{"status", "valid", "issue_count", "issues_json", "issues_text", "blueprint_json", "first_issue_code", "first_issue_message", "first_issue_target"}
+}
+
+func (e *ValidateBlueprintExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	_ = ctx
 	if e == nil || e.Validate == nil {
 		return dag.ExecutorResult{}, fmt.Errorf("validate_blueprint executor is not configured")
@@ -51,7 +66,7 @@ func (e *ValidateBlueprintExecutor) Execute(ctx context.Context, node dag.NodeDe
 		return dag.ExecutorResult{}, fmt.Errorf("validate_blueprint config: blueprint_json_key is required")
 	}
 
-	raw := execCtx.Get(key)
+	raw := inv.Lookup(key)
 	result := validateBlueprintInput(raw, e.Validate)
 	issuesJSON, err := json.Marshal(result.Issues)
 	if err != nil {

@@ -72,7 +72,7 @@ Cancels an in-flight run.
 
 Persist an idempotent resume signal from the indexer or another trusted caller.
 Matching signals resume waiting workflow nodes such as `await_signal` and
-`defer_resolution`.
+`agent_loop async=true`.
 
 ```json
 {
@@ -93,6 +93,9 @@ Returns service health and active run count.
 
 The engine executes resolution blueprints as DAGs with conditional branching (CEL expressions). Node types are handled by typed executors or durable suspension handlers:
 
+For a detailed walkthrough of the in-memory DAG host versus the durable
+suspend/resume host, see [docs/execution-architecture.md](docs/execution-architecture.md).
+
 | Executor              | Description                                                      |
 | --------------------- | ---------------------------------------------------------------- |
 | `llm_call`            | Multi-provider LLM call (Anthropic, OpenAI, Google)              |
@@ -103,25 +106,29 @@ The engine executes resolution blueprints as DAGs with conditional branching (CE
 | `map`                 | Runs an inline child blueprint over a JSON array                 |
 | `gadget`              | Validates and runs a child blueprint supplied at runtime         |
 | `validate_blueprint`  | Validates blueprint JSON from context and emits issues           |
-| `defer_resolution`    | Defers resolution to a later time                                |
 | `wait`                | Pauses execution for a duration                                  |
-| `submit_result`       | Marks the final outcome                                          |
-| `cancel_market`       | Marks the market for cancellation                                |
+| `return`              | Emits a JSON value and short-circuits the run                    |
 
-Terminal results carry an action: `propose`, `finalize_dispute`, `cancel_market`, `defer`, or `none`.
+Every blueprint terminates by firing a `return` node. The emitted JSON
+object (with a required `status` string) is the run's result, accessible
+as `RunState.Return` and `RunResult.Return`. Caller code (the indexer)
+interprets the payload — the engine itself does not know about
+"propose", "cancel", or "defer"; those are caller-side conventions that
+live in the `status` field.
 
 ## Blueprint semantics
 
 A blueprint is a directed graph of steps. Each step writes values into a shared execution context, and later steps or edges can read those values.
 
-### Inputs and context
+### Inputs and results
 
-The engine seeds your request inputs into the context twice:
+The engine exposes invocation state under three namespaces. Templates and CEL
+expressions must use one of these — bare keys are not resolved.
 
-- as plain keys like `market_question`
-- as `input.*` keys like `input.market_question`
-
-That means either style can be referenced by executors and conditions.
+- `inputs.<key>` — the caller's request inputs
+- `results.<node>.<field>` — outputs produced by completed nodes
+- `results.<node>.history` — back-edge iteration history (JSON array)
+- `run.id` / `run.blueprint_id` / `run.started_at` — run identity
 
 ```text
 POST /run
@@ -130,52 +137,49 @@ POST /run
     "main_outcome": "0"
   }
 
-Context at start:
-  market_question        = "Will BTC hit 150k?"
-  input.market_question  = "Will BTC hit 150k?"
-  main_outcome           = "0"
-  input.main_outcome     = "0"
+References from inside the blueprint:
+  inputs.market_question  = "Will BTC hit 150k?"
+  inputs.main_outcome     = "0"
+  results.fetch.status    = "success"     // after node "fetch" completes
+  results.judge.reason    = "..."         // after node "judge" completes
+  results.fetch.history   = [...]         // back-edge iterations of "fetch"
 ```
-
-A node can then emit outputs like:
-
-- `fetch.status = success`
-- `fetch.outcome = 1`
-- `judge.reason = ...`
 
 ### Conditional edges (CEL)
 
 Edges can have conditions written in [CEL (Common Expression Language)](https://cel.dev). A target node only becomes reachable if the edge condition evaluates to true. See the [CEL language spec](https://github.com/google/cel-spec/blob/master/doc/langdef.md) for the full reference.
 
-Context values are available as CEL variables using the dotted key convention (`nodeId.field`). Scalar values from executor outputs are strings. JSON arrays and objects stored in context (such as `_runs` history) are passed to CEL as native lists and maps, so standard operators work on them:
+CEL identifiers use the same namespaced surface as templates. Scalar values
+from executor outputs are strings; JSON arrays and objects parse into native
+CEL lists and maps so standard operators work on them:
 
 ```cel
-fetch.status == 'success'
-fetch.status != 'success'
-judge.outcome != 'inconclusive' && judge.outcome != ''
-wait.status == 'success'
+results.fetch.status == 'success'
+results.fetch.status != 'success'
+results.judge.outcome != 'inconclusive' && results.judge.outcome != ''
+inputs.market.deadline != ''
 
-// List operations on node history (see below)
-fetch._runs.size() > 0
-fetch._runs.exists(r, r.status == 'success')
+// List operations on node back-edge history (see below)
+results.fetch.history.size() > 0
+results.fetch.history.exists(r, r.status == 'success')
 
 // Map field access on structured values
-judge.details.confidence > 0.5
+results.judge.details.confidence > 0.5
 ```
 
 Typical pattern:
-- success path goes to `submit_result`
-- failure or inconclusive path goes somewhere else (`cancel_market`, `defer_resolution`, another judge, etc.)
+- success path goes to a `return` with `{"status": "success", "outcome": "..."}`
+- failure or inconclusive path goes to a different `return` (`{"status": "cancelled"}`, `{"status": "deferred"}`, another judge, etc.)
 
-### Node history (`_runs`)
+### Node history (`results.<node>.history`)
 
-When a node is re-executed via a back-edge loop, the engine snapshots its outputs before resetting. These snapshots accumulate in `nodeId._runs` as a JSON array, giving downstream nodes and edge conditions forensic access to all prior executions.
+When a node is re-executed via a back-edge loop, the engine snapshots its outputs before resetting. These snapshots accumulate under `results.<node>.history` as a JSON array, giving downstream nodes and edge conditions forensic access to all prior executions.
 
-`nodeId.field` always holds the latest value (last-write-wins). `nodeId._runs` holds the history of all previous iterations (not including the current one).
+`results.<node>.<field>` always holds the latest value (last-write-wins). `results.<node>.history` holds the history of all previous iterations (not including the current one).
 
 Example: a node `fetch` is looped 3 times. After the run completes:
-- `fetch.status` = output from iteration 3 (latest)
-- `fetch._runs` = `[{iteration 1 outputs}, {iteration 2 outputs}]`
+- `results.fetch.status` = output from iteration 3 (latest)
+- `results.fetch.history` = `[{iteration 1 outputs}, {iteration 2 outputs}]`
 
 ### Back edges and bounded loops
 
@@ -214,8 +218,8 @@ Here is a simpler workflow from the UI:
 
 A common pattern is:
 - gather some evidence or judgment input
-- if the result is usable, flow into `submit_result`
-- if the result is not usable, flow into `cancel_market`
+- if the result is usable, flow into a `return` with `{"status": "success", ...}`
+- if the result is not usable, flow into a `return` with `{"status": "cancelled", ...}`
 
 In practice:
 
@@ -223,15 +227,40 @@ In practice:
 - nodes write outputs back into context
 - edges decide where execution goes next
 - back edges allow bounded retry loops
-- `submit_result` and `cancel_market` are the primary terminal actions
+- the run terminates the moment any `return` node fires (first-completion-wins; siblings are cancelled)
 
 ## Design notes
 
 - Run state is durably persisted in the local data directory for single-node operation.
-- `wait`, `await_signal`, and `defer_resolution` suspend runs instead of occupying workers.
+- `wait` and `await_signal` suspend runs instead of occupying workers.
 - Resume signals are idempotent and correlated by run, app, or explicit key.
 - Callback URLs are delivered through a durable retrying outbox.
 - Traces are observability, not control-plane state.
+
+## Blueprint Authoring Skills
+
+This repo ships a `blueprint-author` agent skill for authoring, reviewing,
+and debugging resolution blueprints. It routes agents to the in-repo node
+catalog, executor schemas, examples, and validator diagnostics instead of
+making them guess.
+
+The skill itself lives at [`skills/blueprint-author/`](skills/blueprint-author/). For the shared skill docs, see [`skills/README.md`](skills/README.md).
+
+### Install for Claude Code
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r skills/blueprint-author ~/.claude/skills/
+```
+
+### Install for Codex
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r skills/blueprint-author ~/.agents/skills/
+```
+
+After installing, restart your session if the skill does not appear immediately.
 
 ## Security
 
@@ -297,6 +326,36 @@ a time:
 go test ./dag -run '^$' -fuzz='^FuzzEvalCondition$' -fuzztime=30s
 go test ./executors -run '^$' -fuzz='^FuzzExtractJSON$' -fuzztime=30s
 ```
+
+## Agent Skills
+
+This repo ships a [`blueprint-author`](skills/blueprint-author/) skill that
+teaches coding agents how to author, review, and debug engine blueprints.
+It references the in-repo [node catalog](docs/node-catalog.md),
+[execution architecture](docs/execution-architecture.md), and
+[examples](docs/examples/).
+
+**Auto-loads in this repo** (no action needed):
+
+- Claude Code picks it up from `.claude/skills/blueprint-author/` (symlink
+  into `skills/`).
+- Codex CLI picks it up from `.agents/skills/blueprint-author/` (symlink
+  into `skills/`).
+
+**Install in your profile or another project**:
+
+```bash
+# Claude Code (user-level, all projects)
+cp -r skills/blueprint-author ~/.claude/skills/
+
+# Codex CLI (user-level, all projects)
+cp -r skills/blueprint-author ~/.agents/skills/
+
+# Project-level: substitute ~/.claude or ~/.agents with
+#   <project>/.claude or <project>/.agents
+```
+
+See [skills/README.md](skills/README.md) for details and verification steps.
 
 ## License
 

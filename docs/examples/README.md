@@ -9,6 +9,12 @@ The examples intentionally use placeholder URLs and context keys. Market creatio
 
 Most folders are direct resolution workflows. `blueprint-generator` is a meta-workflow example that compiles a resolution blueprint and runs a bounded validate/repair loop around it.
 
+## Where to start
+
+- **Per-node reference (config, outputs, host constraints):** [`../node-catalog.md`](../node-catalog.md).
+- **Primitive patterns (single-fetch, retry loop, human-in-the-loop, fan-out):** the *Quickstart primitives* section of the catalog.
+- **End-to-end resolution workflows:** the table below. These are more realistic compositions — multi-agent judging, redundant sources, dispute paths, meta-workflows.
+
 ## Examples
 
 

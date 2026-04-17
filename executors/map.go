@@ -14,13 +14,6 @@ import (
 
 const mapDepthKey = "__map_depth"
 
-var deprecatedMapConfigFields = []string{
-	"mode",
-	"item_input_key",
-	"index_input_key",
-	"per_item_timeout_seconds",
-}
-
 // MapConfig is the node config for map steps.
 type MapConfig struct {
 	ItemsKey                string            `json:"items_key"`
@@ -37,7 +30,6 @@ type MapConfig struct {
 	MaxDepth                int               `json:"max_depth,omitempty"`
 	PerBatchTimeoutSeconds  int               `json:"per_batch_timeout_seconds,omitempty"`
 	InputMappings           map[string]string `json:"input_mappings,omitempty"`
-	OutputKeys              []string          `json:"output_keys,omitempty"`
 }
 
 type MapExecutor struct {
@@ -46,6 +38,34 @@ type MapExecutor struct {
 
 func NewMapExecutor(engine *dag.Engine) *MapExecutor {
 	return &MapExecutor{engine: engine}
+}
+
+func (*MapExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "required": ["items_key", "inline"],
+  "properties": {
+    "items_key": {"type": "string", "description": "Namespaced lookup path (inputs.X / results.<node>.<field>) holding a JSON array to iterate."},
+    "inline": {"type": "object", "description": "Inline blueprint executed per batch. Must not contain suspension-capable nodes."},
+    "batch_size": {"type": "integer", "minimum": 0, "description": "Items per batch. 0 means one batch containing all items."},
+    "batch_input_key": {"type": "string", "description": "Child-input key receiving the batch items as a JSON array."},
+    "batch_index_input_key": {"type": "string"},
+    "batch_start_index_input_key": {"type": "string"},
+    "batch_end_index_input_key": {"type": "string"},
+    "batch_item_count_input_key": {"type": "string"},
+    "max_concurrency": {"type": "integer", "minimum": 0, "description": "Parallel batches. 0 or nil = sequential."},
+    "on_error": {"type": "string", "enum": ["fail", "continue"], "default": "fail"},
+    "max_items": {"type": "integer", "minimum": 0, "description": "Cap on total items processed."},
+    "max_depth": {"type": "integer", "minimum": 0, "description": "Recursion guard across nested map nodes."},
+    "per_batch_timeout_seconds": {"type": "integer", "minimum": 0},
+    "input_mappings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra parent->child context keys passed into every batch."}
+  },
+  "additionalProperties": false
+}`)
+}
+
+func (*MapExecutor) OutputKeys() []string {
+	return []string{"status", "results", "total_items", "total_batches", "completed_batches", "failed_batches", "skipped_batches", "first_error"}
 }
 
 type mapSettings struct {
@@ -76,33 +96,12 @@ type mapBatchResult struct {
 	BatchItemCount  int               `json:"batch_item_count"`
 	Items           []json.RawMessage `json:"items,omitempty"`
 	Status          string            `json:"status"`
-	Outputs         map[string]string `json:"outputs,omitempty"`
+	Return          json.RawMessage   `json:"return,omitempty"`
 	Error           string            `json:"error,omitempty"`
 	Usage           dag.TokenUsage    `json:"usage"`
 }
 
-// DeprecatedMapConfigField reports removed map config fields so callers can
-// reject stale blueprints before silently ignoring unknown JSON fields.
-func DeprecatedMapConfigField(raw interface{}) (string, bool, error) {
-	keys, err := rawConfigKeys(raw)
-	if err != nil {
-		return "", false, err
-	}
-	for _, field := range deprecatedMapConfigFields {
-		if _, ok := keys[field]; ok {
-			return field, true, nil
-		}
-	}
-	return "", false, nil
-}
-
-func (e *MapExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	if field, ok, err := DeprecatedMapConfigField(node.Config); err != nil {
-		return dag.ExecutorResult{}, fmt.Errorf("map config: %w", err)
-	} else if ok {
-		return dag.ExecutorResult{}, fmt.Errorf("map config field %q is no longer supported; use batch_size and max_concurrency", field)
-	}
-
+func (e *MapExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	cfg, err := ParseConfig[MapConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("map config: %w", err)
@@ -112,7 +111,7 @@ func (e *MapExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *da
 	}
 
 	settings := resolveMapSettings(cfg)
-	depth, err := currentMapDepth(execCtx)
+	depth, err := parseDepthCounter(inv.Run.Inputs[mapDepthKey])
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("map depth: %w", err)
 	}
@@ -120,7 +119,7 @@ func (e *MapExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *da
 		return dag.ExecutorResult{}, fmt.Errorf("map depth %d exceeds max_depth %d", depth+1, settings.maxDepth)
 	}
 
-	raw := strings.TrimSpace(execCtx.Get(strings.TrimSpace(cfg.ItemsKey)))
+	raw := strings.TrimSpace(inv.Lookup(strings.TrimSpace(cfg.ItemsKey)))
 	if raw == "" {
 		return buildMapResult(nil, dag.TokenUsage{}), nil
 	}
@@ -140,7 +139,7 @@ func (e *MapExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *da
 		childKey = strings.TrimSpace(childKey)
 		parentKey = strings.TrimSpace(parentKey)
 		if childKey != "" && parentKey != "" {
-			baseInputs[childKey] = execCtx.Get(parentKey)
+			baseInputs[childKey] = inv.Lookup(parentKey)
 		}
 	}
 
@@ -264,7 +263,7 @@ func (e *MapExecutor) executeBatch(
 	}
 
 	result.Status = "completed"
-	result.Outputs = mapBatchOutputs(cfg.OutputKeys, run.Context)
+	result.Return = cloneRawMessage(run.Return)
 	return result
 }
 
@@ -280,6 +279,12 @@ func (e *MapExecutor) validateConfig(cfg MapConfig) error {
 	}
 	if errs := dag.ValidateBlueprint(*cfg.Inline); len(errs) > 0 {
 		return fmt.Errorf("inline blueprint: %w", errs[0])
+	}
+	if err := FirstReturnContractError(*cfg.Inline); err != nil {
+		return fmt.Errorf("inline blueprint: %w", err)
+	}
+	if err := e.engine.ValidateNoSuspensionCapableNodes(*cfg.Inline); err != nil {
+		return fmt.Errorf("inline blueprint: %w", err)
 	}
 	if cfg.BatchSize < 0 {
 		return fmt.Errorf("batch_size must be non-negative")
@@ -353,7 +358,7 @@ func buildMapBatches(items []json.RawMessage, batchSize int) []mapBatch {
 			Index:      len(batches),
 			StartIndex: start,
 			EndIndex:   endExclusive - 1,
-			Items:      append([]json.RawMessage(nil), items[start:endExclusive]...),
+			Items:      items[start:endExclusive],
 		})
 	}
 	return batches
@@ -367,21 +372,6 @@ func mapWorkerCount(maxConcurrency int, batchCount int) int {
 		return batchCount
 	}
 	return maxConcurrency
-}
-
-func currentMapDepth(execCtx *dag.Context) (int, error) {
-	raw := strings.TrimSpace(execCtx.Get(mapDepthKey))
-	if raw == "" {
-		return 0, nil
-	}
-	depth, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, err
-	}
-	if depth < 0 {
-		return 0, fmt.Errorf("negative depth %d", depth)
-	}
-	return depth, nil
 }
 
 func newMapBatchResult(batch mapBatch) mapBatchResult {
@@ -398,31 +388,6 @@ func skippedMapBatchResult(batch mapBatch) mapBatchResult {
 	result := newMapBatchResult(batch)
 	result.Status = "skipped"
 	return result
-}
-
-func mapBatchOutputs(outputKeys []string, context map[string]string) map[string]string {
-	if len(outputKeys) > 0 {
-		outputs := make(map[string]string, len(outputKeys))
-		for _, key := range outputKeys {
-			key = strings.TrimSpace(key)
-			if key != "" {
-				if v, ok := context[key]; ok {
-					outputs[key] = v
-				}
-			}
-		}
-		return outputs
-	}
-	if context == nil {
-		return nil
-	}
-	outputs := make(map[string]string, len(context))
-	for k, v := range context {
-		if !strings.HasPrefix(k, "__") && !strings.HasPrefix(k, "input.") {
-			outputs[k] = v
-		}
-	}
-	return outputs
 }
 
 func buildMapResult(results []mapBatchResult, usage dag.TokenUsage) dag.ExecutorResult {
@@ -478,14 +443,3 @@ func buildMapResult(results []mapBatchResult, usage dag.TokenUsage) dag.Executor
 	}
 }
 
-func rawConfigKeys(raw interface{}) (map[string]struct{}, error) {
-	m, ok := raw.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("config is not an object")
-	}
-	keys := make(map[string]struct{}, len(m))
-	for k := range m {
-		keys[k] = struct{}{}
-	}
-	return keys, nil
-}

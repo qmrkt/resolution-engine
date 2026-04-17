@@ -11,3 +11,7 @@ data/
 # Misc
 .hermes
 .DS_Store
+
+# Local agent tooling
+.claude/
+.agents/

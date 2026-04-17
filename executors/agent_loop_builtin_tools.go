@@ -40,7 +40,7 @@ func (t *contextGetTool) Execute(_ context.Context, args json.RawMessage) (agent
 			denied = append(denied, key)
 			continue
 		}
-		value := t.access.execCtx.Get(key)
+		value := t.access.inv.Lookup(key)
 		if value == "" {
 			missing = append(missing, key)
 			continue
@@ -175,7 +175,7 @@ func (t *jsonExtractTool) Execute(_ context.Context, args json.RawMessage) (agen
 		if !t.access.readable(key) {
 			return jsonToolResult(map[string]any{"status": "failed", "error": fmt.Sprintf("context key %q is not readable", key)}), nil
 		}
-		raw = t.access.execCtx.Get(key)
+		raw = t.access.inv.Lookup(key)
 	}
 	if strings.TrimSpace(raw) == "" {
 		return jsonToolResult(map[string]any{"status": "failed", "error": "json or context_key is required"}), nil

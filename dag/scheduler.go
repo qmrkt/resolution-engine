@@ -177,7 +177,7 @@ func (s *Scheduler) ReadyNodes(completed, failed, running map[string]struct{}) [
 }
 
 // EvaluateEdges returns outgoing edges whose conditions pass.
-func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) ([]EdgeDef, error) {
+func (s *Scheduler) EvaluateEdges(nodeID string, inv *Invocation) ([]EdgeDef, error) {
 	outgoing := s.outgoing[nodeID]
 	if len(outgoing) == 0 {
 		return nil, nil
@@ -192,7 +192,7 @@ func (s *Scheduler) EvaluateEdges(nodeID string, ctx *Context) ([]EdgeDef, error
 	forwardCandidates := make([]EdgeDef, 0)
 
 	for _, edge := range outgoing {
-		met, err := s.edgeConditionMet(edge, ctx)
+		met, err := s.edgeConditionMet(edge, inv)
 		if err != nil {
 			return nil, err
 		}
@@ -240,11 +240,11 @@ func (s *Scheduler) TrackTraversal(from, to string) {
 	s.edgeTraversals[edgeKey(from, to)]++
 }
 
-func (s *Scheduler) edgeConditionMet(edge EdgeDef, ctx *Context) (bool, error) {
+func (s *Scheduler) edgeConditionMet(edge EdgeDef, inv *Invocation) (bool, error) {
 	if strings.TrimSpace(edge.Condition) == "" {
 		return true, nil
 	}
-	ok, err := EvalCondition(edge.Condition, ctx)
+	ok, err := EvalCondition(edge.Condition, inv)
 	if err != nil {
 		return false, fmt.Errorf("condition %q on edge %s->%s: %w", edge.Condition, edge.From, edge.To, err)
 	}

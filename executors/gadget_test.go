@@ -10,10 +10,10 @@ import (
 	"github.com/qmrkt/resolution-engine/dag"
 )
 
-type gadgetTestExecutorFunc func(context.Context, dag.NodeDef, *dag.Context) (dag.ExecutorResult, error)
+type gadgetTestExecutorFunc func(context.Context, dag.NodeDef, *dag.Invocation) (dag.ExecutorResult, error)
 
-func (fn gadgetTestExecutorFunc) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	return fn(ctx, node, execCtx)
+func (fn gadgetTestExecutorFunc) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
+	return fn(ctx, node, inv)
 }
 
 func validGadgetTestValidator(_ dag.Blueprint, _ []byte) BlueprintValidationResult {
@@ -29,17 +29,29 @@ func mustBlueprintJSON(t *testing.T, bp dag.Blueprint) string {
 	return string(raw)
 }
 
+func mustGadgetReturnPayload(t *testing.T, outputs map[string]string) map[string]any {
+	t.Helper()
+	raw := strings.TrimSpace(outputs["return_json"])
+	if raw == "" {
+		t.Fatalf("expected non-empty return_json on gadget outputs: %+v", outputs)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("unmarshal return_json: %v\n%s", err, raw)
+	}
+	return payload
+}
+
 func newGadgetTestEngine() *dag.Engine {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("cel_eval", NewCelEvalExecutor())
-	engine.RegisterExecutor("submit_result", NewSubmitResultExecutor())
-	engine.RegisterExecutor("defer_resolution", NewDeferResolutionExecutor())
-	engine.RegisterExecutor("cancel_market", NewCancelMarketExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
 	engine.RegisterExecutor("gadget", exec)
 	return engine
 }
 
+// nestedGrandchildBlueprint: pick an outcome and return a success payload.
 func nestedGrandchildBlueprint() dag.Blueprint {
 	return dag.Blueprint{
 		ID:      "grandchild",
@@ -57,9 +69,12 @@ func nestedGrandchildBlueprint() dag.Blueprint {
 			},
 			{
 				ID:   "submit",
-				Type: "submit_result",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "pick.outcome",
+					"value": map[string]any{
+						"status":  "success",
+						"outcome": "{{results.pick.outcome}}",
+					},
 				},
 			},
 		},
@@ -67,10 +82,11 @@ func nestedGrandchildBlueprint() dag.Blueprint {
 	}
 }
 
+// nestedChildBlueprint: parent of a nested gadget. The inner gadget's
+// return value lands on inner.return_json; the parent branches on it.
 func nestedChildBlueprint(innerMaxDepth int) dag.Blueprint {
 	innerConfig := map[string]any{
-		"inline":             nestedGrandchildBlueprint(),
-		"propagate_terminal": true,
+		"inline": nestedGrandchildBlueprint(),
 	}
 	if innerMaxDepth > 0 {
 		innerConfig["max_depth"] = innerMaxDepth
@@ -88,22 +104,25 @@ func nestedChildBlueprint(innerMaxDepth int) dag.Blueprint {
 			},
 			{
 				ID:   "submit",
-				Type: "submit_result",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "inner.outcome",
+					"from_key": "results.inner.return_json",
 				},
 			},
 			{
 				ID:   "defer",
-				Type: "defer_resolution",
+				Type: "return",
 				Config: map[string]any{
-					"reason": "inner gadget failed",
+					"value": map[string]any{
+						"status": "deferred",
+						"reason": "inner gadget failed",
+					},
 				},
 			},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "inner", To: "submit", Condition: "inner.submitted == 'true'"},
-			{From: "inner", To: "defer", Condition: "inner.submitted != 'true'"},
+			{From: "inner", To: "submit", Condition: "results.inner.run_status == 'completed'"},
+			{From: "inner", To: "defer", Condition: "results.inner.run_status != 'completed'"},
 		},
 	}
 }
@@ -111,6 +130,7 @@ func nestedChildBlueprint(innerMaxDepth int) dag.Blueprint {
 func TestGadgetRuntimeBlueprintJSONKey(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("cel_eval", NewCelEvalExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
 
 	child := dag.Blueprint{
@@ -123,30 +143,40 @@ func TestGadgetRuntimeBlueprintJSONKey(t *testing.T) {
 				Type: "cel_eval",
 				Config: map[string]any{
 					"expressions": map[string]string{
-						"answer": "input.subject",
+						"answer": "inputs.subject",
+					},
+				},
+			},
+			{
+				ID:   "out",
+				Type: "return",
+				Config: map[string]any{
+					"value": map[string]any{
+						"status": "success",
+						"answer": "{{results.step.answer}}",
 					},
 				},
 			},
 		},
+		Edges: []dag.EdgeDef{{From: "step", To: "out"}},
 	}
 
 	node := dag.NodeDef{
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 			"input_mappings": map[string]string{
-				"subject": "parent.subject",
+				"subject": "inputs.parent.subject",
 			},
-			"output_keys": []string{"step.answer"},
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": mustBlueprintJSON(t, child),
 		"parent.subject":           "winner",
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,8 +186,9 @@ func TestGadgetRuntimeBlueprintJSONKey(t *testing.T) {
 	if result.Outputs["run_status"] != "completed" {
 		t.Fatalf("expected completed child run, got %+v", result.Outputs)
 	}
-	if result.Outputs["step.answer"] != "winner" {
-		t.Fatalf("expected mapped child output, got %+v", result.Outputs)
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["answer"] != "winner" {
+		t.Fatalf("expected return.answer=winner, got %+v", payload)
 	}
 	if strings.TrimSpace(result.Outputs["child_run_id"]) == "" {
 		t.Fatalf("expected child_run_id, got %+v", result.Outputs)
@@ -170,14 +201,14 @@ func TestGadgetInvalidRuntimeJSON(t *testing.T) {
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": "{not-json",
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,14 +233,14 @@ func TestGadgetValidatorRejectsInvalidChild(t *testing.T) {
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": `{"id":"child","version":1,"nodes":[],"edges":[]}`,
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,11 +265,11 @@ func TestGadgetDepthGuard(t *testing.T) {
 			"max_depth":      1,
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		gadgetDepthKey: "1",
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +292,7 @@ func TestGadgetRejectsDisallowedNodeType(t *testing.T) {
 				ID:   "check",
 				Type: "validate_blueprint",
 				Config: map[string]any{
-					"blueprint_json_key": "input.child",
+					"blueprint_json_key": "inputs.child",
 				},
 			},
 		},
@@ -274,7 +305,7 @@ func TestGadgetRejectsDisallowedNodeType(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,13 +324,12 @@ func TestGadgetRejectsNestedGadgetByDefaultPolicy(t *testing.T) {
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json":     mustBlueprintJSON(t, nestedChildBlueprint(2)),
-			"propagate_terminal": true,
-			"max_depth":          2,
+			"blueprint_json": mustBlueprintJSON(t, nestedChildBlueprint(2)),
+			"max_depth":      2,
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,34 +348,30 @@ func TestGadgetSupportsNestedGadgetWithCustomPolicy(t *testing.T) {
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json":     mustBlueprintJSON(t, nestedChildBlueprint(2)),
-			"propagate_terminal": true,
-			"max_depth":          2,
+			"blueprint_json": mustBlueprintJSON(t, nestedChildBlueprint(2)),
+			"max_depth":      2,
 			"dynamic_blueprint_policy": map[string]any{
-				"allowed_node_types":     []string{"gadget", "submit_result", "defer_resolution"},
+				"allowed_node_types":     []string{"gadget", "return"},
 				"max_nodes":              8,
 				"max_edges":              8,
 				"max_total_time_seconds": 10,
 				"max_total_tokens":       20,
 				"max_depth":              2,
-				"allow_terminal_nodes":   true,
 				"allow_agent_loop":       false,
 			},
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["status"] != "success" {
 		t.Fatalf("expected success, got %+v", result.Outputs)
 	}
-	if result.Outputs["terminal_action"] != "submit_result" || result.Outputs["submitted"] != "true" {
-		t.Fatalf("expected propagated submit result, got %+v", result.Outputs)
-	}
-	if result.Outputs["outcome"] != "1" {
-		t.Fatalf("expected nested gadget outcome 1, got %+v", result.Outputs)
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["status"] != "success" || payload["outcome"] != "1" {
+		t.Fatalf("expected nested success payload, got %+v", payload)
 	}
 }
 
@@ -356,41 +382,37 @@ func TestGadgetNestedGadgetNeedsMaxDepthBump(t *testing.T) {
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json":     mustBlueprintJSON(t, nestedChildBlueprint(0)),
-			"propagate_terminal": true,
-			"max_depth":          2,
+			"blueprint_json": mustBlueprintJSON(t, nestedChildBlueprint(0)),
+			"max_depth":      2,
 			"dynamic_blueprint_policy": map[string]any{
-				"allowed_node_types":     []string{"gadget", "submit_result", "defer_resolution"},
+				"allowed_node_types":     []string{"gadget", "return"},
 				"max_nodes":              8,
 				"max_edges":              8,
 				"max_total_time_seconds": 10,
 				"max_total_tokens":       20,
 				"max_depth":              2,
-				"allow_terminal_nodes":   true,
 				"allow_agent_loop":       false,
 			},
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["status"] != "success" {
 		t.Fatalf("expected outer gadget success, got %+v", result.Outputs)
 	}
-	if result.Outputs["terminal_action"] != "defer_resolution" || result.Outputs["deferred"] != "true" {
-		t.Fatalf("expected defer fallback, got %+v", result.Outputs)
-	}
-	if result.Outputs["reason"] != "inner gadget failed" {
-		t.Fatalf("expected defer reason, got %+v", result.Outputs)
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["status"] != "deferred" || payload["reason"] != "inner gadget failed" {
+		t.Fatalf("expected defer fallback payload, got %+v", payload)
 	}
 }
 
-func TestGadgetPropagatesSubmitTerminal(t *testing.T) {
+func TestGadgetSurfacesChildReturn(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("cel_eval", NewCelEvalExecutor())
-	engine.RegisterExecutor("submit_result", NewSubmitResultExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
 
 	child := dag.Blueprint{
@@ -408,120 +430,96 @@ func TestGadgetPropagatesSubmitTerminal(t *testing.T) {
 				},
 			},
 			{
-				ID:   "submit",
-				Type: "submit_result",
+				ID:   "out",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "pick.outcome",
+					"value": map[string]any{
+						"status":  "success",
+						"outcome": "{{results.pick.outcome}}",
+					},
 				},
 			},
 		},
-		Edges: []dag.EdgeDef{{From: "pick", To: "submit"}},
+		Edges: []dag.EdgeDef{{From: "pick", To: "out"}},
 	}
 	node := dag.NodeDef{
 		ID:   "run_child",
 		Type: "gadget",
 		Config: map[string]any{
-			"blueprint_json":     mustBlueprintJSON(t, child),
-			"propagate_terminal": true,
-			"output_keys":        []string{"pick.outcome", "submit.outcome"},
+			"blueprint_json": mustBlueprintJSON(t, child),
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["status"] != "success" {
 		t.Fatalf("expected success, got %+v", result.Outputs)
 	}
-	if result.Outputs["terminal_action"] != "submit_result" || result.Outputs["submitted"] != "true" {
-		t.Fatalf("expected propagated submit result, got %+v", result.Outputs)
-	}
-	if result.Outputs["outcome"] != "1" {
-		t.Fatalf("expected outcome 1, got %+v", result.Outputs)
-	}
-	if strings.TrimSpace(result.Outputs["evidence_hash"]) == "" {
-		t.Fatalf("expected evidence_hash, got %+v", result.Outputs)
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["status"] != "success" || payload["outcome"] != "1" {
+		t.Fatalf("expected propagated payload, got %+v", payload)
 	}
 }
 
-func TestGadgetPropagatesCancelAndDeferTerminal(t *testing.T) {
-	testCases := []struct {
-		name           string
-		nodeType       string
-		expectedAction string
-		expectedFlag   string
-		expectedReason string
-	}{
-		{
-			name:           "cancel",
-			nodeType:       "cancel_market",
-			expectedAction: "cancel_market",
-			expectedFlag:   "cancelled",
-			expectedReason: "market invalid",
+func TestGadgetAllowsInlineWaitByDefault(t *testing.T) {
+	engine := dag.NewEngine(nil)
+	engine.RegisterExecutor("wait", NewWaitExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
+	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
+
+	child := dag.Blueprint{
+		ID:      "child-inline-wait",
+		Version: 1,
+		Budget:  &dag.Budget{MaxTotalTimeSeconds: 5, MaxTotalTokens: 10},
+		Nodes: []dag.NodeDef{
+			{
+				ID:     "pause",
+				Type:   "wait",
+				Config: map[string]any{"duration_seconds": 0},
+			},
+			{
+				ID:   "out",
+				Type: "return",
+				Config: map[string]any{
+					"value": map[string]any{
+						"status": "success",
+						"waited": "{{results.pause.waited}}",
+						"mode":   "{{results.pause.mode}}",
+					},
+				},
+			},
 		},
-		{
-			name:           "defer",
-			nodeType:       "defer_resolution",
-			expectedAction: "defer_resolution",
-			expectedFlag:   "deferred",
-			expectedReason: "need more data",
+		Edges: []dag.EdgeDef{{From: "pause", To: "out"}},
+	}
+	node := dag.NodeDef{
+		ID:   "run_child",
+		Type: "gadget",
+		Config: map[string]any{
+			"blueprint_json": mustBlueprintJSON(t, child),
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			engine := dag.NewEngine(nil)
-			engine.RegisterExecutor("cancel_market", NewCancelMarketExecutor())
-			engine.RegisterExecutor("defer_resolution", NewDeferResolutionExecutor())
-			exec := NewGadgetExecutor(engine, validGadgetTestValidator)
-
-			child := dag.Blueprint{
-				ID:      "child-action",
-				Version: 1,
-				Budget:  &dag.Budget{MaxTotalTimeSeconds: 5, MaxTotalTokens: 10},
-				Nodes: []dag.NodeDef{
-					{
-						ID:   "act",
-						Type: tc.nodeType,
-						Config: map[string]any{
-							"reason": tc.expectedReason,
-						},
-					},
-				},
-			}
-			node := dag.NodeDef{
-				ID:   "run_child",
-				Type: "gadget",
-				Config: map[string]any{
-					"blueprint_json":     mustBlueprintJSON(t, child),
-					"propagate_terminal": true,
-				},
-			}
-
-			result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Outputs["status"] != "success" {
-				t.Fatalf("expected success, got %+v", result.Outputs)
-			}
-			if result.Outputs["terminal_action"] != tc.expectedAction {
-				t.Fatalf("expected action %q, got %+v", tc.expectedAction, result.Outputs)
-			}
-			if result.Outputs[tc.expectedFlag] != "true" {
-				t.Fatalf("expected flag %q, got %+v", tc.expectedFlag, result.Outputs)
-			}
-			if result.Outputs["reason"] != tc.expectedReason {
-				t.Fatalf("expected reason %q, got %+v", tc.expectedReason, result.Outputs)
-			}
-		})
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" {
+		t.Fatalf("expected success, got %+v", result.Outputs)
+	}
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["waited"] != "0" {
+		t.Fatalf("payload.waited = %v, want \"0\"", payload["waited"])
+	}
+	if payload["mode"] != "sleep" {
+		t.Fatalf("payload.mode = %v, want \"sleep\"", payload["mode"])
 	}
 }
 
 func TestGadgetSoftFailsChildExecutionError(t *testing.T) {
 	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("fail_step", gadgetTestExecutorFunc(func(_ context.Context, _ dag.NodeDef, _ *dag.Context) (dag.ExecutorResult, error) {
+	engine.RegisterExecutor("fail_step", gadgetTestExecutorFunc(func(_ context.Context, _ dag.NodeDef, _ *dag.Invocation) (dag.ExecutorResult, error) {
 		return dag.ExecutorResult{}, fmt.Errorf("boom")
 	}))
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
@@ -545,13 +543,12 @@ func TestGadgetSoftFailsChildExecutionError(t *testing.T) {
 				"max_edges":              4,
 				"max_total_time_seconds": 5,
 				"max_total_tokens":       10,
-				"allow_terminal_nodes":   false,
 				"allow_agent_loop":       false,
 			},
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,13 +565,14 @@ func TestGadgetSoftFailsChildExecutionError(t *testing.T) {
 
 func TestGadgetInputMappingsCannotOverrideReservedDepth(t *testing.T) {
 	engine := dag.NewEngine(nil)
-	engine.RegisterExecutor("inspect", gadgetTestExecutorFunc(func(_ context.Context, _ dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+	engine.RegisterExecutor("inspect", gadgetTestExecutorFunc(func(_ context.Context, _ dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 		return dag.ExecutorResult{Outputs: map[string]string{
 			"status":  "success",
-			"depth":   execCtx.Get(gadgetDepthKey),
-			"subject": execCtx.Get("subject"),
+			"depth":   inv.Run.Inputs[gadgetDepthKey],
+			"subject": inv.Run.Inputs["subject"],
 		}}, nil
 	}))
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
 
 	child := dag.Blueprint{
@@ -583,7 +581,19 @@ func TestGadgetInputMappingsCannotOverrideReservedDepth(t *testing.T) {
 		Budget:  &dag.Budget{MaxTotalTimeSeconds: 5, MaxTotalTokens: 10},
 		Nodes: []dag.NodeDef{
 			{ID: "inspect", Type: "inspect", Config: map[string]any{}},
+			{
+				ID:   "out",
+				Type: "return",
+				Config: map[string]any{
+					"value": map[string]any{
+						"status":  "success",
+						"depth":   "{{results.inspect.depth}}",
+						"subject": "{{results.inspect.subject}}",
+					},
+				},
+			},
 		},
+		Edges: []dag.EdgeDef{{From: "inspect", To: "out"}},
 	}
 	node := dag.NodeDef{
 		ID:   "run_child",
@@ -591,44 +601,44 @@ func TestGadgetInputMappingsCannotOverrideReservedDepth(t *testing.T) {
 		Config: map[string]any{
 			"blueprint_json": mustBlueprintJSON(t, child),
 			"input_mappings": map[string]string{
-				gadgetDepthKey: "parent.fake_depth",
-				"subject":      "parent.subject",
+				gadgetDepthKey: "inputs.parent.fake_depth",
+				"subject":      "inputs.parent.subject",
 			},
-			"output_keys": []string{"inspect.depth", "inspect.subject"},
 			"dynamic_blueprint_policy": map[string]any{
-				"allowed_node_types":     []string{"inspect"},
+				"allowed_node_types":     []string{"inspect", "return"},
 				"max_nodes":              4,
 				"max_edges":              4,
 				"max_total_time_seconds": 5,
 				"max_total_tokens":       10,
-				"allow_terminal_nodes":   false,
 				"allow_agent_loop":       false,
 			},
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		"parent.fake_depth": "999",
 		"parent.subject":    "winner",
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Outputs["status"] != "success" {
 		t.Fatalf("expected success, got %+v", result.Outputs)
 	}
-	if result.Outputs["inspect.depth"] != "1" {
-		t.Fatalf("expected reserved depth override to win, got %+v", result.Outputs)
+	payload := mustGadgetReturnPayload(t, result.Outputs)
+	if payload["depth"] != "1" {
+		t.Fatalf("expected reserved depth override to win, got %+v", payload)
 	}
-	if result.Outputs["inspect.subject"] != "winner" {
-		t.Fatalf("expected mapped input to pass through, got %+v", result.Outputs)
+	if payload["subject"] != "winner" {
+		t.Fatalf("expected mapped input to pass through, got %+v", payload)
 	}
 }
 
 func TestGadgetRejectsPolicyDepthExceeded(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("cel_eval", NewCelEvalExecutor())
+	engine.RegisterExecutor("return", NewReturnExecutor())
 	exec := NewGadgetExecutor(engine, validGadgetTestValidator)
 
 	child := dag.Blueprint{
@@ -645,7 +655,18 @@ func TestGadgetRejectsPolicyDepthExceeded(t *testing.T) {
 					},
 				},
 			},
+			{
+				ID:   "out",
+				Type: "return",
+				Config: map[string]any{
+					"value": map[string]any{
+						"status": "success",
+						"answer": "{{results.step.answer}}",
+					},
+				},
+			},
 		},
+		Edges: []dag.EdgeDef{{From: "step", To: "out"}},
 	}
 	node := dag.NodeDef{
 		ID:   "run_child",
@@ -654,22 +675,21 @@ func TestGadgetRejectsPolicyDepthExceeded(t *testing.T) {
 			"blueprint_json": mustBlueprintJSON(t, child),
 			"max_depth":      2,
 			"dynamic_blueprint_policy": map[string]any{
-				"allowed_node_types":     []string{"cel_eval"},
+				"allowed_node_types":     []string{"cel_eval", "return"},
 				"max_nodes":              4,
 				"max_edges":              4,
 				"max_total_time_seconds": 5,
 				"max_total_tokens":       10,
 				"max_depth":              1,
-				"allow_terminal_nodes":   false,
 				"allow_agent_loop":       false,
 			},
 		},
 	}
-	execCtx := dag.NewContext(map[string]string{
+	inv := dag.NewInvocationFromInputs(map[string]string{
 		gadgetDepthKey: "1",
 	})
 
-	result, err := exec.Execute(context.Background(), node, execCtx)
+	result, err := exec.Execute(context.Background(), node, inv)
 	if err != nil {
 		t.Fatal(err)
 	}

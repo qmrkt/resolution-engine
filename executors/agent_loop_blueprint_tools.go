@@ -11,17 +11,18 @@ import (
 	"github.com/qmrkt/resolution-engine/dag"
 )
 
+const agentBlueprintDepthKey = "__agent_blueprint_depth"
+
 type blueprintTool struct {
 	name           string
 	description    string
 	parameters     json.RawMessage
 	inline         *dag.Blueprint
 	inputMappings  map[string]string
-	outputKeys     []string
 	timeoutSeconds int
 	maxDepth       int
 	engine         *dag.Engine
-	parentCtx      *dag.Context
+	parentCtx      *dag.Invocation
 }
 
 func (t *blueprintTool) Name() string { return t.name }
@@ -29,7 +30,7 @@ func (t *blueprintTool) Description() string {
 	if strings.TrimSpace(t.description) != "" {
 		return t.description
 	}
-	return "Run a predefined child blueprint and return selected outputs."
+	return "Run a predefined child blueprint and return its explicit return value."
 }
 func (t *blueprintTool) Parameters() json.RawMessage { return defaultSchemaObject(t.parameters) }
 func (t *blueprintTool) ReadOnly() bool              { return false }
@@ -41,7 +42,7 @@ func (t *blueprintTool) Execute(ctx context.Context, args json.RawMessage) (agen
 	if maxDepth <= 0 {
 		maxDepth = defaultAgentBlueprintMaxDepth
 	}
-	currentDepth := parseAgentBlueprintDepth(t.parentCtx.Get("__agent_blueprint_depth"))
+	currentDepth := parseAgentBlueprintDepth(t.parentCtx.Run.Inputs[agentBlueprintDepthKey])
 	if currentDepth >= maxDepth {
 		return toolErrorResult("blueprint tool %q exceeded max_depth %d", t.name, maxDepth), nil
 	}
@@ -49,7 +50,7 @@ func (t *blueprintTool) Execute(ctx context.Context, args json.RawMessage) (agen
 	if err != nil {
 		return toolErrorResult("%v", err), nil
 	}
-	childInputs["__agent_blueprint_depth"] = nextAgentBlueprintDepth(t.parentCtx)
+	childInputs[agentBlueprintDepthKey] = nextAgentBlueprintDepth(t.parentCtx)
 	runCtx := ctx
 	if t.timeoutSeconds > 0 {
 		var cancel context.CancelFunc
@@ -61,20 +62,20 @@ func (t *blueprintTool) Execute(ctx context.Context, args json.RawMessage) (agen
 		output := map[string]any{"status": "failed", "error": err.Error()}
 		if run != nil {
 			output["run_status"] = run.Status
-			output["outputs"] = selectedContextOutputs(run.Context, t.outputKeys)
+			output["return"] = toolReturnValue(run.Return)
 		}
 		return jsonToolResult(output), nil
 	}
 	return jsonToolResult(map[string]any{
 		"status":     "success",
 		"run_status": run.Status,
-		"outputs":    selectedContextOutputs(run.Context, t.outputKeys),
+		"return":     toolReturnValue(run.Return),
 	}), nil
 }
 
 type dynamicBlueprintTool struct {
 	engine    *dag.Engine
-	parentCtx *dag.Context
+	parentCtx *dag.Invocation
 	policy    DynamicBlueprintPolicy
 }
 
@@ -83,7 +84,7 @@ func (t *dynamicBlueprintTool) Description() string {
 	return "Run a dynamically supplied child blueprint after policy validation. Use only when predefined tools are insufficient."
 }
 func (t *dynamicBlueprintTool) Parameters() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"blueprint_json":{"type":"string","description":"Complete child blueprint JSON."},"inputs":{"type":"object","additionalProperties":{"type":"string"}},"output_keys":{"type":"array","items":{"type":"string"}}},"required":["blueprint_json"]}`)
+	return json.RawMessage(`{"type":"object","properties":{"blueprint_json":{"type":"string","description":"Complete child blueprint JSON."},"inputs":{"type":"object","additionalProperties":{"type":"string"}}},"required":["blueprint_json"]}`)
 }
 func (t *dynamicBlueprintTool) ReadOnly() bool { return false }
 func (t *dynamicBlueprintTool) Execute(ctx context.Context, args json.RawMessage) (agentToolResult, error) {
@@ -93,7 +94,6 @@ func (t *dynamicBlueprintTool) Execute(ctx context.Context, args json.RawMessage
 	var input struct {
 		BlueprintJSON string            `json:"blueprint_json"`
 		Inputs        map[string]string `json:"inputs"`
-		OutputKeys    []string          `json:"output_keys"`
 	}
 	if err := json.Unmarshal(args, &input); err != nil {
 		return toolErrorResult("invalid run_blueprint input: %v", err), nil
@@ -102,7 +102,7 @@ func (t *dynamicBlueprintTool) Execute(ctx context.Context, args json.RawMessage
 	if err := json.Unmarshal([]byte(input.BlueprintJSON), &bp); err != nil {
 		return toolErrorResult("parse blueprint_json: %v", err), nil
 	}
-	if err := validateDynamicBlueprint(bp, t.policy, t.parentCtx); err != nil {
+	if err := validateDynamicBlueprint(t.engine, bp, t.policy, t.parentCtx); err != nil {
 		return toolErrorResult("dynamic blueprint rejected: %v", err), nil
 	}
 	childInputs := map[string]string{}
@@ -111,7 +111,7 @@ func (t *dynamicBlueprintTool) Execute(ctx context.Context, args json.RawMessage
 			childInputs[k] = v
 		}
 	}
-	childInputs["__agent_blueprint_depth"] = nextAgentBlueprintDepth(t.parentCtx)
+	childInputs[agentBlueprintDepthKey] = nextAgentBlueprintDepth(t.parentCtx)
 	runCtx := ctx
 	if t.policy.MaxTotalTimeSeconds > 0 {
 		var cancel context.CancelFunc
@@ -123,18 +123,18 @@ func (t *dynamicBlueprintTool) Execute(ctx context.Context, args json.RawMessage
 		output := map[string]any{"status": "failed", "error": err.Error()}
 		if run != nil {
 			output["run_status"] = run.Status
-			output["outputs"] = selectedContextOutputs(run.Context, input.OutputKeys)
+			output["return"] = toolReturnValue(run.Return)
 		}
 		return jsonToolResult(output), nil
 	}
 	return jsonToolResult(map[string]any{
 		"status":     "success",
 		"run_status": run.Status,
-		"outputs":    selectedContextOutputs(run.Context, input.OutputKeys),
+		"return":     toolReturnValue(run.Return),
 	}), nil
 }
 
-func buildBlueprintToolInputs(mappings map[string]string, args json.RawMessage, parent *dag.Context) (map[string]string, error) {
+func buildBlueprintToolInputs(mappings map[string]string, args json.RawMessage, parent *dag.Invocation) (map[string]string, error) {
 	var argValues map[string]any
 	if len(args) > 0 && string(args) != "null" {
 		if err := json.Unmarshal(args, &argValues); err != nil {
@@ -157,7 +157,7 @@ func buildBlueprintToolInputs(mappings map[string]string, args json.RawMessage, 
 			inputs[childKey] = stringifyToolArg(value)
 			continue
 		}
-		inputs[childKey] = parent.Get(source)
+		inputs[childKey] = parent.Lookup(source)
 	}
 	return inputs, nil
 }
@@ -181,58 +181,46 @@ func stringifyToolArg(value any) string {
 	}
 }
 
-func selectedContextOutputs(ctx map[string]string, keys []string) map[string]string {
-	outputs := map[string]string{}
-	if len(keys) == 0 {
-		for key, value := range ctx {
-			if strings.HasPrefix(key, "__") || strings.HasPrefix(key, "input.") {
-				continue
-			}
-			outputs[key] = value
-		}
-		return outputs
+func toolReturnValue(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
 	}
-	for _, key := range keys {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		if value, ok := ctx[key]; ok {
-			outputs[key] = value
-		}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return string(raw)
 	}
-	return outputs
+	return decoded
 }
 
-func validateDynamicBlueprint(bp dag.Blueprint, policy DynamicBlueprintPolicy, parent *dag.Context) error {
+func validateDynamicBlueprint(engine *dag.Engine, bp dag.Blueprint, policy DynamicBlueprintPolicy, parent *dag.Invocation) error {
 	maxDepth := policy.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = 1
 	}
-	depth := parseAgentBlueprintDepth(parent.Get("__agent_blueprint_depth"))
+	depth := parseAgentBlueprintDepth(parent.Run.Inputs[agentBlueprintDepthKey])
 	if depth >= maxDepth {
 		return fmt.Errorf("max dynamic blueprint depth %d exceeded", maxDepth)
 	}
-	return validateRuntimeBlueprintStructure(bp, policy)
+	if err := validateRuntimeBlueprintStructure(bp, policy); err != nil {
+		return err
+	}
+	if err := FirstReturnContractError(bp); err != nil {
+		return err
+	}
+	return engine.ValidateNoSuspensionCapableNodes(bp)
 }
 
-func validateBlueprintTool(bp *dag.Blueprint) error {
+func validateBlueprintTool(engine *dag.Engine, bp *dag.Blueprint) error {
 	if bp == nil {
 		return fmt.Errorf("inline blueprint is required")
 	}
 	if errs := dag.ValidateBlueprint(*bp); len(errs) > 0 {
 		return errs[0]
 	}
-	return nil
-}
-
-func isTerminalAgentToolNode(nodeType string) bool {
-	switch nodeType {
-	case "submit_result", "cancel_market", "defer_resolution":
-		return true
-	default:
-		return false
+	if err := FirstReturnContractError(*bp); err != nil {
+		return err
 	}
+	return engine.ValidateNoSuspensionCapableNodes(*bp)
 }
 
 func parseAgentBlueprintDepth(raw string) int {
@@ -240,6 +228,9 @@ func parseAgentBlueprintDepth(raw string) int {
 	return depth
 }
 
-func nextAgentBlueprintDepth(parent *dag.Context) string {
-	return strconv.Itoa(parseAgentBlueprintDepth(parent.Get("__agent_blueprint_depth")) + 1)
+func nextAgentBlueprintDepth(parent *dag.Invocation) string {
+	if parent == nil {
+		return "1"
+	}
+	return strconv.Itoa(parseAgentBlueprintDepth(parent.Run.Inputs[agentBlueprintDepthKey]) + 1)
 }

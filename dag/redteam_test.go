@@ -147,7 +147,7 @@ type countingExecutor struct {
 	count int
 }
 
-func (e *countingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (e *countingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
 	e.count++
 	return ExecutorResult{Outputs: map[string]string{"count": fmt.Sprintf("%d", e.count)}}, nil
 }
@@ -226,7 +226,7 @@ func TestExecutorPanicRecovery(t *testing.T) {
 
 type panickingExecutor struct{}
 
-func (e *panickingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Context) (ExecutorResult, error) {
+func (e *panickingExecutor) Execute(ctx context.Context, node NodeDef, execCtx *Invocation) (ExecutorResult, error) {
 	panic("executor crashed!")
 }
 
@@ -331,7 +331,7 @@ func TestContextInjectionViaInput(t *testing.T) {
 		t.Fatalf("expected completed, got %s", run.NodeStates["step"].Status)
 	}
 	// The executor's output should override the injected value
-	if run.Context["step.result"] != "normal" {
-		t.Fatalf("expected normal, got %q (injection succeeded!)", run.Context["step.result"])
+	if resultValue(run, "step", "result") != "normal" {
+		t.Fatalf("expected normal, got %q (injection succeeded!)", resultValue(run, "step", "result"))
 	}
 }

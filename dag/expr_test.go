@@ -7,22 +7,13 @@ import (
 	"testing"
 )
 
-// TestEvalCELCache_TypeSignatureKeyedCorrectly is the central stale-cache
-// regression test. Same expression, same ident set, but the context value's
-// type shifts across calls — the compiled program must NOT be reused with a
-// mismatched declaration.
-//
-// The expression `fetch._runs.size() > 0` produces ident `fetch._runs` (the
-// `.size` tail is stripped as a CEL method). When `fetch._runs` is a JSON
-// list, it's declared as list<dyn> and `.size()` runs on the list. When the
-// key is absent, it's declared as empty string and `.size()` runs on the
-// string — returning 0.
+// Reusing the same expression with different input types must not hit a stale CEL program.
 func TestEvalCELCache_TypeSignatureKeyedCorrectly(t *testing.T) {
-	expr := `fetch._runs.size() > 0`
+	expr := `inputs.fetch_runs.size() > 0`
 
-	// Phase 1: list type with content → true.
-	ctx1 := NewContext(map[string]string{
-		"fetch._runs": `[{"x":1}]`,
+	// List input.
+	ctx1 := NewInvocationFromInputs(map[string]string{
+		"fetch_runs": `[{"x":1}]`,
 	})
 	ok, err := EvalCondition(expr, ctx1)
 	if err != nil {
@@ -32,11 +23,8 @@ func TestEvalCELCache_TypeSignatureKeyedCorrectly(t *testing.T) {
 		t.Fatal("phase 1: expected true")
 	}
 
-	// Phase 2: key absent → falls through to empty-string declaration.
-	// "".size() == 0, so result is false. If the cache keyed only on the
-	// expression text, this would try to eval the list-typed program with
-	// no activation for `fetch._runs` — either erroring or misbehaving.
-	ctx2 := NewContext(nil)
+	// Missing input.
+	ctx2 := NewInvocationFromInputs(nil)
 	ok, err = EvalCondition(expr, ctx2)
 	if err != nil {
 		t.Fatalf("phase 2: %v", err)
@@ -45,10 +33,9 @@ func TestEvalCELCache_TypeSignatureKeyedCorrectly(t *testing.T) {
 		t.Fatal("phase 2: expected false")
 	}
 
-	// Phase 3: list type again, different content → true. Confirms the
-	// list-typed program is still reachable after a string-typed detour.
-	ctx3 := NewContext(map[string]string{
-		"fetch._runs": `[{"a":1},{"b":2},{"c":3}]`,
+	// List input again.
+	ctx3 := NewInvocationFromInputs(map[string]string{
+		"fetch_runs": `[{"a":1},{"b":2},{"c":3}]`,
 	})
 	ok, err = EvalCondition(expr, ctx3)
 	if err != nil {
@@ -62,11 +49,11 @@ func TestEvalCELCache_TypeSignatureKeyedCorrectly(t *testing.T) {
 // TestEvalCELCache_MapVsScalarForSameIdent covers the second staleness axis:
 // same ident, value shape changes between map and scalar string.
 func TestEvalCELCache_MapVsScalarForSameIdent(t *testing.T) {
-	// Case A: judge.details is a JSON map — expression accesses .outcome.
-	ctx := NewContext(map[string]string{
-		"judge.details": `{"outcome":"0","confidence":"high"}`,
+	// Case A: inputs.judge_details is a JSON map — expression accesses .outcome.
+	ctx := NewInvocationFromInputs(map[string]string{
+		"judge_details": `{"outcome":"0","confidence":"high"}`,
 	})
-	ok, err := EvalCondition(`judge.details.outcome == "0"`, ctx)
+	ok, err := EvalCondition(`inputs.judge_details.outcome == "0"`, ctx)
 	if err != nil {
 		t.Fatalf("map case: %v", err)
 	}
@@ -74,19 +61,19 @@ func TestEvalCELCache_MapVsScalarForSameIdent(t *testing.T) {
 		t.Fatal("map case: expected true")
 	}
 
-	// Case B: judge.details is a plain string. The expression then needs
-	// `judge.details.outcome` as its own declared variable (scalar prefix
-	// is not declared structurally). The ident resolves to empty string,
-	// so the comparison to "0" is false.
-	ctx2 := NewContext(map[string]string{
-		"judge.details": "opaque-string",
+	// Case B: inputs.judge_details is a plain string. The expression then
+	// needs `inputs.judge_details.outcome` as its own declared variable
+	// (scalar prefix is not declared structurally). The ident resolves to
+	// empty string, so the comparison to "0" is false.
+	ctx2 := NewInvocationFromInputs(map[string]string{
+		"judge_details": "opaque-string",
 	})
-	ok, err = EvalCondition(`judge.details.outcome == "0"`, ctx2)
+	ok, err = EvalCondition(`inputs.judge_details.outcome == "0"`, ctx2)
 	if err != nil {
 		t.Fatalf("scalar case: %v", err)
 	}
 	if ok {
-		t.Fatal("scalar case: expected false (judge.details.outcome declared as empty)")
+		t.Fatal("scalar case: expected false (inputs.judge_details.outcome declared as empty)")
 	}
 }
 
@@ -95,14 +82,14 @@ func TestEvalCELCache_MapVsScalarForSameIdent(t *testing.T) {
 // Exercises the hot path repeatedly to make sure the activation map isn't
 // aliased or reused across calls.
 func TestEvalCELCache_RepeatedCallsConsistent(t *testing.T) {
-	expr := `status == "completed"`
+	expr := `inputs.status == "completed"`
 	for i := 0; i < 200; i++ {
 		want := i%2 == 0
 		value := "pending"
 		if want {
 			value = "completed"
 		}
-		ctx := NewContext(map[string]string{"status": value})
+		ctx := NewInvocationFromInputs(map[string]string{"status": value})
 		got, err := EvalCondition(expr, ctx)
 		if err != nil {
 			t.Fatalf("iter %d: %v", i, err)
@@ -118,7 +105,7 @@ func TestEvalCELCache_RepeatedCallsConsistent(t *testing.T) {
 // correctness bug in the cache key would surface as wrong results or
 // panics under -race.
 func TestEvalCELCache_ConcurrentMixedShapes(t *testing.T) {
-	expr := `fetch._runs.size() >= 1`
+	expr := `inputs.fetch_runs.size() >= 1`
 
 	const workers = 32
 	const iters = 100
@@ -131,18 +118,18 @@ func TestEvalCELCache_ConcurrentMixedShapes(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				var (
-					ctx  *Context
+					ctx  *Invocation
 					want bool
 				)
 				switch (id + i) % 3 {
 				case 0:
-					ctx = NewContext(map[string]string{"fetch._runs": `[{"a":1}]`})
+					ctx = NewInvocationFromInputs(map[string]string{"fetch_runs": `[{"a":1}]`})
 					want = true
 				case 1:
-					ctx = NewContext(map[string]string{"fetch._runs": `[]`})
+					ctx = NewInvocationFromInputs(map[string]string{"fetch_runs": `[]`})
 					want = false
 				case 2:
-					ctx = NewContext(nil) // absent → empty string → "".size()==0
+					ctx = NewInvocationFromInputs(nil) // absent → empty string → "".size()==0
 					want = false
 				}
 				got, err := EvalCondition(expr, ctx)
@@ -167,7 +154,7 @@ func TestEvalCELCache_ConcurrentMixedShapes(t *testing.T) {
 // returns differently-ordered identifier slices for the same expression —
 // varSig must be stable for the compiled-program cache to work.
 func TestEvalCELPlan_DeterministicIdentifiers(t *testing.T) {
-	expr := `fetch.status == "ok" && judge.outcome != "inconclusive" && fetch._runs.size() > 0`
+	expr := `inputs.fetch_status == "ok" && inputs.judge_outcome != "inconclusive" && inputs.fetch_runs.size() > 0`
 
 	first := getOrBuildPlan(expr)
 	// Call many times — same pointer after the first LoadOrStore.
@@ -198,14 +185,15 @@ func TestEvalCELPlan_DeterministicIdentifiers(t *testing.T) {
 // structural resolution must be present in the candidates slice so that
 // GetMulti returns it in the raw map.
 func TestEvalCELPlan_CandidatesIncludePrefixes(t *testing.T) {
-	plan := getOrBuildPlan(`a.b.c.d == "x"`)
+	plan := getOrBuildPlan(`inputs.a.b.c.d == "x"`)
 
-	// Identifier is `a.b.c.d`; candidates must include it plus every dotted prefix.
+	// Identifier is `inputs.a.b.c.d`; candidates must include it plus every dotted prefix.
 	wantCandidates := map[string]bool{
-		"a.b.c.d": false,
-		"a.b.c":   false,
-		"a.b":     false,
-		"a":       false,
+		"inputs.a.b.c.d": false,
+		"inputs.a.b.c":   false,
+		"inputs.a.b":     false,
+		"inputs.a":       false,
+		"inputs":         false,
 	}
 	for _, c := range plan.candidates {
 		if _, known := wantCandidates[c]; !known {
@@ -221,43 +209,39 @@ func TestEvalCELPlan_CandidatesIncludePrefixes(t *testing.T) {
 	}
 }
 
-// TestContextGetMulti_MissingVsEmpty confirms GetMulti preserves the
-// present-but-empty vs missing distinction that buildActivation relies on
-// when deciding whether to declare an ident or fall through to prefix
-// resolution.
-func TestContextGetMulti_MissingVsEmpty(t *testing.T) {
-	ctx := NewContext(map[string]string{
+// Present-but-empty and missing inputs must still behave differently.
+func TestEvalCEL_PresentVsMissingViaInvocation(t *testing.T) {
+	inv := NewInvocationFromInputs(map[string]string{
 		"present.empty":  "",
 		"present.scalar": "x",
 	})
 
-	got := ctx.GetMulti([]string{"present.empty", "present.scalar", "absent"})
-
-	if v, ok := got["present.empty"]; !ok || v != "" {
-		t.Errorf("present.empty: got (%q,%v), want (%q,true)", v, ok, "")
+	// Present-but-empty: declared as a string variable; comparison succeeds.
+	ok, err := EvalCondition(`inputs.present.empty == ""`, inv)
+	if err != nil {
+		t.Fatalf("present.empty eval: %v", err)
 	}
-	if v, ok := got["present.scalar"]; !ok || v != "x" {
-		t.Errorf("present.scalar: got (%q,%v), want (%q,true)", v, ok, "x")
-	}
-	if _, ok := got["absent"]; ok {
-		t.Error("absent: got present, want missing")
-	}
-}
-
-// TestContextGetMulti_NilAndEmpty — edge cases that callers may hit when
-// evaluating constant expressions like `true` with no identifiers.
-func TestContextGetMulti_NilAndEmpty(t *testing.T) {
-	ctx := NewContext(nil)
-	if got := ctx.GetMulti(nil); got != nil {
-		t.Errorf("nil keys: got %v, want nil", got)
-	}
-	if got := ctx.GetMulti([]string{}); got != nil {
-		t.Errorf("empty keys: got %v, want nil", got)
+	if !ok {
+		t.Fatal("inputs.present.empty == \"\" expected true")
 	}
 
-	var nilCtx *Context
-	if got := nilCtx.GetMulti([]string{"k"}); got != nil {
-		t.Errorf("nil context: got %v, want nil", got)
+	// Present scalar: equality with the literal succeeds.
+	ok, err = EvalCondition(`inputs.present.scalar == "x"`, inv)
+	if err != nil {
+		t.Fatalf("present.scalar eval: %v", err)
+	}
+	if !ok {
+		t.Fatal("inputs.present.scalar == \"x\" expected true")
+	}
+
+	// Missing: comparison to a non-empty string is false (CEL returns the
+	// empty fallthrough; lenient map suppresses the no-such-key error).
+	ok, err = EvalCondition(`inputs.absent == "x"`, inv)
+	if err != nil {
+		t.Fatalf("absent eval: %v", err)
+	}
+	if ok {
+		t.Fatal("inputs.absent == \"x\" expected false")
 	}
 }
 
@@ -273,26 +257,26 @@ func TestEvalCEL_PrefixResolvesListAndMap(t *testing.T) {
 	}{
 		{
 			name:       "list prefix",
-			values:     map[string]string{"fetch._runs": `[{"s":"ok"},{"s":"ok"}]`},
-			expression: `fetch._runs.size() == 2`,
+			values:     map[string]string{"fetch_runs": `[{"s":"ok"},{"s":"ok"}]`},
+			expression: `inputs.fetch_runs.size() == 2`,
 			want:       true,
 		},
 		{
 			name:       "map prefix",
 			values:     map[string]string{"judge.details": `{"outcome":"0"}`},
-			expression: `judge.details.outcome == "0"`,
+			expression: `inputs.judge.details.outcome == "0"`,
 			want:       true,
 		},
 		{
 			name:       "nested map prefix",
 			values:     map[string]string{"a.b": `{"c":{"d":"e"}}`},
-			expression: `a.b.c.d == "e"`,
+			expression: `inputs.a.b.c.d == "e"`,
 			want:       true,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := NewContext(tc.values)
+			ctx := NewInvocationFromInputs(tc.values)
 			got, err := EvalCondition(tc.expression, ctx)
 			if err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
@@ -307,7 +291,7 @@ func TestEvalCEL_PrefixResolvesListAndMap(t *testing.T) {
 // TestEvalCEL_NoIdentifiers ensures constant expressions still work after
 // caching refactor — no ident lookups, no activation map entries.
 func TestEvalCEL_NoIdentifiers(t *testing.T) {
-	ctx := NewContext(nil)
+	ctx := NewInvocationFromInputs(nil)
 	for _, tc := range []struct {
 		expr string
 		want bool

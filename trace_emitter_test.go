@@ -87,7 +87,7 @@ func TestTraceEmitterPostsToIndexerInBackground(t *testing.T) {
 	}
 	if ok := emitter.Enqueue(TraceEnvelope{
 		AppID:         303,
-		BlueprintPath: PathMain,
+		BlueprintPath: "main",
 		Initiator:     "test:http",
 		Revision:      1,
 		Run:           run,

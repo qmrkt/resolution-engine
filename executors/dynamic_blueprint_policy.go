@@ -26,9 +26,6 @@ func validateRuntimeBlueprintStructure(bp dag.Blueprint, policy DynamicBlueprint
 		if node.Type == "agent_loop" && !policy.AllowAgentLoop {
 			return fmt.Errorf("agent_loop nodes are not allowed")
 		}
-		if isTerminalAgentToolNode(node.Type) && !policy.AllowTerminalNodes {
-			return fmt.Errorf("terminal node type %q is not allowed", node.Type)
-		}
 		if len(allowed) > 0 {
 			if _, ok := allowed[node.Type]; !ok {
 				return fmt.Errorf("node type %q is not allowed", node.Type)

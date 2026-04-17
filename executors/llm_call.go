@@ -17,10 +17,10 @@ import (
 type LLMCallConfig struct {
 	Provider           string `json:"provider,omitempty"` // anthropic | openai | google
 	Model              string `json:"model,omitempty"`    // e.g. "claude-sonnet-4-6"
-	Prompt             string `json:"prompt"`             // template with {{evidence}}, {{market.question}}
+	Prompt             string `json:"prompt"`             // template with {{inputs.X}} / {{results.<node>.<field>}}
 	TimeoutSeconds     int    `json:"timeout_seconds,omitempty"`
 	WebSearch          bool   `json:"web_search,omitempty"`           // enable Anthropic server-side web search
-	AllowedOutcomesKey string `json:"allowed_outcomes_key,omitempty"` // context key holding a JSON array of valid outcomes
+	AllowedOutcomesKey string `json:"allowed_outcomes_key,omitempty"` // namespaced lookup path holding a JSON array of valid outcomes
 }
 
 // LLMCallExecutorConfig configures API access for supported model providers.
@@ -39,6 +39,26 @@ type LLMCallExecutor struct {
 	provider providerLayerConfig
 }
 
+func (*LLMCallExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "required": ["prompt"],
+  "properties": {
+    "provider": {"type": "string", "enum": ["anthropic", "openai", "google"], "description": "Provider to call. Defaults are wired at construction time."},
+    "model": {"type": "string", "description": "Provider-specific model id, e.g. claude-sonnet-4-6."},
+    "prompt": {"type": "string", "description": "User prompt. Supports {{key}} interpolation from the shared context."},
+    "timeout_seconds": {"type": "integer", "minimum": 0},
+    "web_search": {"type": "boolean", "description": "Enable Anthropic's server-side web search. Ignored for other providers."},
+    "allowed_outcomes_key": {"type": "string", "description": "Namespaced lookup path (inputs.X / results.<node>.<field>) holding a JSON array of valid outcome labels. The executor rejects outcomes outside the range."}
+  },
+  "additionalProperties": false
+}`)
+}
+
+func (*LLMCallExecutor) OutputKeys() []string {
+	return []string{"status", "outcome", "reasoning", "confidence", "raw", "citations_json", "error"}
+}
+
 type llmJudgment struct {
 	OutcomeIndex int             `json:"outcome_index"`
 	Confidence   json.RawMessage `json:"confidence"`
@@ -47,7 +67,13 @@ type llmJudgment struct {
 }
 
 func (j llmJudgment) ConfidenceString() string {
-	s := strings.Trim(string(j.Confidence), "\"")
+	return normalizeConfidenceString(j.Confidence)
+}
+
+// normalizeConfidenceString unwraps a JSON confidence value (typically a
+// quoted string) and returns "medium" when absent or null.
+func normalizeConfidenceString(raw json.RawMessage) string {
+	s := strings.Trim(string(raw), "\"")
 	if s == "" || s == "null" {
 		return "medium"
 	}
@@ -66,19 +92,19 @@ func NewLLMCallExecutorWithConfig(cfg LLMCallExecutorConfig) *LLMCallExecutor {
 	}
 }
 
-func (e *LLMCallExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *LLMCallExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	cfg, err := ParseConfig[LLMCallConfig](node.Config)
 	if err != nil {
 		return dag.ExecutorResult{}, fmt.Errorf("llm_call config: %w", err)
 	}
 
-	prompt := execCtx.Interpolate(cfg.Prompt)
+	prompt := inv.Interpolate(cfg.Prompt)
 	provider, model, err := normalizeLLMSelection(cfg.Provider, cfg.Model)
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
 
-	allowedOutcomes, err := allowedOutcomesFromContext(execCtx, cfg.AllowedOutcomesKey)
+	allowedOutcomes, err := allowedOutcomesFromContext(inv, cfg.AllowedOutcomesKey)
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
@@ -493,12 +519,12 @@ func buildGoogleResponseSchema() map[string]any {
 	}
 }
 
-func allowedOutcomesFromContext(execCtx *dag.Context, key string) ([]string, error) {
+func allowedOutcomesFromContext(inv *dag.Invocation, key string) ([]string, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, nil
 	}
-	raw := strings.TrimSpace(execCtx.Get(key))
+	raw := strings.TrimSpace(inv.Lookup(key))
 	if raw == "" {
 		return nil, fmt.Errorf("allowed outcomes key %q not found in context", key)
 	}
@@ -583,9 +609,3 @@ func firstGoogleText(parts []struct {
 	return builder.String()
 }
 
-func defaultString(value string, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}

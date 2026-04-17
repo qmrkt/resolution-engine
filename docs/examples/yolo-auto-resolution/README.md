@@ -31,9 +31,9 @@ flowchart LR
   validate["Validate Child<br/>validate_blueprint"]
   repair["Repair Child<br/>agent_loop"]
   runchild["Run Child Blueprint<br/>gadget"]
-  submit["Submit Resolution<br/>submit_result"]
-  deferinvalid["Defer Invalid Child<br/>defer_resolution"]
-  deferruntime["Defer Runtime Failure<br/>defer_resolution"]
+  submit["Submit Resolution<br/>return"]
+  deferinvalid["Defer Invalid Child<br/>return"]
+  deferruntime["Defer Runtime Failure<br/>return"]
 
   draft --> redteam
   redteam --> candidate

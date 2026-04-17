@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -10,6 +11,73 @@ import (
 
 	"github.com/qmrkt/resolution-engine/dag"
 )
+
+// parallelDelayExecutor records sibling start times.
+type parallelDelayExecutor struct {
+	delay  time.Duration
+	mu     sync.Mutex
+	starts []time.Time
+}
+
+func (e *parallelDelayExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
+	e.mu.Lock()
+	e.starts = append(e.starts, time.Now())
+	e.mu.Unlock()
+	select {
+	case <-time.After(e.delay):
+		return dag.ExecutorResult{Outputs: map[string]string{"status": "success"}}, nil
+	case <-ctx.Done():
+		return dag.ExecutorResult{}, ctx.Err()
+	}
+}
+
+func (e *parallelDelayExecutor) startSpread() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.starts) < 2 {
+		return 0
+	}
+	min, max := e.starts[0], e.starts[0]
+	for _, t := range e.starts[1:] {
+		if t.Before(min) {
+			min = t
+		}
+		if t.After(max) {
+			max = t
+		}
+	}
+	return max.Sub(min)
+}
+
+func (e *parallelDelayExecutor) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.starts)
+}
+
+type cancelAwareBlockingExecutor struct {
+	started  chan string
+	canceled chan string
+	delay    time.Duration
+}
+
+func (e *cancelAwareBlockingExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
+	runID := inv.Run.ID
+	select {
+	case e.started <- runID:
+	default:
+	}
+	select {
+	case <-time.After(e.delay):
+		return dag.ExecutorResult{Outputs: map[string]string{"status": "success"}}, nil
+	case <-ctx.Done():
+		select {
+		case e.canceled <- runID:
+		default:
+		}
+		return dag.ExecutorResult{}, ctx.Err()
+	}
+}
 
 type durableConcurrentSubmitResult struct {
 	result RunResult
@@ -71,7 +139,7 @@ func TestDurableConcurrentUniqueAppSubmitsCompleteAll(t *testing.T) {
 	tmpDir := t.TempDir()
 	const attempts = 12
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   6,
@@ -114,8 +182,8 @@ func TestDurableConcurrentUniqueAppSubmitsCompleteAll(t *testing.T) {
 		if result.Status != RunStatusCompleted {
 			t.Fatalf("%s status = %q, want completed", runID, result.Status)
 		}
-		if result.Outcome != "1" {
-			t.Fatalf("%s outcome = %q, want 1", runID, result.Outcome)
+		if returnStringField(t, result.Return, "outcome") != "1" {
+			t.Fatalf("%s outcome = %q, want 1", runID, returnStringField(t, result.Return, "outcome"))
 		}
 	}
 	if got := outcome.Count(); got != attempts {
@@ -220,7 +288,7 @@ func TestDurableConcurrentDuplicateSignalsAreIdempotent(t *testing.T) {
 				AppID:          2200,
 				RunID:          "concurrent-signal",
 				SignalType:     "human_judgment.responded",
-				CorrelationKey: "2200:concurrent-signal:judge",
+				CorrelationKey: "concurrent-signal:judge",
 				Payload:        map[string]string{"outcome": "1", "reason": "concurrent"},
 			})
 			results[i] = durableConcurrentSignalResult{result: result, err: err}
@@ -238,8 +306,8 @@ func TestDurableConcurrentDuplicateSignalsAreIdempotent(t *testing.T) {
 		}
 	}
 	result := waitForDurableStatus(t, manager, "concurrent-signal", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	if got := countDurableNodeTraces(result.RunState, "judge"); got != 1 {
 		t.Fatalf("judge trace count = %d, want 1", got)
@@ -300,7 +368,7 @@ func TestDurableConcurrentCancelAndSignalsLeaveTerminalRunClean(t *testing.T) {
 				AppID:          2300,
 				RunID:          "cancel-signal-race",
 				SignalType:     "human_judgment.responded",
-				CorrelationKey: "2300:cancel-signal-race:judge",
+				CorrelationKey: "cancel-signal-race:judge",
 				Payload:        map[string]string{"outcome": "1"},
 			})
 			if err != nil {
@@ -341,22 +409,11 @@ func TestDurableConcurrentCancelAndSignalsLeaveTerminalRunClean(t *testing.T) {
 	}
 }
 
-// TestDurableEnqueueRaceWithBusyWorkerIsNotLost covers the lost-wake-up race
-// between an enqueue (from a signal or timer) and a worker that is already
-// processing the same run. Before the fix, an idle worker would dequeue the
-// runID, discover markProcessing returns false because another worker holds
-// the mark, and silently drop the dispatch. If that dropped dispatch carried
-// the only signal that could progress the run, the run was effectively stuck.
-//
-// The fix: markProcessing sets a pending flag when contention is detected,
-// and the worker that holds the mark re-enqueues the run on its way out via
-// unmarkProcessing. PollInterval is set long enough that the timer loop is
-// not helping on its own — the enqueue must be preserved by the pending-flag
-// machinery for the run to make progress.
+// Enqueue contention should leave a pending breadcrumb instead of dropping the run.
 func TestDurableEnqueueRaceWithBusyWorkerIsNotLost(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"blocking": blocking,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   4,
@@ -380,15 +437,12 @@ func TestDurableEnqueueRaceWithBusyWorkerIsNotLost(t *testing.T) {
 		t.Fatal("timed out waiting for blocking node to start")
 	}
 
-	// One worker is now holding markProcessing(runID) inside exec.Execute.
-	// Simulate rapid-fire enqueues — as would arise from a signal handler or
-	// timer loop firing repeatedly while the worker is busy.
+	// Another worker keeps enqueueing while this one is still busy.
 	for i := 0; i < 8; i++ {
 		manager.enqueue(runID)
 	}
 
-	// Idle workers must dequeue these, fail to claim, and leave a pending
-	// breadcrumb so the holder re-enqueues on exit.
+	// A failed claim should still set pending.
 	deadline := time.Now().Add(2 * time.Second)
 	var hadPending bool
 	for time.Now().Before(deadline) {
@@ -404,25 +458,19 @@ func TestDurableEnqueueRaceWithBusyWorkerIsNotLost(t *testing.T) {
 		t.Fatal("expected pending flag to be set while worker held markProcessing")
 	}
 
-	// Release the holder. The run completes normally; the pending flag
-	// triggers a benign re-enqueue against a terminal run.
+	// Release the holder and let the pending re-enqueue drain.
 	close(blocking.release)
 	result := waitForDurableStatus(t, manager, runID, RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 }
 
-// TestDurableEnqueueBurstStaysBounded verifies the enqueue dedup. With
-// MaxWorkers=1 and MaxQueueSize=1, a burst of enqueues targeting a run that
-// is already being processed would — without dedup — see the channel fill
-// up on the first call and spawn a blocked sender goroutine for every
-// subsequent call. With dedup, all but the first see processing=true and
-// return immediately without touching the channel.
+// A burst of duplicate enqueues should stay bounded.
 func TestDurableEnqueueBurstStaysBounded(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"blocking": blocking,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   1,
@@ -445,7 +493,7 @@ func TestDurableEnqueueBurstStaysBounded(t *testing.T) {
 		t.Fatal("timed out waiting for blocking node to start")
 	}
 
-	// Let any transient startup goroutines settle, then sample baseline.
+	// Let startup noise settle before sampling.
 	time.Sleep(30 * time.Millisecond)
 	baseline := runtime.NumGoroutine()
 
@@ -459,8 +507,7 @@ func TestDurableEnqueueBurstStaysBounded(t *testing.T) {
 		t.Fatalf("goroutine count grew by %d after a %d-enqueue burst (before=%d, after=%d) — dedup regressed", diff, burst, baseline, after)
 	}
 
-	// Confirm the dedup path actually fired: pending should be set because
-	// the worker is still busy with the blocking executor.
+	// pending should be set while the worker is still busy.
 	manager.mu.Lock()
 	pendingSet := manager.pending[runID]
 	manager.mu.Unlock()
@@ -470,4 +517,197 @@ func TestDurableEnqueueBurstStaysBounded(t *testing.T) {
 
 	close(blocking.release)
 	waitForDurableStatus(t, manager, runID, RunStatusCompleted)
+}
+
+// Three ready siblings should dispatch in parallel.
+func TestDurableParallelBranchesRunConcurrently(t *testing.T) {
+	tmpDir := t.TempDir()
+	const delay = 200 * time.Millisecond
+
+	root := &durableStaticExecutor{outputs: map[string]string{"status": "success"}}
+	siblings := &parallelDelayExecutor{delay: delay}
+
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
+		"root":    root,
+		"sibling": siblings,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 4,
+		PollInterval: 5 * time.Millisecond,
+	})
+	defer manager.Close()
+
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "fanout",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "root", Type: "root", Config: map[string]interface{}{}},
+			{ID: "a", Type: "sibling", Config: map[string]interface{}{}},
+			{ID: "b", Type: "sibling", Config: map[string]interface{}{}},
+			{ID: "c", Type: "sibling", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "root", To: "a"},
+			{From: "root", To: "b"},
+			{From: "root", To: "c"},
+		},
+	})
+
+	wallStart := time.Now()
+	if _, err := manager.Submit(RunRequest{RunID: "fanout-1", AppID: 9001, BlueprintJSON: bp}); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForDurableTerminal(t, manager, "fanout-1")
+	wall := time.Since(wallStart)
+
+	if result.Status != RunStatusCompleted {
+		t.Fatalf("status = %q, want %q", result.Status, RunStatusCompleted)
+	}
+	if siblings.count() != 3 {
+		t.Fatalf("siblings executed %d times, want 3", siblings.count())
+	}
+
+	// Serial dispatch would be ~3*delay; parallel should stay near delay.
+	if wall > 2*delay {
+		t.Fatalf("wall clock = %v, want <= %v (parallel branches regressed to serial dispatch)", wall, 2*delay)
+	}
+
+	// The siblings should start in a tight window.
+	if spread := siblings.startSpread(); spread > 50*time.Millisecond {
+		t.Fatalf("sibling start spread = %v, want <= 50ms (siblings not dispatched concurrently)", spread)
+	}
+}
+
+// Every sibling in a parallel batch should leave a trace entry.
+func TestDurableParallelBranchesAllTracesRecorded(t *testing.T) {
+	tmpDir := t.TempDir()
+	root := &durableStaticExecutor{outputs: map[string]string{"status": "success"}}
+	siblings := &durableStaticExecutor{outputs: map[string]string{"status": "success"}}
+
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
+		"root":    root,
+		"sibling": siblings,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 4,
+		PollInterval: 5 * time.Millisecond,
+	})
+	defer manager.Close()
+
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "fanout-traces",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "root", Type: "root", Config: map[string]interface{}{}},
+			{ID: "a", Type: "sibling", Config: map[string]interface{}{}},
+			{ID: "b", Type: "sibling", Config: map[string]interface{}{}},
+			{ID: "c", Type: "sibling", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "root", To: "a"},
+			{From: "root", To: "b"},
+			{From: "root", To: "c"},
+		},
+	})
+
+	if _, err := manager.Submit(RunRequest{RunID: "fanout-traces", AppID: 9002, BlueprintJSON: bp}); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForDurableTerminal(t, manager, "fanout-traces")
+	if result.Status != RunStatusCompleted {
+		t.Fatalf("status = %q, want %q", result.Status, RunStatusCompleted)
+	}
+	if siblings.Count() != 3 {
+		t.Fatalf("siblings executed %d times, want 3", siblings.Count())
+	}
+	for _, id := range []string{"root", "a", "b", "c"} {
+		if n := countDurableNodeTraces(result.RunState, id); n != 1 {
+			t.Fatalf("node %q traces = %d, want 1", id, n)
+		}
+		state, ok := result.RunState.NodeStates[id]
+		if !ok {
+			t.Fatalf("node %q missing from NodeStates", id)
+		}
+		if state.Status != "completed" {
+			t.Fatalf("node %q status = %q, want completed", id, state.Status)
+		}
+	}
+
+	// Exactly one NodeStarted event per node: the batch should not emit
+	// duplicate starts if persistWithRetry re-applies on stale.
+	events, err := manager.store.loadEvents("fanout-traces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countDurableEvents(events, "NodeStarted"); got != 4 {
+		t.Fatalf("NodeStarted events = %d, want 4", got)
+	}
+	if got := countDurableEvents(events, "NodeCompleted"); got != 4 {
+		t.Fatalf("NodeCompleted events = %d, want 4", got)
+	}
+}
+
+func TestDurableParallelEarlyReturnCancelsSiblingWork(t *testing.T) {
+	tmpDir := t.TempDir()
+	root := &durableStaticExecutor{outputs: map[string]string{"status": "success"}}
+	slow := &cancelAwareBlockingExecutor{
+		started:  make(chan string, 1),
+		canceled: make(chan string, 1),
+		delay:    5 * time.Second,
+	}
+
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
+		"root": root,
+		"slow": slow,
+	}), DurableRunManagerConfig{
+		MaxWorkers:   1,
+		MaxQueueSize: 4,
+		PollInterval: 5 * time.Millisecond,
+	})
+	defer manager.Close()
+
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "parallel-return-cancel",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "root", Type: "root", Config: map[string]interface{}{}},
+			{ID: "done", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status":  "success",
+					"outcome": "1",
+				},
+			}},
+			{ID: "slow", Type: "slow", Config: map[string]interface{}{}},
+		},
+		Edges: []dag.EdgeDef{
+			{From: "root", To: "done"},
+			{From: "root", To: "slow"},
+		},
+	})
+
+	start := time.Now()
+	if _, err := manager.Submit(RunRequest{RunID: "parallel-return-cancel", AppID: 9003, BlueprintJSON: bp}); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForDurableTerminal(t, manager, "parallel-return-cancel")
+	if result.Status != RunStatusCompleted {
+		t.Fatalf("status = %q, want %q", result.Status, RunStatusCompleted)
+	}
+	if got := returnStringField(t, result.Return, "outcome"); got != "1" {
+		t.Fatalf("outcome = %q, want 1", got)
+	}
+	if wall := time.Since(start); wall > time.Second {
+		t.Fatalf("wall clock = %v, want <= 1s (early return waited for slow sibling)", wall)
+	}
+	if state := result.RunState.NodeStates["slow"].Status; state != "skipped" {
+		t.Fatalf("slow node status = %q, want skipped", state)
+	}
+	select {
+	case runID := <-slow.canceled:
+		if runID != "parallel-return-cancel" {
+			t.Fatalf("canceled run = %q, want parallel-return-cancel", runID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slow sibling cancellation")
+	}
 }

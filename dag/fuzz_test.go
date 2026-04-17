@@ -1,6 +1,8 @@
 package dag
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -24,7 +26,7 @@ func FuzzEvalCondition(f *testing.F) {
 	f.Add(`size(fetch._runs) >= 3`)
 	f.Add(`has(judge.outcome)`)
 
-	ctx := NewContext(map[string]string{
+	ctx := NewInvocationFromInputs(map[string]string{
 		"status":        "completed",
 		"fetch.status":  "success",
 		"judge.outcome": "0",
@@ -45,7 +47,7 @@ func FuzzEvalConditionWithValues(f *testing.F) {
 	f.Add(`a == b`, `[1,2,3]`, `{"key":"val"}`)
 
 	f.Fuzz(func(t *testing.T, expr, valA, valB string) {
-		ctx := NewContext(map[string]string{
+		ctx := NewInvocationFromInputs(map[string]string{
 			"a": valA,
 			"b": valB,
 		})
@@ -68,7 +70,7 @@ func FuzzInterpolate(f *testing.F) {
 	f.Add("{{  spaced  }}")
 
 	f.Fuzz(func(t *testing.T, template string) {
-		ctx := NewContext(map[string]string{
+		ctx := NewInvocationFromInputs(map[string]string{
 			"name":  "world",
 			"place": "earth",
 			"a":     "1",
@@ -100,7 +102,7 @@ func nodeIDGen() *rapid.Generator[string] {
 func nodeTypeGen() *rapid.Generator[string] {
 	return rapid.SampledFrom([]string{
 		"api_fetch", "llm_call", "await_signal",
-		"submit_result", "cancel_market", "wait", "defer_resolution",
+		"return", "wait",
 		"cel_eval",
 	})
 }
@@ -262,6 +264,117 @@ func TestValidateBlueprintProperties(t *testing.T) {
 	})
 }
 
+// --- Suspension invariants ---
+
+func stringMapGen() *rapid.Generator[map[string]string] {
+	return rapid.Custom[map[string]string](func(t *rapid.T) map[string]string {
+		n := rapid.IntRange(1, 4).Draw(t, "size")
+		m := make(map[string]string, n)
+		for i := 0; i < n; i++ {
+			key := rapid.StringMatching(`[a-z]{1,6}`).Draw(t, "key")
+			val := rapid.StringMatching(`[a-z0-9]{0,8}`).Draw(t, "val")
+			m[key] = val
+		}
+		return m
+	})
+}
+
+// suspensionGen produces Suspensions whose empty/absent fields are always nil
+// (never empty-but-non-nil), so round-trip comparisons do not need to paper
+// over Go's `omitempty` asymmetry between nil and empty slices/maps.
+func suspensionGen() *rapid.Generator[*Suspension] {
+	return rapid.Custom[*Suspension](func(t *rapid.T) *Suspension {
+		s := &Suspension{
+			Kind:           rapid.SampledFrom([]string{SuspensionKindTimer, SuspensionKindSignal}).Draw(t, "kind"),
+			Reason:         rapid.StringMatching(`[a-z ]{0,20}`).Draw(t, "reason"),
+			ResumeAtUnix:   rapid.Int64Range(0, 1<<40).Draw(t, "resumeAt"),
+			SignalType:     rapid.SampledFrom([]string{"", "foo", "foo.bar", "agent.done", "human_judgment.responded"}).Draw(t, "signalType"),
+			CorrelationKey: rapid.SampledFrom([]string{"", "k1", "1:run:node"}).Draw(t, "correlationKey"),
+		}
+		if rapid.Bool().Draw(t, "hasRequiredPayload") {
+			s.RequiredPayload = rapid.SliceOfN(rapid.StringMatching(`[a-z]{1,4}`), 1, 5).Draw(t, "required")
+		}
+		if rapid.Bool().Draw(t, "hasDefaultOutputs") {
+			s.DefaultOutputs = stringMapGen().Draw(t, "defaultOutputs")
+		}
+		if rapid.Bool().Draw(t, "hasOutputs") {
+			s.Outputs = stringMapGen().Draw(t, "outputs")
+		}
+		if rapid.Bool().Draw(t, "hasTimeoutOutputs") {
+			s.TimeoutOutputs = stringMapGen().Draw(t, "timeoutOutputs")
+		}
+		return s
+	})
+}
+
+// TestSuspensionCloneProperties verifies Clone returns a deeply-equal,
+// independently-mutable copy.
+func TestSuspensionCloneProperties(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		src := suspensionGen().Draw(t, "suspension")
+		clone := src.Clone()
+
+		if !reflect.DeepEqual(src, clone) {
+			t.Fatalf("Clone diverges:\n src=%+v\n clone=%+v", src, clone)
+		}
+
+		// Mutating clone's maps must not reach the source.
+		if clone.DefaultOutputs != nil {
+			clone.DefaultOutputs["__inj__"] = "x"
+			if _, ok := src.DefaultOutputs["__inj__"]; ok {
+				t.Fatal("Clone aliased DefaultOutputs")
+			}
+		}
+		if clone.Outputs != nil {
+			clone.Outputs["__inj__"] = "x"
+			if _, ok := src.Outputs["__inj__"]; ok {
+				t.Fatal("Clone aliased Outputs")
+			}
+		}
+		if clone.TimeoutOutputs != nil {
+			clone.TimeoutOutputs["__inj__"] = "x"
+			if _, ok := src.TimeoutOutputs["__inj__"]; ok {
+				t.Fatal("Clone aliased TimeoutOutputs")
+			}
+		}
+		if len(clone.RequiredPayload) > 0 {
+			original := src.RequiredPayload[0]
+			clone.RequiredPayload[0] = "__mutated__"
+			if src.RequiredPayload[0] != original {
+				t.Fatal("Clone aliased RequiredPayload")
+			}
+		}
+	})
+}
+
+// TestSuspensionCloneNilIsSafe: Clone on a nil receiver returns nil.
+func TestSuspensionCloneNilIsSafe(t *testing.T) {
+	var s *Suspension
+	if got := s.Clone(); got != nil {
+		t.Fatalf("nil Clone returned %+v, want nil", got)
+	}
+}
+
+// TestSuspensionJSONRoundTrip: marshal → unmarshal preserves semantic equality.
+// This pins the wire format so the durable manager's on-disk waiting entries
+// (which embed a Suspension in durableWaitingNode) stay compatible.
+func TestSuspensionJSONRoundTrip(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		src := suspensionGen().Draw(t, "suspension")
+		data, err := json.Marshal(src)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var dst Suspension
+		if err := json.Unmarshal(data, &dst); err != nil {
+			t.Fatalf("unmarshal %s: %v", string(data), err)
+		}
+		if !reflect.DeepEqual(src, &dst) {
+			t.Fatalf("round-trip mismatch:\n src=%+v\n dst=%+v\n json=%s", src, &dst, string(data))
+		}
+	})
+}
+
 // TestEvalConditionProperties tests CEL evaluation with structured inputs.
 func TestEvalConditionProperties(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
@@ -283,7 +396,7 @@ func TestEvalConditionProperties(t *testing.T) {
 			).Draw(t, "value")
 			inputs[key] = value
 		}
-		ctx := NewContext(inputs)
+		ctx := NewInvocationFromInputs(inputs)
 
 		// Pick an expression that references existing keys
 		keys := make([]string, 0, len(inputs))

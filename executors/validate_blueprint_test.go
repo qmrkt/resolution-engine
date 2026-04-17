@@ -23,9 +23,9 @@ func TestValidateBlueprintExecutorAcceptsValidBlueprint(t *testing.T) {
 		ID:   "validate",
 		Type: "validate_blueprint",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 		},
-	}, dag.NewContext(map[string]string{
+	}, dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": `{"id":"valid","version":1,"nodes":[],"edges":[]}`,
 	}))
 	if err != nil {
@@ -55,9 +55,9 @@ func TestValidateBlueprintExecutorReportsInvalidJSON(t *testing.T) {
 		ID:   "validate",
 		Type: "validate_blueprint",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 		},
-	}, dag.NewContext(map[string]string{
+	}, dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": `{"id":`,
 	}))
 	if err != nil {
@@ -91,9 +91,9 @@ func TestValidateBlueprintExecutorSummarizesValidatorIssues(t *testing.T) {
 		ID:   "validate",
 		Type: "validate_blueprint",
 		Config: map[string]any{
-			"blueprint_json_key": "candidate.blueprint_json",
+			"blueprint_json_key": "inputs.candidate.blueprint_json",
 		},
-	}, dag.NewContext(map[string]string{
+	}, dag.NewInvocationFromInputs(map[string]string{
 		"candidate.blueprint_json": `{"id":"candidate","version":1,"nodes":[],"edges":[]}`,
 	}))
 	if err != nil {

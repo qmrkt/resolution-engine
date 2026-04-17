@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,14 +17,16 @@ const (
 	defaultGadgetMaxDepth = 1
 )
 
+// defaultGadgetAllowedNodeTypes lists node types permitted in a gadget child
+// by default. Short inline waits are allowed because they complete
+// synchronously, while suspension-capable types such as await_signal and async
+// agent_loop are blocked by ValidateNoSuspensionCapableNodes before execution.
 var defaultGadgetAllowedNodeTypes = []string{
 	"api_fetch",
 	"llm_call",
 	"agent_loop",
 	"wait",
-	"defer_resolution",
-	"submit_result",
-	"cancel_market",
+	"return",
 	"cel_eval",
 	"map",
 }
@@ -35,10 +36,8 @@ type GadgetConfig struct {
 	BlueprintJSONKey       string                  `json:"blueprint_json_key,omitempty"`
 	Inline                 *dag.Blueprint          `json:"inline,omitempty"`
 	InputMappings          map[string]string       `json:"input_mappings,omitempty"`
-	OutputKeys             []string                `json:"output_keys,omitempty"`
 	TimeoutSeconds         int                     `json:"timeout_seconds,omitempty"`
 	MaxDepth               int                     `json:"max_depth,omitempty"`
-	PropagateTerminal      bool                    `json:"propagate_terminal,omitempty"`
 	DynamicBlueprintPolicy *DynamicBlueprintPolicy `json:"dynamic_blueprint_policy,omitempty"`
 }
 
@@ -51,7 +50,32 @@ func NewGadgetExecutor(engine *dag.Engine, validate BlueprintValidatorFunc) *Gad
 	return &GadgetExecutor{engine: engine, validate: validate}
 }
 
-func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (*GadgetExecutor) ConfigSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "blueprint_json": {"type": "string", "description": "Child blueprint as a JSON string. Mutually exclusive with blueprint_json_key and inline."},
+    "blueprint_json_key": {"type": "string", "description": "Namespaced lookup path (inputs.X / results.<node>.<field>) holding a child blueprint JSON string."},
+    "inline": {"type": "object", "description": "Child blueprint as a structured object."},
+    "input_mappings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "child_input_key -> parent_context_key."},
+    "timeout_seconds": {"type": "integer", "minimum": 0},
+    "max_depth": {"type": "integer", "minimum": 0, "description": "Recursion guard across nested gadgets. Defaults to 1."},
+    "dynamic_blueprint_policy": {"type": "object", "description": "Overrides the default allowed-node-types, depth, and token budgets for runtime-supplied child blueprints."}
+  },
+  "oneOf": [
+    {"required": ["blueprint_json"]},
+    {"required": ["blueprint_json_key"]},
+    {"required": ["inline"]}
+  ],
+  "additionalProperties": false
+}`)
+}
+
+func (*GadgetExecutor) OutputKeys() []string {
+	return []string{"status", "error", "run_status", "child_run_id", "return_json"}
+}
+
+func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	if e == nil || e.engine == nil {
 		return dag.ExecutorResult{}, fmt.Errorf("gadget executor is not configured")
 	}
@@ -68,7 +92,7 @@ func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx 
 	if maxDepth <= 0 {
 		maxDepth = defaultGadgetMaxDepth
 	}
-	currentDepth, err := parseDepthCounter(execCtx.Get(gadgetDepthKey))
+	currentDepth, err := parseDepthCounter(inv.Run.Inputs[gadgetDepthKey])
 	if err != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{
 			"status": "failed",
@@ -82,7 +106,7 @@ func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx 
 		}}, nil
 	}
 
-	childBlueprint, rawJSON, failure := resolveGadgetBlueprint(execCtx, cfg)
+	childBlueprint, rawJSON, failure := resolveGadgetBlueprint(inv, cfg)
 	if failure != nil {
 		return dag.ExecutorResult{Outputs: map[string]string{
 			"status": "failed",
@@ -101,7 +125,7 @@ func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx 
 		if childKey == "" || parentKey == "" {
 			continue
 		}
-		childInputs[childKey] = execCtx.Get(parentKey)
+		childInputs[childKey] = inv.Lookup(parentKey)
 	}
 	childInputs[gadgetDepthKey] = strconv.Itoa(currentDepth + 1)
 
@@ -121,13 +145,13 @@ func (e *GadgetExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx 
 		if errors.Is(err, context.Canceled) && ctx != nil && ctx.Err() != nil {
 			return dag.ExecutorResult{}, err
 		}
-		outputs := gadgetRunOutputs(run, cfg)
+		outputs := gadgetRunOutputs(run)
 		outputs["status"] = "failed"
 		outputs["error"] = err.Error()
 		return dag.ExecutorResult{Outputs: outputs, Usage: usage}, nil
 	}
 
-	outputs := gadgetRunOutputs(run, cfg)
+	outputs := gadgetRunOutputs(run)
 	if run != nil && run.Status == "failed" {
 		outputs["status"] = "failed"
 		if strings.TrimSpace(outputs["error"]) == "" {
@@ -174,7 +198,7 @@ func validateGadgetConfig(cfg GadgetConfig) error {
 	return nil
 }
 
-func resolveGadgetBlueprint(execCtx *dag.Context, cfg GadgetConfig) (dag.Blueprint, []byte, error) {
+func resolveGadgetBlueprint(inv *dag.Invocation, cfg GadgetConfig) (dag.Blueprint, []byte, error) {
 	if cfg.Inline != nil {
 		rawJSON, err := json.Marshal(cfg.Inline)
 		if err != nil {
@@ -185,12 +209,10 @@ func resolveGadgetBlueprint(execCtx *dag.Context, cfg GadgetConfig) (dag.Bluepri
 
 	raw := strings.TrimSpace(cfg.BlueprintJSON)
 	if key := strings.TrimSpace(cfg.BlueprintJSONKey); key != "" {
-		raw = strings.TrimSpace(execCtx.Get(key))
+		raw = strings.TrimSpace(inv.Lookup(key))
 		if raw == "" {
 			return dag.Blueprint{}, nil, fmt.Errorf("blueprint_json_key %q was empty or missing", key)
 		}
-	} else {
-		raw = strings.TrimSpace(execCtx.Interpolate(raw))
 	}
 	if raw == "" {
 		return dag.Blueprint{}, nil, fmt.Errorf("blueprint_json was empty")
@@ -238,6 +260,12 @@ func (e *GadgetExecutor) validateChildBlueprint(bp dag.Blueprint, rawJSON []byte
 			"error":  fmt.Sprintf("child blueprint rejected: %v", err),
 		}, true
 	}
+	if err := e.engine.ValidateNoSuspensionCapableNodes(bp); err != nil {
+		return map[string]string{
+			"status": "failed",
+			"error":  fmt.Sprintf("child blueprint rejected: %v", err),
+		}, true
+	}
 	return nil, false
 }
 
@@ -250,134 +278,22 @@ func defaultGadgetBlueprintPolicy(policy *DynamicBlueprintPolicy) DynamicBluepri
 			MaxTotalTimeSeconds: 300,
 			MaxTotalTokens:      120000,
 			AllowAgentLoop:      true,
-			AllowTerminalNodes:  true,
 		}
 	}
 	return *policy
 }
 
-func gadgetRunOutputs(run *dag.RunState, cfg GadgetConfig) map[string]string {
+func gadgetRunOutputs(run *dag.RunState) map[string]string {
 	outputs := map[string]string{}
 	if run == nil {
 		return outputs
 	}
 	outputs["run_status"] = run.Status
 	outputs["child_run_id"] = run.ID
-	for _, key := range cfg.OutputKeys {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		if value, ok := run.Context[key]; ok {
-			outputs[key] = value
-		}
-	}
-	if cfg.PropagateTerminal {
-		propagateChildTerminalOutputs(outputs, run.Context)
+	if len(run.Return) > 0 {
+		outputs["return_json"] = string(run.Return)
 	}
 	return outputs
-}
-
-func propagateChildTerminalOutputs(outputs map[string]string, context map[string]string) {
-	if len(context) == 0 {
-		return
-	}
-	keys := SortedContextKeys(context)
-
-	clearTerminalOutputs := func() {
-		delete(outputs, "terminal_action")
-		delete(outputs, "submitted")
-		delete(outputs, "outcome")
-		delete(outputs, "evidence_hash")
-		delete(outputs, "cancelled")
-		delete(outputs, "deferred")
-		delete(outputs, "reason")
-	}
-
-	if submission, ok := findChildSubmission(context, keys); ok {
-		clearTerminalOutputs()
-		outputs["terminal_action"] = "submit_result"
-		outputs["submitted"] = "true"
-		outputs["outcome"] = submission.Outcome
-		if submission.EvidenceHash != "" {
-			outputs["evidence_hash"] = submission.EvidenceHash
-		}
-	}
-	if action, ok := findChildRunAction(context, keys, "cancelled"); ok {
-		clearTerminalOutputs()
-		outputs["terminal_action"] = "cancel_market"
-		outputs["cancelled"] = "true"
-		outputs["reason"] = action.Reason
-	}
-	if action, ok := findChildRunAction(context, keys, "deferred"); ok {
-		clearTerminalOutputs()
-		outputs["terminal_action"] = "defer_resolution"
-		outputs["deferred"] = "true"
-		outputs["reason"] = action.Reason
-	}
-}
-
-type childSubmission struct {
-	NodeID       string
-	Outcome      string
-	EvidenceHash string
-}
-
-type childRunAction struct {
-	NodeID string
-	Reason string
-}
-
-func findChildSubmission(context map[string]string, keys []string) (childSubmission, bool) {
-	var zero childSubmission
-	for _, key := range keys {
-		if !strings.HasSuffix(key, ".submitted") {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(context[key]), "true") {
-			continue
-		}
-		nodeID := strings.TrimSuffix(key, ".submitted")
-		outcome := strings.TrimSpace(context[nodeID+".outcome"])
-		if outcome == "" || outcome == "inconclusive" {
-			continue
-		}
-		return childSubmission{
-			NodeID:       nodeID,
-			Outcome:      outcome,
-			EvidenceHash: strings.TrimSpace(context[nodeID+".evidence_hash"]),
-		}, true
-	}
-	return zero, false
-}
-
-func findChildRunAction(context map[string]string, keys []string, flag string) (childRunAction, bool) {
-	var zero childRunAction
-	suffix := "." + strings.TrimSpace(flag)
-	for _, key := range keys {
-		if !strings.HasSuffix(key, suffix) {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(context[key]), "true") {
-			continue
-		}
-		nodeID := strings.TrimSuffix(key, suffix)
-		return childRunAction{
-			NodeID: nodeID,
-			Reason: strings.TrimSpace(context[nodeID+".reason"]),
-		}, true
-	}
-	return zero, false
-}
-
-// SortedContextKeys returns the keys of a string map in sorted order.
-func SortedContextKeys(values map[string]string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func parseDepthCounter(raw string) (int, error) {

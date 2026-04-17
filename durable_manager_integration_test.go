@@ -25,7 +25,7 @@ type durableStaticExecutor struct {
 	count   int
 }
 
-func (e *durableStaticExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *durableStaticExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	e.mu.Lock()
 	e.count++
 	outputs := cloneStringMap(e.outputs)
@@ -46,10 +46,10 @@ type durableSequenceExecutor struct {
 	lastRuns []string
 }
 
-func (e *durableSequenceExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *durableSequenceExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	runID := execCtx.Get("resolution_run_id")
+	runID := inv.Run.ID
 	e.lastRuns = append(e.lastRuns, runID)
 	index := e.count
 	if index >= len(e.outputs) {
@@ -69,7 +69,7 @@ type durableErrorExecutor struct {
 	err error
 }
 
-func (e *durableErrorExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *durableErrorExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	if e.err == nil {
 		e.err = errors.New("boom")
 	}
@@ -80,7 +80,7 @@ type durableBlockingExecutor struct {
 	started chan struct{}
 }
 
-func (e *durableBlockingExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
+func (e *durableBlockingExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
 	select {
 	case e.started <- struct{}{}:
 	default:
@@ -106,8 +106,8 @@ func newDurableReleaseExecutor(outputs map[string]string) *durableReleaseExecuto
 	}
 }
 
-func (e *durableReleaseExecutor) Execute(ctx context.Context, node dag.NodeDef, execCtx *dag.Context) (dag.ExecutorResult, error) {
-	runID := execCtx.Get("resolution_run_id")
+func (e *durableReleaseExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {
+	runID := inv.Run.ID
 	e.mu.Lock()
 	e.attempts[runID]++
 	e.mu.Unlock()
@@ -153,12 +153,23 @@ func newDurableTestManagerWithConfig(t *testing.T, storeDir string, engine *dag.
 	return manager
 }
 
-func durableTestEngine(execs map[string]dag.NodeExecutor) *dag.Engine {
+func durableTestEngine(execs map[string]dag.Executor) *dag.Engine {
 	engine := dag.NewEngine(nil)
 	for nodeType, exec := range execs {
 		engine.RegisterExecutor(nodeType, exec)
 	}
-	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
+	if _, ok := execs["return"]; !ok {
+		engine.RegisterExecutor("return", executors.NewReturnExecutor())
+	}
+	// Register the suspension-capable executors so the generic Suspend
+	// path can dispatch them like any other executor. Tests may override
+	// these by passing their own executor for the same node type.
+	if _, ok := execs["wait"]; !ok {
+		engine.RegisterExecutor("wait", executors.NewWaitExecutor())
+	}
+	if _, ok := execs["await_signal"]; !ok {
+		engine.RegisterExecutor("await_signal", executors.NewAwaitSignalExecutor())
+	}
 	return engine
 }
 
@@ -207,13 +218,26 @@ func waitForEventType(t *testing.T, manager *DurableRunManager, runID string, ev
 	return nil
 }
 
+func returnSuccessNode(id string, outcomeKey string) dag.NodeDef {
+	return dag.NodeDef{
+		ID:   id,
+		Type: "return",
+		Config: map[string]interface{}{
+			"value": map[string]interface{}{
+				"status":  "success",
+				"outcome": "{{" + outcomeKey + "}}",
+			},
+		},
+	}
+}
+
 func simpleSubmitBlueprint(stepType string) []byte {
 	return mustMarshalBlueprint(dag.Blueprint{
 		ID:      "simple",
 		Version: 1,
 		Nodes: []dag.NodeDef{
 			{ID: "step", Type: stepType, Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
+			returnSuccessNode("submit", "results.step.outcome"),
 		},
 		Edges: []dag.EdgeDef{{From: "step", To: "submit"}},
 	})
@@ -226,7 +250,7 @@ func joinSubmitBlueprint(leftType, rightType string) []byte {
 		Nodes: []dag.NodeDef{
 			{ID: "left", Type: leftType, Config: map[string]interface{}{}},
 			{ID: "right", Type: rightType, Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "right.outcome"}},
+			returnSuccessNode("submit", "results.right.outcome"),
 		},
 		Edges: []dag.EdgeDef{
 			{From: "left", To: "submit"},
@@ -240,9 +264,9 @@ func waitSubmitBlueprint() []byte {
 		ID:      "wait-submit",
 		Version: 1,
 		Nodes: []dag.NodeDef{
-			{ID: "wait", Type: "wait", Config: map[string]interface{}{"duration_seconds": 1}},
+			{ID: "wait", Type: "wait", Config: map[string]interface{}{"duration_seconds": 1, "max_inline_seconds": -1}},
 			{ID: "step", Type: "outcome", Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
+			returnSuccessNode("submit", "results.step.outcome"),
 		},
 		Edges: []dag.EdgeDef{
 			{From: "wait", To: "step"},
@@ -262,42 +286,23 @@ func awaitSignalBlueprint() []byte {
 				"default_outputs":  map[string]string{"status": "responded"},
 				"timeout_seconds":  60,
 			}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "judge.outcome"}},
+			returnSuccessNode("submit", "results.judge.outcome"),
 		},
 		Edges: []dag.EdgeDef{{From: "judge", To: "submit"}},
 	})
 }
 
-func deferResumeBlueprint() []byte {
+func deferTerminalBlueprint() []byte {
 	return mustMarshalBlueprint(dag.Blueprint{
-		ID:      "defer-resume",
+		ID:      "defer-terminal",
 		Version: 1,
 		Nodes: []dag.NodeDef{
-			{ID: "defer", Type: "defer_resolution", Config: map[string]interface{}{"reason": "need new chain data"}},
-			{ID: "step", Type: "outcome", Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
-		},
-		Edges: []dag.EdgeDef{
-			{From: "defer", To: "step", Condition: "defer.status == 'success'"},
-			{From: "step", To: "submit"},
-		},
-	})
-}
-
-func doubleDeferBlueprint() []byte {
-	return mustMarshalBlueprint(dag.Blueprint{
-		ID:      "double-defer",
-		Version: 1,
-		Nodes: []dag.NodeDef{
-			{ID: "defer_a", Type: "defer_resolution", Config: map[string]interface{}{"correlation_key": "shared-defer"}},
-			{ID: "defer_b", Type: "defer_resolution", Config: map[string]interface{}{"correlation_key": "shared-defer"}},
-			{ID: "step", Type: "outcome", Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
-		},
-		Edges: []dag.EdgeDef{
-			{From: "defer_a", To: "step", Condition: "defer_a.status == 'success'"},
-			{From: "defer_b", To: "step", Condition: "defer_b.status == 'success'"},
-			{From: "step", To: "submit"},
+			{ID: "defer", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status": "deferred",
+					"reason": "need new chain data",
+				},
+			}},
 		},
 	})
 }
@@ -308,13 +313,13 @@ func loopWithWaitBlueprint() []byte {
 		Version: 1,
 		Nodes: []dag.NodeDef{
 			{ID: "fetch", Type: "fetch", Config: map[string]interface{}{}},
-			{ID: "wait", Type: "wait", Config: map[string]interface{}{"duration_seconds": 1}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "fetch.outcome"}},
+			{ID: "wait", Type: "wait", Config: map[string]interface{}{"duration_seconds": 1, "max_inline_seconds": -1}},
+			returnSuccessNode("submit", "results.fetch.outcome"),
 		},
 		Edges: []dag.EdgeDef{
-			{From: "fetch", To: "wait", Condition: "fetch.status != 'success'"},
+			{From: "fetch", To: "wait", Condition: "results.fetch.status != 'success'"},
 			{From: "wait", To: "fetch", MaxTraversals: 1},
-			{From: "fetch", To: "submit", Condition: "fetch.status == 'success'"},
+			{From: "fetch", To: "submit", Condition: "results.fetch.status == 'success'"},
 		},
 	})
 }
@@ -334,7 +339,7 @@ func jsonMarshal(value interface{}) ([]byte, error) {
 func TestDurableRunCompletesAcrossRestartAfterInterruptedWorker(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := &durableBlockingExecutor{started: make(chan struct{}, 1)}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": blocking,
 	}), 1)
 
@@ -349,13 +354,13 @@ func TestDurableRunCompletesAcrossRestartAfterInterruptedWorker(t *testing.T) {
 	manager.Close()
 
 	success := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager = newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager = newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": success,
 	}), 1)
 	defer manager.Close()
 
 	result := waitForDurableStatus(t, manager, "restart-run", RunStatusCompleted)
-	if result.Outcome != "1" || result.RunState == nil || result.RunState.ID != "restart-run" {
+	if returnStringField(t, result.Return, "outcome") != "1" || result.RunState == nil || result.RunState.ID != "restart-run" {
 		t.Fatalf("unexpected completed result: %+v", result)
 	}
 
@@ -377,7 +382,7 @@ func TestDurableRunCompletesAcrossRestartAfterInterruptedWorker(t *testing.T) {
 func TestDurableWaitSuspendsWithoutConsumingWorker(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), 1)
 	defer manager.Close()
@@ -394,13 +399,13 @@ func TestDurableWaitSuspendsWithoutConsumingWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	quick := waitForDurableStatus(t, manager, "simple-while-waiting", RunStatusCompleted)
-	if quick.Outcome != "1" {
-		t.Fatalf("quick run outcome = %q, want 1", quick.Outcome)
+	if returnStringField(t, quick.Return, "outcome") != "1" {
+		t.Fatalf("quick run outcome = %q, want 1", returnStringField(t, quick.Return, "outcome"))
 	}
 
 	delayed := waitForDurableStatus(t, manager, "wait-run", RunStatusCompleted)
-	if delayed.Outcome != "1" {
-		t.Fatalf("delayed run outcome = %q, want 1", delayed.Outcome)
+	if returnStringField(t, delayed.Return, "outcome") != "1" {
+		t.Fatalf("delayed run outcome = %q, want 1", returnStringField(t, delayed.Return, "outcome"))
 	}
 }
 
@@ -419,7 +424,7 @@ func TestDurableAwaitSignalResumesBySignalAndDedupes(t *testing.T) {
 		AppID:          1004,
 		RunID:          "human-run",
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: fmt.Sprintf("%d:%s:%s", 1004, "human-run", "judge"),
+		CorrelationKey: "human-run:judge",
 		Payload: map[string]string{
 			"outcome": "1",
 			"reason":  "clear evidence",
@@ -433,54 +438,32 @@ func TestDurableAwaitSignalResumesBySignalAndDedupes(t *testing.T) {
 	}
 
 	result := waitForDurableStatus(t, manager, "human-run", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
-	if got := result.RunState.Context["judge.reason"]; got != "clear evidence" {
+	if got := testResultValue(result.RunState, "judge", "reason"); got != "clear evidence" {
 		t.Fatalf("judge reason = %q, want clear evidence", got)
 	}
 }
 
-func TestDurableDeferResolutionResumesSameRunBySignal(t *testing.T) {
+func TestDurableDeferResolutionCompletesRunAsDeferred(t *testing.T) {
 	tmpDir := t.TempDir()
-	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
-		"outcome": outcome,
-	}), 1)
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(nil), 1)
 	defer manager.Close()
 
-	if _, err := manager.Submit(RunRequest{RunID: "defer-run", AppID: 1005, BlueprintJSON: deferResumeBlueprint()}); err != nil {
+	if _, err := manager.Submit(RunRequest{RunID: "defer-run", AppID: 1005, BlueprintJSON: deferTerminalBlueprint()}); err != nil {
 		t.Fatal(err)
-	}
-	waitForDurableStatus(t, manager, "defer-run", RunStatusWaiting)
-
-	signal := signalRequest{
-		IdempotencyKey: "defer-signal-1",
-		AppID:          1005,
-		RunID:          "defer-run",
-		SignalType:     "defer_resolution.resume",
-		CorrelationKey: fmt.Sprintf("%d:%s:%s", 1005, "defer-run", "defer"),
-		Payload:        map[string]string{"chain_round": "123"},
-	}
-	if _, err := manager.Signal(signal); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.Signal(signal); err != nil {
-		t.Fatalf("duplicate defer signal should be idempotent: %v", err)
 	}
 
 	result := waitForDurableStatus(t, manager, "defer-run", RunStatusCompleted)
-	if result.RunID != "defer-run" || result.RunState == nil || result.RunState.ID != "defer-run" {
-		t.Fatalf("workflow did not continue same run: %+v", result)
+	if returnStringField(t, result.Return, "status") != "deferred" {
+		t.Fatalf("status = %q, want deferred", returnStringField(t, result.Return, "status"))
 	}
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "reason") != "need new chain data" {
+		t.Fatalf("reason = %q, want need new chain data", returnStringField(t, result.Return, "reason"))
 	}
-	if got := result.RunState.Context["defer.resumed"]; got != "true" {
-		t.Fatalf("defer resumed = %q, want true", got)
-	}
-	if outcome.Count() != 1 {
-		t.Fatalf("downstream outcome executor count = %d, want 1", outcome.Count())
+	if result.RunState == nil || result.RunState.NodeStates["defer"].Status != "completed" {
+		t.Fatalf("defer node did not complete: %+v", result.RunState)
 	}
 }
 
@@ -507,7 +490,7 @@ func TestDurableManagerRejectsDuplicateActiveApp(t *testing.T) {
 func TestDurableSingleNodeQueueCapacityReturnsStableOverload(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": blocking,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   1,
@@ -552,7 +535,7 @@ func TestDurableSingleNodeQueueCapacityReturnsStableOverload(t *testing.T) {
 func TestDurableSingleNodeDuplicateLocalEnqueueExecutesOnce(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), 1)
 	defer manager.Close()
@@ -571,7 +554,7 @@ func TestDurableSingleNodeDuplicateLocalEnqueueExecutesOnce(t *testing.T) {
 func TestDurableActiveCountIncludesQueuedRunningAndWaiting(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": blocking,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   1,
@@ -623,8 +606,8 @@ func TestDurableCheckpointContainsResumeStateAndHistoryEvents(t *testing.T) {
 	if record.Checkpoint.Run == nil {
 		t.Fatal("checkpoint missing run state")
 	}
-	if len(record.Checkpoint.Context) == 0 {
-		t.Fatal("checkpoint missing context")
+	if record.Checkpoint.Run.Inputs == nil {
+		t.Fatal("checkpoint missing inputs")
 	}
 	if !record.Checkpoint.Activated["judge"] {
 		t.Fatalf("checkpoint activated set = %+v, want judge", record.Checkpoint.Activated)
@@ -636,7 +619,7 @@ func TestDurableCheckpointContainsResumeStateAndHistoryEvents(t *testing.T) {
 	if !ok {
 		t.Fatalf("waiting nodes = %+v, want judge", record.Checkpoint.Waiting)
 	}
-	if waiting.CorrelationKey != "1108:checkpoint-human:judge" {
+	if waiting.CorrelationKey != "checkpoint-human:judge" {
 		t.Fatalf("correlation key = %q", waiting.CorrelationKey)
 	}
 
@@ -680,7 +663,7 @@ func TestDurableEarlySignalIsRejectedConsistently(t *testing.T) {
 		IdempotencyKey: "early-signal",
 		AppID:          1109,
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1109:missing:judge",
+		CorrelationKey: "missing:judge",
 		Payload:        map[string]string{"outcome": "1"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "no matching run") {
@@ -702,7 +685,7 @@ func TestDurableNonMatchingSignalIsStoredButDoesNotResume(t *testing.T) {
 		AppID:          1110,
 		RunID:          "nonmatching-signal",
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1110:nonmatching-signal:other-node",
+		CorrelationKey: "nonmatching-signal:other-node",
 		Payload:        map[string]string{"outcome": "1"},
 	}); err != nil {
 		t.Fatal(err)
@@ -739,20 +722,24 @@ func TestDurableAwaitSignalTimeoutResumesThroughTimeoutPath(t *testing.T) {
 				"default_outputs":  map[string]string{"status": "responded"},
 				"timeout_seconds":  1,
 			}},
-			{ID: "cancel", Type: "cancel_market", Config: map[string]interface{}{"reason": "human timeout"}},
+			{ID: "cancel", Type: "return", Config: map[string]interface{}{
+				"value": map[string]interface{}{
+					"status": "failed",
+					"reason": "human timeout",
+				},
+			}},
 		},
-		Edges: []dag.EdgeDef{{From: "judge", To: "cancel", Condition: "judge.status == 'timeout'"}},
+		Edges: []dag.EdgeDef{{From: "judge", To: "cancel", Condition: "results.judge.status == 'timeout'"}},
 	})
-	manager.runner.engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
 	if _, err := manager.Submit(RunRequest{RunID: "human-timeout", AppID: 1111, BlueprintJSON: bp}); err != nil {
 		t.Fatal(err)
 	}
 	waitForDurableStatus(t, manager, "human-timeout", RunStatusWaiting)
 	result := waitForDurableStatus(t, manager, "human-timeout", RunStatusCompleted)
-	if result.Action != RunActionCancelMarket {
-		t.Fatalf("action = %q, want cancel_market result=%+v", result.Action, result)
+	if returnStringField(t, result.Return, "status") != "failed" {
+		t.Fatalf("status = %q, want failed result=%+v", returnStringField(t, result.Return, "status"), result)
 	}
-	if got := result.RunState.Context["judge.status"]; got != "timeout" {
+	if got := testResultValue(result.RunState, "judge", "status"); got != "timeout" {
 		t.Fatalf("judge.status = %q, want timeout", got)
 	}
 }
@@ -760,7 +747,7 @@ func TestDurableAwaitSignalTimeoutResumesThroughTimeoutPath(t *testing.T) {
 func TestDurableCancellationIgnoresOutstandingTimer(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), 1)
 	defer manager.Close()
@@ -806,7 +793,7 @@ func TestDurableBeginShutdownRejectsNewMutations(t *testing.T) {
 		AppID:          1113,
 		RunID:          "shutdown-submit",
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1113:shutdown-submit:judge",
+		CorrelationKey: "shutdown-submit:judge",
 		Payload:        map[string]string{"outcome": "1"},
 	}); !errors.Is(err, errDurableManagerShuttingDown) {
 		t.Fatalf("signal error = %v, want %v", err, errDurableManagerShuttingDown)
@@ -816,7 +803,7 @@ func TestDurableBeginShutdownRejectsNewMutations(t *testing.T) {
 func TestDurableBeginShutdownCancelsInFlightWorker(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := &durableBlockingExecutor{started: make(chan struct{}, 1)}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"blocking": blocking,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   1,
@@ -863,7 +850,7 @@ func TestDurableCallbackOutboxRetriesUntilSuccess(t *testing.T) {
 	defer callback.Close()
 
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{MaxWorkers: 1, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -892,7 +879,7 @@ func TestDurableCallbackOutboxRetriesUntilSuccess(t *testing.T) {
 func TestDurableSignalCanResumeWhileOnlyWorkerIsBusy(t *testing.T) {
 	tmpDir := t.TempDir()
 	blocking := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": blocking,
 	}), DurableRunManagerConfig{MaxWorkers: 1, MaxQueueSize: 10, PollInterval: 10 * time.Millisecond})
 	defer manager.Close()
@@ -915,7 +902,7 @@ func TestDurableSignalCanResumeWhileOnlyWorkerIsBusy(t *testing.T) {
 		AppID:          1114,
 		RunID:          "waiting-human",
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1114:waiting-human:judge",
+		CorrelationKey: "waiting-human:judge",
 		Payload:        map[string]string{"outcome": "1"},
 	}); err != nil {
 		t.Fatal(err)
@@ -931,7 +918,7 @@ func TestDurableSignalCanResumeWhileOnlyWorkerIsBusy(t *testing.T) {
 
 func TestDurableExecutorFailureFailsRunWithEvents(t *testing.T) {
 	tmpDir := t.TempDir()
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"failing": &durableErrorExecutor{err: errors.New("upstream exploded")},
 	}), 1)
 	defer manager.Close()
@@ -962,7 +949,7 @@ func TestDurablePartialFrontierRecoveryDoesNotRerunCompletedNode(t *testing.T) {
 	tmpDir := t.TempDir()
 	left := &durableStaticExecutor{outputs: map[string]string{"status": "success"}}
 	rightBlock := newDurableReleaseExecutor(map[string]string{"status": "success", "outcome": "1"})
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"left_exec":  left,
 		"right_exec": rightBlock,
 	}), 1)
@@ -984,15 +971,15 @@ func TestDurablePartialFrontierRecoveryDoesNotRerunCompletedNode(t *testing.T) {
 	manager.Close()
 
 	rightSuccess := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager = newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager = newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"left_exec":  left,
 		"right_exec": rightSuccess,
 	}), 1)
 	defer manager.Close()
 
 	result := waitForDurableStatus(t, manager, "partial-frontier", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	if left.Count() != 1 {
 		t.Fatalf("completed left node reran after restart; count=%d", left.Count())
@@ -1005,7 +992,7 @@ func TestDurableBackEdgeHistorySurvivesSuspendResume(t *testing.T) {
 		{"status": "retry", "outcome": ""},
 		{"status": "success", "outcome": "1"},
 	}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"fetch": fetch,
 	}), 1)
 	defer manager.Close()
@@ -1015,13 +1002,13 @@ func TestDurableBackEdgeHistorySurvivesSuspendResume(t *testing.T) {
 	}
 	waitForDurableStatus(t, manager, "loop-history", RunStatusWaiting)
 	result := waitForDurableStatus(t, manager, "loop-history", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	if fetch.Count() != 2 {
 		t.Fatalf("fetch count = %d, want 2", fetch.Count())
 	}
-	history := result.RunState.Context["fetch._runs"]
+	history := testResultHistoryJSON(result.RunState, "fetch")
 	if !strings.Contains(history, `"status":"retry"`) {
 		t.Fatalf("fetch history missing retry snapshot: %q", history)
 	}
@@ -1030,7 +1017,7 @@ func TestDurableBackEdgeHistorySurvivesSuspendResume(t *testing.T) {
 func TestDurableDueTimerIsIdempotent(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), 1)
 	defer manager.Close()
@@ -1047,8 +1034,8 @@ func TestDurableDueTimerIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := waitForDurableStatus(t, manager, "timer-idempotent", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 	if outcome.Count() != 1 {
 		t.Fatalf("downstream executor count = %d, want 1", outcome.Count())
@@ -1058,7 +1045,7 @@ func TestDurableDueTimerIsIdempotent(t *testing.T) {
 func TestDurableImmediateWaitDoesNotSuspend(t *testing.T) {
 	tmpDir := t.TempDir()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), 1)
 	defer manager.Close()
@@ -1069,7 +1056,7 @@ func TestDurableImmediateWaitDoesNotSuspend(t *testing.T) {
 		Nodes: []dag.NodeDef{
 			{ID: "wait", Type: "wait", Config: map[string]interface{}{"duration_seconds": 0}},
 			{ID: "step", Type: "outcome", Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}},
+			returnSuccessNode("submit", "results.step.outcome"),
 		},
 		Edges: []dag.EdgeDef{{From: "wait", To: "step"}, {From: "step", To: "submit"}},
 	})
@@ -1080,8 +1067,8 @@ func TestDurableImmediateWaitDoesNotSuspend(t *testing.T) {
 	if result.RunState.NodeStates["wait"].Status != "completed" {
 		t.Fatalf("wait status = %q, want completed", result.RunState.NodeStates["wait"].Status)
 	}
-	if len(result.RunState.Context["wait.ready_at"]) != 0 {
-		t.Fatalf("unexpected ready_at for immediate wait: %q", result.RunState.Context["wait.ready_at"])
+	if len(testResultValue(result.RunState, "wait", "ready_at")) != 0 {
+		t.Fatalf("unexpected ready_at for immediate wait: %q", testResultValue(result.RunState, "wait", "ready_at"))
 	}
 }
 
@@ -1098,14 +1085,14 @@ func TestDurableSignalCanCorrelateByAppIDWithoutRunID(t *testing.T) {
 		IdempotencyKey: "app-only-signal",
 		AppID:          1121,
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1121:app-signal-run:judge",
+		CorrelationKey: "app-signal-run:judge",
 		Payload:        map[string]string{"outcome": "1"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	result := waitForDurableStatus(t, manager, "app-signal-run", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
 	}
 }
 
@@ -1123,7 +1110,7 @@ func TestDurableSignalValidationHappensBeforeCheckpointMutation(t *testing.T) {
 		AppID:          1122,
 		RunID:          "invalid-signal",
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: "1122:invalid-signal:judge",
+		CorrelationKey: "invalid-signal:judge",
 		Payload:        map[string]string{"reason": "missing outcome"},
 	}); err == nil {
 		t.Fatal("expected signal validation error")
@@ -1147,40 +1134,6 @@ func TestDurableSignalValidationHappensBeforeCheckpointMutation(t *testing.T) {
 	}
 }
 
-func TestDurableSignalMatchesMultipleWaitingNodesDeterministically(t *testing.T) {
-	tmpDir := t.TempDir()
-	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
-		"outcome": outcome,
-	}), 1)
-	defer manager.Close()
-
-	if _, err := manager.Submit(RunRequest{RunID: "multi-signal", AppID: 1123, BlueprintJSON: doubleDeferBlueprint()}); err != nil {
-		t.Fatal(err)
-	}
-	waitForDurableStatus(t, manager, "multi-signal", RunStatusWaiting)
-	if _, err := manager.Signal(signalRequest{
-		IdempotencyKey: "multi-signal-1",
-		AppID:          1123,
-		RunID:          "multi-signal",
-		SignalType:     "defer_resolution.resume",
-		CorrelationKey: "shared-defer",
-		Payload:        map[string]string{"chain_round": "77"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	result := waitForDurableStatus(t, manager, "multi-signal", RunStatusCompleted)
-	if result.Outcome != "1" {
-		t.Fatalf("outcome = %q, want 1", result.Outcome)
-	}
-	if result.RunState.NodeStates["defer_a"].Status != "completed" || result.RunState.NodeStates["defer_b"].Status != "completed" {
-		t.Fatalf("defer node states = %+v", result.RunState.NodeStates)
-	}
-	if outcome.Count() != 1 {
-		t.Fatalf("outcome executor count = %d, want 1", outcome.Count())
-	}
-}
-
 func TestDurableCallbackOutboxSurvivesManagerRestart(t *testing.T) {
 	tmpDir := t.TempDir()
 	var allowSuccess atomic.Bool
@@ -1196,7 +1149,7 @@ func TestDurableCallbackOutboxSurvivesManagerRestart(t *testing.T) {
 	defer callback.Close()
 
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	engine := durableTestEngine(map[string]dag.NodeExecutor{"outcome": outcome})
+	engine := durableTestEngine(map[string]dag.Executor{"outcome": outcome})
 	manager := newDurableTestManagerWithConfig(t, tmpDir, engine, DurableRunManagerConfig{
 		MaxWorkers:   1,
 		PollInterval: 10 * time.Millisecond,
@@ -1236,7 +1189,7 @@ func TestDurableMapExecutorCompletesOnce(t *testing.T) {
 	tmpDir := t.TempDir()
 	step := &durableStaticExecutor{outputs: map[string]string{"status": "success", "processed": "true"}}
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	engine := durableTestEngine(map[string]dag.NodeExecutor{
+	engine := durableTestEngine(map[string]dag.Executor{
 		"step":    step,
 		"outcome": outcome,
 	})
@@ -1249,21 +1202,27 @@ func TestDurableMapExecutorCompletesOnce(t *testing.T) {
 		Version: 1,
 		Nodes: []dag.NodeDef{
 			{ID: "mapper", Type: "map", Config: map[string]interface{}{
-				"items_key":       "items_json",
+				"items_key":       "inputs.items_json",
 				"batch_size":      2,
 				"max_concurrency": 1,
 				"inline": &dag.Blueprint{
 					Nodes: []dag.NodeDef{
 						{ID: "step", Type: "step", Config: map[string]interface{}{}},
+						{ID: "out", Type: "return", Config: map[string]interface{}{
+							"value": map[string]interface{}{
+								"status":    "success",
+								"processed": "{{results.step.processed}}",
+							},
+						}},
 					},
+					Edges: []dag.EdgeDef{{From: "step", To: "out"}},
 				},
-				"output_keys": []string{"step.status", "step.processed"},
 			}},
 			{ID: "outcome", Type: "outcome", Config: map[string]interface{}{}},
-			{ID: "submit", Type: "submit_result", Config: map[string]interface{}{"outcome_key": "outcome.outcome"}},
+			returnSuccessNode("submit", "results.outcome.outcome"),
 		},
 		Edges: []dag.EdgeDef{
-			{From: "mapper", To: "outcome", Condition: "mapper.status == 'success'"},
+			{From: "mapper", To: "outcome", Condition: "results.mapper.status == 'success'"},
 			{From: "outcome", To: "submit"},
 		},
 	})
@@ -1277,11 +1236,11 @@ func TestDurableMapExecutorCompletesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := waitForDurableStatus(t, manager, "durable-map", RunStatusCompleted)
-	if result.RunState.Context["mapper.total_batches"] != "2" {
-		t.Fatalf("mapper.total_batches = %q, want 2", result.RunState.Context["mapper.total_batches"])
+	if testResultValue(result.RunState, "mapper", "total_batches") != "2" {
+		t.Fatalf("mapper.total_batches = %q, want 2", testResultValue(result.RunState, "mapper", "total_batches"))
 	}
-	if result.RunState.Context["mapper.total_items"] != "3" {
-		t.Fatalf("mapper.total_items = %q, want 3", result.RunState.Context["mapper.total_items"])
+	if testResultValue(result.RunState, "mapper", "total_items") != "3" {
+		t.Fatalf("mapper.total_items = %q, want 3", testResultValue(result.RunState, "mapper", "total_items"))
 	}
 	if got := countDurableNodeTraces(result.RunState, "mapper"); got != 1 {
 		t.Fatalf("mapper trace count = %d, want 1", got)
@@ -1313,7 +1272,7 @@ func TestDurableManagerEmitsTraceSnapshotsOverLifecycle(t *testing.T) {
 	if _, err := manager.Submit(RunRequest{
 		RunID:         runID,
 		AppID:         appID,
-		BlueprintPath: PathMain,
+		BlueprintPath: "main",
 		Initiator:     "test:trace",
 		BlueprintJSON: awaitSignalBlueprint(),
 	}); err != nil {
@@ -1326,7 +1285,7 @@ func TestDurableManagerEmitsTraceSnapshotsOverLifecycle(t *testing.T) {
 		AppID:          appID,
 		RunID:          runID,
 		SignalType:     "human_judgment.responded",
-		CorrelationKey: fmt.Sprintf("%d:%s:judge", appID, runID),
+		CorrelationKey: fmt.Sprintf("%s:judge", runID),
 		Payload:        map[string]string{"outcome": "1"},
 	}); err != nil {
 		t.Fatal(err)
@@ -1356,8 +1315,8 @@ func TestDurableManagerEmitsTraceSnapshotsOverLifecycle(t *testing.T) {
 		if env.AppID != appID {
 			t.Fatalf("envelope[%d].AppID = %d, want %d", i, env.AppID, appID)
 		}
-		if env.BlueprintPath != PathMain {
-			t.Fatalf("envelope[%d].BlueprintPath = %q, want %q", i, env.BlueprintPath, PathMain)
+		if env.BlueprintPath != "main" {
+			t.Fatalf("envelope[%d].BlueprintPath = %q, want %q", i, env.BlueprintPath, "main")
 		}
 		if env.Initiator != "test:trace" {
 			t.Fatalf("envelope[%d].Initiator = %q, want test:trace", i, env.Initiator)
@@ -1389,7 +1348,7 @@ func TestDurableManagerEmitsTraceSnapshotsOverLifecycle(t *testing.T) {
 	if final.Run.Status != "completed" {
 		t.Fatalf("final envelope status = %q, want completed", final.Run.Status)
 	}
-	if got := final.Run.Context["judge.outcome"]; got != "1" {
+	if got := testResultValue(final.Run, "judge", "outcome"); got != "1" {
 		t.Fatalf("final envelope judge.outcome = %q, want 1", got)
 	}
 }
@@ -1401,7 +1360,7 @@ func TestDurableManagerEmitsDefensiveSnapshots(t *testing.T) {
 	tmpDir := t.TempDir()
 	sink := newFakeTraceSink()
 	outcome := &durableStaticExecutor{outputs: map[string]string{"status": "success", "outcome": "1"}}
-	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.NodeExecutor{
+	manager := newDurableTestManagerWithConfig(t, tmpDir, durableTestEngine(map[string]dag.Executor{
 		"outcome": outcome,
 	}), DurableRunManagerConfig{
 		MaxWorkers:   1,
@@ -1414,7 +1373,7 @@ func TestDurableManagerEmitsDefensiveSnapshots(t *testing.T) {
 	if _, err := manager.Submit(RunRequest{
 		RunID:         "trace-defensive",
 		AppID:         4002,
-		BlueprintPath: PathMain,
+		BlueprintPath: "main",
 		Initiator:     "test:defensive",
 		BlueprintJSON: simpleSubmitBlueprint("outcome"),
 	}); err != nil {
@@ -1426,20 +1385,214 @@ func TestDurableManagerEmitsDefensiveSnapshots(t *testing.T) {
 	if len(envelopes) < 2 {
 		t.Fatalf("expected multiple envelopes, got %d", len(envelopes))
 	}
-	// Mutate the earliest snapshot's Context; the final snapshot must be
+	// Mutate the earliest snapshot's Results; the final snapshot must be
 	// unaffected.
 	first := envelopes[0]
-	if first.Run == nil || first.Run.Context == nil {
-		t.Fatal("first envelope has no run/context")
+	if first.Run == nil || first.Run.Results == nil {
+		t.Fatal("first envelope has no run/results")
 	}
-	first.Run.Context["spurious"] = "mutation"
+	first.Run.Results.SetField("__spurious__", "field", "mutation")
 	first.Run.Status = "mutated"
 
 	final := envelopes[len(envelopes)-1]
-	if _, ok := final.Run.Context["spurious"]; ok {
+	if _, ok := final.Run.Results.Get("__spurious__", "field"); ok {
 		t.Fatal("mutation to earlier envelope leaked into final envelope")
 	}
 	if final.Run.Status == "mutated" {
 		t.Fatal("mutation to earlier envelope leaked into final envelope status")
+	}
+}
+
+// TestDurablePreMatchedSignalCompletesNodeWithoutSuspending covers the
+// executeNode branch where a matching signal is already in record.Signals
+// by the time the suspending node runs: the node must complete immediately
+// and never land in record.Checkpoint.Waiting.
+func TestDurablePreMatchedSignalCompletesNodeWithoutSuspending(t *testing.T) {
+	tmpDir := t.TempDir()
+	gate := newDurableReleaseExecutor(map[string]string{"status": "success"})
+	engine := durableTestEngine(map[string]dag.Executor{"gate": gate})
+	manager := newDurableTestManager(t, tmpDir, engine, 1)
+	defer manager.Close()
+
+	runID := "pre-match-run"
+	appID := 9100
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "pre-match",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "gate", Type: "gate", Config: map[string]interface{}{}},
+			{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+				"signal_type":      "human_judgment.responded",
+				"required_payload": []string{"outcome"},
+				"default_outputs":  map[string]string{"status": "responded"},
+				"timeout_seconds":  60,
+			}},
+			returnSuccessNode("submit", "results.judge.outcome"),
+		},
+		Edges: []dag.EdgeDef{
+			{From: "gate", To: "judge"},
+			{From: "judge", To: "submit"},
+		},
+	})
+	if _, err := manager.Submit(RunRequest{RunID: runID, AppID: appID, BlueprintJSON: bp}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-gate.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gate executor never started")
+	}
+
+	// Deliver the judge's correlation-matched signal before judge has run.
+	// AwaitSignalExecutor auto-derives "<app_id>:<run_id>:<node_id>".
+	correlationKey := fmt.Sprintf("%s:judge", runID)
+	if _, err := manager.Signal(signalRequest{
+		IdempotencyKey: "pre-match-signal",
+		RunID:          runID,
+		SignalType:     "human_judgment.responded",
+		CorrelationKey: correlationKey,
+		Payload:        map[string]string{"outcome": "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity: signal is persisted and no waiting entry exists yet.
+	record, err := manager.store.loadRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := record.Signals["pre-match-signal"]; !ok {
+		t.Fatalf("signal not stored before judge ran: %+v", record.Signals)
+	}
+	if len(record.Checkpoint.Waiting) != 0 {
+		t.Fatalf("unexpected waiting entries before judge ran: %+v", record.Checkpoint.Waiting)
+	}
+
+	close(gate.release)
+
+	result := waitForDurableStatus(t, manager, runID, RunStatusCompleted)
+	if returnStringField(t, result.Return, "outcome") != "1" {
+		t.Fatalf("outcome = %q, want 1", returnStringField(t, result.Return, "outcome"))
+	}
+	final, err := manager.store.loadRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := final.Checkpoint.Run.NodeStates["judge"].Status; status != "completed" {
+		t.Fatalf("judge status = %q, want completed", status)
+	}
+	if consumedAt := final.Signals["pre-match-signal"].ConsumedAt; consumedAt == "" {
+		t.Fatalf("pre-match signal was not marked consumed: %+v", final.Signals["pre-match-signal"])
+	}
+
+	events, err := manager.store.loadEvents(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type != "NodeSuspended" {
+			continue
+		}
+		payload, ok := event.Payload.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if payload["node_id"] == "judge" {
+			t.Fatalf("judge was suspended despite pre-delivered signal: %+v", event)
+		}
+	}
+}
+
+func TestDurableLoopedAwaitSignalRequiresFreshSignalPerIteration(t *testing.T) {
+	tmpDir := t.TempDir()
+	decide := &durableSequenceExecutor{
+		outputs: []map[string]string{
+			{"next": "loop"},
+			{"next": "done"},
+		},
+	}
+	manager := newDurableTestManager(t, tmpDir, durableTestEngine(map[string]dag.Executor{
+		"decide": decide,
+	}), 1)
+	defer manager.Close()
+
+	runID := "looped-await-signal"
+	appID := 9101
+	bp := mustMarshalBlueprint(dag.Blueprint{
+		ID:      "looped-await-signal",
+		Version: 1,
+		Nodes: []dag.NodeDef{
+			{ID: "judge", Type: "await_signal", Config: map[string]interface{}{
+				"signal_type":      "human_judgment.responded",
+				"required_payload": []string{"outcome"},
+				"default_outputs":  map[string]string{"status": "responded"},
+				"timeout_seconds":  60,
+			}},
+			{ID: "decide", Type: "decide", Config: map[string]interface{}{}},
+			returnSuccessNode("submit", "results.judge.outcome"),
+		},
+		Edges: []dag.EdgeDef{
+			{From: "judge", To: "decide"},
+			{From: "decide", To: "judge", Condition: "results.decide.next == 'loop'", MaxTraversals: 1},
+			{From: "decide", To: "submit", Condition: "results.decide.next == 'done'"},
+		},
+	})
+	if _, err := manager.Submit(RunRequest{RunID: runID, AppID: appID, BlueprintJSON: bp}); err != nil {
+		t.Fatal(err)
+	}
+	waitForDurableStatus(t, manager, runID, RunStatusWaiting)
+
+	correlationKey := fmt.Sprintf("%s:judge", runID)
+	if _, err := manager.Signal(signalRequest{
+		IdempotencyKey: "loop-signal-1",
+		RunID:          runID,
+		SignalType:     "human_judgment.responded",
+		CorrelationKey: correlationKey,
+		Payload:        map[string]string{"outcome": "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondWait := waitForDurableStatus(t, manager, runID, RunStatusWaiting)
+	if got := secondWait.RunState.NodeStates["judge"].Status; got != "waiting" {
+		t.Fatalf("judge status after first signal = %q, want waiting", got)
+	}
+	if got := decide.Count(); got != 1 {
+		t.Fatalf("decide executor count after first signal = %d, want 1", got)
+	}
+
+	record, err := manager.store.loadRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumedAt := record.Signals["loop-signal-1"].ConsumedAt; consumedAt == "" {
+		t.Fatalf("first signal was not marked consumed: %+v", record.Signals["loop-signal-1"])
+	}
+
+	if _, err := manager.Signal(signalRequest{
+		IdempotencyKey: "loop-signal-2",
+		RunID:          runID,
+		SignalType:     "human_judgment.responded",
+		CorrelationKey: correlationKey,
+		Payload:        map[string]string{"outcome": "0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := waitForDurableStatus(t, manager, runID, RunStatusCompleted)
+	if returnStringField(t, result.Return, "outcome") != "0" {
+		t.Fatalf("outcome = %q, want 0", returnStringField(t, result.Return, "outcome"))
+	}
+	if got := decide.Count(); got != 2 {
+		t.Fatalf("decide executor count at completion = %d, want 2", got)
+	}
+
+	final, err := manager.store.loadRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumedAt := final.Signals["loop-signal-2"].ConsumedAt; consumedAt == "" {
+		t.Fatalf("second signal was not marked consumed: %+v", final.Signals["loop-signal-2"])
 	}
 }

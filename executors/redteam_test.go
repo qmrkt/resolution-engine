@@ -40,7 +40,7 @@ func TestAPIFetchSSRFBlocked(t *testing.T) {
 			},
 		}
 
-		result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+		result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 		if err != nil {
 			t.Fatalf("url=%s: unexpected error: %v", url, err)
 		}
@@ -75,7 +75,7 @@ func TestAPIFetchRedirectToLocalhostBlocked(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestAPIFetchResponseBodyLimit(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestAPIFetchEmptyURL(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		// Error is acceptable for empty URL
 		return
@@ -166,7 +166,7 @@ func TestAPIFetchMalformedJSON(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		return // acceptable
 	}
@@ -192,7 +192,7 @@ func TestAPIFetchTimeout(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		return
 	}
@@ -228,7 +228,7 @@ func TestLLMCallUnparseableResponse(t *testing.T) {
 		},
 	}
 
-	result, err := exec.Execute(context.Background(), node, dag.NewContext(nil))
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,67 +240,17 @@ func TestLLMCallUnparseableResponse(t *testing.T) {
 
 func TestLLMCallInjectionViaPrompt(t *testing.T) {
 	// Verify that template interpolation doesn't allow code injection
-	ctx := dag.NewContext(map[string]string{
+	ctx := dag.NewInvocationFromInputs(map[string]string{
 		"market_question": `"; DROP TABLE markets; --`,
 	})
 
-	result := ctx.Interpolate("Question: {{market_question}}")
+	result := ctx.Interpolate("Question: {{inputs.market_question}}")
 	// The interpolation should be a simple string replacement, not eval
 	if !strings.Contains(result, "DROP TABLE") {
 		t.Fatal("interpolation should be literal, not filtered")
 	}
 	// The point: interpolation is safe because it's pure string replacement.
 	// There's no eval, no shell execution, no SQL — just text into text.
-}
-
-// ---------------------------------------------------------------------------
-// Submit/Cancel edge cases
-// ---------------------------------------------------------------------------
-
-func TestSubmitResultWithInconclusiveOutcome(t *testing.T) {
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("judge.outcome", "inconclusive")
-
-	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
-	_, err := exec.Execute(context.Background(), node, ctx)
-	if err == nil {
-		t.Fatal("expected error for inconclusive outcome")
-	}
-}
-
-func TestSubmitResultWithMultipleConflictingOutcomes(t *testing.T) {
-	// Conflicting outcomes from multiple upstream nodes must be rejected
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("judge1.outcome", "0")
-	ctx.Set("judge2.outcome", "1")
-
-	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
-	_, err := exec.Execute(context.Background(), node, ctx)
-	if err == nil {
-		t.Fatal("expected error for conflicting outcomes")
-	}
-	if !strings.Contains(err.Error(), "ambiguous outcome") {
-		t.Fatalf("expected ambiguous outcome error, got: %v", err)
-	}
-}
-
-func TestSubmitResultWithMultipleAgreeingOutcomes(t *testing.T) {
-	// Multiple upstream nodes agreeing on the same outcome should succeed
-	exec := NewSubmitResultExecutor()
-	ctx := dag.NewContext(nil)
-	ctx.Set("judge1.outcome", "0")
-	ctx.Set("judge2.outcome", "0")
-
-	node := dag.NodeDef{ID: "submit", Type: "submit_result", Config: map[string]interface{}{}}
-	result, err := exec.Execute(context.Background(), node, ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Outputs["outcome"] != "0" {
-		t.Fatalf("expected outcome=0, got %q", result.Outputs["outcome"])
-	}
 }
 
 // ---------------------------------------------------------------------------

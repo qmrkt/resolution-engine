@@ -86,13 +86,13 @@ func (r *agentToolRegistry) canParallelize(call agentToolCall) bool {
 }
 
 type contextAccess struct {
-	execCtx   *dag.Context
+	inv       *dag.Invocation
 	allowSet  map[string]struct{}
 	allowList []string
 }
 
-func newContextAccess(execCtx *dag.Context, allowlist []string) contextAccess {
-	access := contextAccess{execCtx: execCtx}
+func newContextAccess(inv *dag.Invocation, allowlist []string) contextAccess {
+	access := contextAccess{inv: inv}
 	for _, key := range allowlist {
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -127,17 +127,35 @@ func (a contextAccess) readable(key string) bool {
 }
 
 func (a contextAccess) readableKeys() []string {
-	if a.execCtx == nil {
+	if a.inv == nil {
 		return nil
 	}
 	if a.allowSet != nil {
 		return append([]string(nil), a.allowList...)
 	}
-	snap := a.execCtx.Snapshot()
-	keys := make([]string, 0, len(snap))
-	for key := range snap {
-		if a.readable(key) {
-			keys = append(keys, key)
+	seen := map[string]struct{}{}
+	keys := []string{"run.id", "run.blueprint_id", "run.started_at"}
+	for _, k := range keys {
+		seen[k] = struct{}{}
+	}
+	for k := range a.inv.Run.Inputs {
+		full := "inputs." + k
+		if a.readable(full) {
+			if _, ok := seen[full]; !ok {
+				seen[full] = struct{}{}
+				keys = append(keys, full)
+			}
+		}
+	}
+	for _, nodeID := range a.inv.Results.NodeIDs() {
+		for field := range a.inv.Results.OfNode(nodeID) {
+			full := "results." + nodeID + "." + field
+			if a.readable(full) {
+				if _, ok := seen[full]; !ok {
+					seen[full] = struct{}{}
+					keys = append(keys, full)
+				}
+			}
 		}
 	}
 	sort.Strings(keys)

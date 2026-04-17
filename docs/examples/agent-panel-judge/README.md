@@ -15,8 +15,8 @@ flowchart LR
   evidence["Evidence Agent<br/>agent_loop"]
   skeptic["Skeptic Agent<br/>agent_loop"]
   judge["Final Judge<br/>agent_loop"]
-  submit["Submit<br/>submit_result"]
-  cancel["Cancel<br/>cancel_market"]
+  submit["Submit<br/>return"]
+  cancel["Cancel<br/>return"]
 
   rules --> skeptic
   evidence --> skeptic

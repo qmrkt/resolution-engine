@@ -44,8 +44,5 @@ const (
 // Blueprint validation limits.
 const (
 	MaxBlueprintNodes = 16
-	MaxBlueprintBytes = 8192
+	MaxBlueprintBytes = 16384
 )
-
-// Durable await-signal default timeout (seconds).
-const DefaultDurableAwaitSignalTimeout = 172800

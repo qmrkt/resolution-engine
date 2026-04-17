@@ -24,8 +24,7 @@ func TestGadgetWrapperBlueprintSubmitsChildOutcome(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("gadget", executors.NewGadgetExecutor(engine, gadgetValidationAdapter))
 	engine.RegisterExecutor("cel_eval", executors.NewCelEvalExecutor())
-	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
-	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
+	engine.RegisterExecutor("return", executors.NewReturnExecutor())
 
 	parent := dag.Blueprint{
 		ID:      "gadget-wrapper-submit",
@@ -35,28 +34,30 @@ func TestGadgetWrapperBlueprintSubmitsChildOutcome(t *testing.T) {
 				ID:   "run_child",
 				Type: "gadget",
 				Config: map[string]any{
-					"blueprint_json_key": "input.child_blueprint_json",
-					"propagate_terminal": true,
+					"blueprint_json_key": "inputs.child_blueprint_json",
 				},
 			},
 			{
-				ID:   "submit",
-				Type: "submit_result",
+				ID:   "return_result",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "run_child.outcome",
+					"from_key": "results.run_child.return_json",
 				},
 			},
 			{
-				ID:   "cancel",
-				Type: "cancel_market",
+				ID:   "defer_runtime",
+				Type: "return",
 				Config: map[string]any{
-					"reason": "child run failed",
+					"value": map[string]any{
+						"status": "deferred",
+						"reason": "child run failed",
+					},
 				},
 			},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "run_child", To: "submit", Condition: "run_child.submitted == 'true'"},
-			{From: "run_child", To: "cancel", Condition: "run_child.submitted != 'true'"},
+			{From: "run_child", To: "return_result", Condition: "results.run_child.status == 'success' && results.run_child.run_status == 'completed'"},
+			{From: "run_child", To: "defer_runtime", Condition: "results.run_child.status != 'success' || results.run_child.run_status != 'completed'"},
 		},
 	}
 	parentRaw, err := json.Marshal(parent)
@@ -82,14 +83,17 @@ func TestGadgetWrapperBlueprintSubmitsChildOutcome(t *testing.T) {
 				},
 			},
 			{
-				ID:   "submit",
-				Type: "submit_result",
+				ID:   "done",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "pick.outcome",
+					"value": map[string]any{
+						"status":  "success",
+						"outcome": "{{results.pick.outcome}}",
+					},
 				},
 			},
 		},
-		Edges: []dag.EdgeDef{{From: "pick", To: "submit"}},
+		Edges: []dag.EdgeDef{{From: "pick", To: "done"}},
 	}
 
 	run, err := engine.Execute(context.Background(), parent, map[string]string{
@@ -104,22 +108,21 @@ func TestGadgetWrapperBlueprintSubmitsChildOutcome(t *testing.T) {
 	if run.NodeStates["run_child"].Status != "completed" {
 		t.Fatalf("expected gadget node completed, got %+v", run.NodeStates["run_child"])
 	}
-	if run.NodeStates["submit"].Status != "completed" {
-		t.Fatalf("expected submit node completed, got %+v", run.NodeStates["submit"])
+	if run.NodeStates["return_result"].Status != "completed" {
+		t.Fatalf("expected return_result node completed, got %+v", run.NodeStates["return_result"])
 	}
-	if run.Context["run_child.submitted"] != "true" {
-		t.Fatalf("expected propagated child submission, got context %+v", run.Context)
+	if testResultValue(run, "run_child", "return_json") == "" {
+		t.Fatalf("expected propagated child return_json, got context %+v", run.Results)
 	}
-	if run.Context["submit.outcome"] != "1" {
-		t.Fatalf("expected parent submit outcome 1, got %+v", run.Context)
+	if returnStringField(t, run.Return, "outcome") != "1" {
+		t.Fatalf("expected parent return outcome 1, got %+v", run)
 	}
 }
 
 func TestGadgetWrapperBlueprintCancelsOnChildFailure(t *testing.T) {
 	engine := dag.NewEngine(nil)
 	engine.RegisterExecutor("gadget", executors.NewGadgetExecutor(engine, gadgetValidationAdapter))
-	engine.RegisterExecutor("submit_result", executors.NewSubmitResultExecutor())
-	engine.RegisterExecutor("cancel_market", executors.NewCancelMarketExecutor())
+	engine.RegisterExecutor("return", executors.NewReturnExecutor())
 
 	parent := dag.Blueprint{
 		ID:      "gadget-wrapper-cancel",
@@ -129,28 +132,30 @@ func TestGadgetWrapperBlueprintCancelsOnChildFailure(t *testing.T) {
 				ID:   "run_child",
 				Type: "gadget",
 				Config: map[string]any{
-					"blueprint_json_key": "input.child_blueprint_json",
-					"propagate_terminal": true,
+					"blueprint_json_key": "inputs.child_blueprint_json",
 				},
 			},
 			{
-				ID:   "submit",
-				Type: "submit_result",
+				ID:   "return_result",
+				Type: "return",
 				Config: map[string]any{
-					"outcome_key": "run_child.outcome",
+					"from_key": "results.run_child.return_json",
 				},
 			},
 			{
-				ID:   "cancel",
-				Type: "cancel_market",
+				ID:   "defer_runtime",
+				Type: "return",
 				Config: map[string]any{
-					"reason": "child run failed",
+					"value": map[string]any{
+						"status": "deferred",
+						"reason": "child run failed",
+					},
 				},
 			},
 		},
 		Edges: []dag.EdgeDef{
-			{From: "run_child", To: "submit", Condition: "run_child.submitted == 'true'"},
-			{From: "run_child", To: "cancel", Condition: "run_child.submitted != 'true'"},
+			{From: "run_child", To: "return_result", Condition: "results.run_child.status == 'success' && results.run_child.run_status == 'completed'"},
+			{From: "run_child", To: "defer_runtime", Condition: "results.run_child.status != 'success' || results.run_child.run_status != 'completed'"},
 		},
 	}
 
@@ -163,13 +168,13 @@ func TestGadgetWrapperBlueprintCancelsOnChildFailure(t *testing.T) {
 	if run.Status != "completed" {
 		t.Fatalf("expected completed parent run, got %+v", run)
 	}
-	if run.NodeStates["cancel"].Status != "completed" {
-		t.Fatalf("expected cancel path to run, got %+v", run.NodeStates["cancel"])
+	if run.NodeStates["defer_runtime"].Status != "completed" {
+		t.Fatalf("expected defer_runtime path to run, got %+v", run.NodeStates["defer_runtime"])
 	}
-	if run.Context["run_child.status"] != "failed" {
-		t.Fatalf("expected gadget soft failure, got %+v", run.Context)
+	if testResultValue(run, "run_child", "status") != "failed" {
+		t.Fatalf("expected gadget soft failure, got %+v", run.Results)
 	}
-	if run.Context["cancel.cancelled"] != "true" {
-		t.Fatalf("expected cancel output, got %+v", run.Context)
+	if returnStringField(t, run.Return, "reason") != "child run failed" {
+		t.Fatalf("expected deferred return output, got %+v", run)
 	}
 }
