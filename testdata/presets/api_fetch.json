@@ -1,0 +1,58 @@
+{
+  "id": "api-fetch",
+  "name": "API Fetch Resolution",
+  "description": "Fetch from an API, map the result, then return success or cancellation.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "fetch",
+      "type": "api_fetch",
+      "label": "API Fetch",
+      "config": {
+        "url": "https://api.example.com/market-resolution",
+        "method": "GET",
+        "headers": {},
+        "json_path": "data.outcome",
+        "outcome_mapping": {},
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.fetch.outcome}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "API fetch did not produce a valid outcome."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "fetch",
+      "to": "success",
+      "condition": "results.fetch.status == 'success' && results.fetch.outcome != ''"
+    },
+    {
+      "from": "fetch",
+      "to": "cancelled",
+      "condition": "results.fetch.status != 'success' || results.fetch.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 1800
+  }
+}

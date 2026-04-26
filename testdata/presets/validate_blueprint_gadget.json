@@ -1,0 +1,243 @@
+{
+  "id": "yolo-auto-resolution",
+  "name": "YOLO Auto Resolution",
+  "description": "Draft → red-team → validate → repair → gadget. Defers rather than guessing when the child blueprint is not bounded or cannot be validated.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "draft",
+      "type": "agent_loop",
+      "label": "Draft Blueprint",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "output_mode": "structured",
+        "max_steps": 8,
+        "max_tool_calls": 6,
+        "prompt": "Draft a minimal, well-bounded child resolution blueprint for this prediction market.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nLive context JSON: {{inputs.market.context_json}}\nSuggested sources JSON: {{inputs.market.sources_json}}\nAllowed child node types JSON: {{inputs.yolo.allowed_node_types_json}}\nExample catalog JSON: {{inputs.yolo.examples_json}}\nSource pack catalog JSON: {{inputs.yolo.source_packs_json}}\n\nDesign principles — follow all:\n 1. Prefer primary, authoritative sources over aggregators.\n 2. Use redundancy when a single source could be wrong or unavailable.\n 3. Keep the graph small and bounded: <= 12 nodes, <= 18 edges, <= 1 depth.\n 4. End with a `return` node whose payload is {status, outcome?, reason?}.\n 5. Defer with status=deferred rather than guess when evidence is weak.\n\nReturn the full child blueprint as a JSON string in `blueprint_json`. Include a one-line `strategy_summary` and the `assumptions` you are making about the question.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "strategy_summary": {
+                "type": "string"
+              },
+              "assumptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json",
+              "strategy_summary"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "redteam",
+      "type": "agent_loop",
+      "label": "Red-team & Harden",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "output_mode": "structured",
+        "max_steps": 8,
+        "max_tool_calls": 6,
+        "prompt": "Red-team and strengthen the drafted child blueprint. Assume it is WRONG until proven safe.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nResolution rules: {{inputs.market.resolution_rules}}\nDraft blueprint JSON: {{results.draft.output.blueprint_json}}\nDraft notes JSON: {{results.draft.output_json}}\n\nAdversarial checklist — for each, strengthen the blueprint if the issue applies:\n 1. Single-point-of-failure sources: add redundancy or cross-checks.\n 2. Ambiguous outcome mapping: add explicit CEL that eliminates ties.\n 3. Premature certainty: widen thresholds that would trigger `outcome` over `deferred`.\n 4. Stale data / timing edge cases around the deadline: add recency checks.\n 5. Missing deferral paths: every fetch/LLM call should have a deferred fallback edge.\n 6. Node-count and depth: keep <= 12 nodes / <= 18 edges / <= 1 depth.\n\nRewrite the blueprint to fix everything you found. Return the full revised child blueprint JSON as `blueprint_json`, a concise `attack_summary`, and any `residual_risks` you could not remove.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "attack_summary": {
+                "type": "string"
+              },
+              "residual_risks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json",
+              "attack_summary"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "candidate",
+      "type": "cel_eval",
+      "label": "Pick Candidate",
+      "config": {
+        "expressions": {
+          "blueprint_json": "results.repair.output_json.blueprint_json != '' ? results.repair.output_json.blueprint_json : results.redteam.output_json.blueprint_json",
+          "source": "results.repair.output_json.blueprint_json != '' ? 'repair' : 'redteam'"
+        }
+      }
+    },
+    {
+      "id": "validate",
+      "type": "validate_blueprint",
+      "label": "Validate",
+      "config": {
+        "blueprint_json_key": "results.candidate.blueprint_json"
+      }
+    },
+    {
+      "id": "repair",
+      "type": "agent_loop",
+      "label": "Repair Blueprint",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "output_mode": "structured",
+        "max_steps": 6,
+        "max_tool_calls": 4,
+        "prompt": "Repair this child resolution blueprint so it passes the runtime validator. Change as little as possible.\n\nQuestion: {{inputs.market.question}}\nOutcomes JSON: {{inputs.market.outcomes_json}}\nCurrent child blueprint JSON: {{results.candidate.blueprint_json}}\nValidator issues JSON: {{results.validate.issues_json}}\nValidator issues text:\n{{results.validate.issues_text}}\n\nRules:\n - Preserve the existing deferral paths; do not remove conservative fallbacks.\n - Keep node and edge counts at or below the original.\n - Do not add new tool types or widen the policy envelope.\n\nReturn the full repaired child blueprint JSON string as `blueprint_json` and a short `repair_notes` list.",
+        "output_tool": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blueprint_json": {
+                "type": "string"
+              },
+              "repair_notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "blueprint_json"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "run_child",
+      "type": "gadget",
+      "label": "Execute Child",
+      "config": {
+        "blueprint_json_key": "results.candidate.blueprint_json",
+        "timeout_seconds": 600,
+        "max_depth": 1,
+        "input_mappings": {
+          "market.question": "inputs.market.question",
+          "market.outcomes_json": "inputs.market.outcomes_json",
+          "market.resolution_rules": "inputs.market.resolution_rules",
+          "market.context_json": "inputs.market.context_json",
+          "market.sources_json": "inputs.market.sources_json"
+        },
+        "dynamic_blueprint_policy": {
+          "allowed_node_types": [
+            "api_fetch",
+            "llm_call",
+            "agent_loop",
+            "wait",
+            "return",
+            "cel_eval",
+            "map"
+          ],
+          "max_nodes": 16,
+          "max_edges": 24,
+          "max_depth": 1,
+          "max_total_time_seconds": 600,
+          "max_total_tokens": 120000,
+          "allow_agent_loop": true
+        }
+      }
+    },
+    {
+      "id": "return_result",
+      "type": "return",
+      "label": "Return Child Result",
+      "config": {
+        "from_key": "results.run_child.return_json"
+      }
+    },
+    {
+      "id": "defer_runtime",
+      "type": "return",
+      "label": "Defer (runtime)",
+      "config": {
+        "value": {
+          "status": "deferred",
+          "reason": "The generated child blueprint did not produce a conclusive bounded resolution."
+        }
+      }
+    },
+    {
+      "id": "defer_invalid",
+      "type": "return",
+      "label": "Defer (invalid)",
+      "config": {
+        "value": {
+          "status": "deferred",
+          "reason": "The generated child blueprint could not be validated within the repair budget."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "draft",
+      "to": "redteam"
+    },
+    {
+      "from": "redteam",
+      "to": "candidate"
+    },
+    {
+      "from": "candidate",
+      "to": "validate"
+    },
+    {
+      "from": "validate",
+      "to": "run_child",
+      "condition": "results.validate.valid == 'true'"
+    },
+    {
+      "from": "validate",
+      "to": "repair",
+      "condition": "results.validate.valid != 'true' && size(results.validate.history) < 2"
+    },
+    {
+      "from": "repair",
+      "to": "candidate",
+      "max_traversals": 2
+    },
+    {
+      "from": "validate",
+      "to": "defer_invalid",
+      "condition": "results.validate.valid != 'true' && size(results.validate.history) >= 2"
+    },
+    {
+      "from": "run_child",
+      "to": "return_result",
+      "condition": "results.run_child.status == 'success' && results.run_child.run_status == 'completed'"
+    },
+    {
+      "from": "run_child",
+      "to": "defer_runtime",
+      "condition": "results.run_child.status != 'success' || results.run_child.run_status != 'completed'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 2400,
+    "max_total_tokens": 240000
+  }
+}

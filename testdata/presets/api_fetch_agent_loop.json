@@ -1,0 +1,116 @@
+{
+  "id": "api-fetch-agent-loop",
+  "name": "API Fetch + Agent Fallback",
+  "description": "Use API fetch first and escalate to an agent loop when the API path is insufficient.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "fetch",
+      "type": "api_fetch",
+      "label": "API Fetch",
+      "config": {
+        "url": "https://api.example.com/market-resolution",
+        "method": "GET",
+        "headers": {},
+        "json_path": "data.outcome",
+        "outcome_mapping": {},
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "id": "agent",
+      "type": "agent_loop",
+      "label": "Agent Fallback",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "system_prompt": "You are resolving a prediction market. Choose the best investigation strategy given the market question, outcomes, deadline, and available tools. Gather the strongest public evidence you can find, prefer primary and recent sources when timing matters, and only return an outcome when the evidence supports it. If the evidence is insufficient, contradictory, or unverifiable, return inconclusive instead of guessing.",
+        "prompt": "Question: Will Bitcoin (BTC) close above $150,000 at any point before July 2026?\nOutcomes: 0: Yes, 1: No\nResolution deadline: 2026-04-24T03:06:40.000Z\n\nInvestigate this market using the best strategy you can devise. Use tools to gather evidence from public sources, follow the strongest leads, compare competing claims, and decide which outcome is best supported.\n\nReturn a structured resolution with:\n- outcome: the winning outcome index\n- reasoning: a concise evidence-based explanation\n- confidence: a 0-1 confidence estimate\n\nIf the market cannot be resolved confidently from available evidence, return inconclusive.\n\nThe deterministic API path did not produce a reliable answer.\nAPI status: {{results.fetch.status}}\nAPI raw response: {{results.fetch.raw}}\nAPI extracted value: {{results.fetch.json_path_value}}\n\nRecover by investigating with public evidence and return the strongest supported outcome.",
+        "output_mode": "resolution",
+        "allowed_outcomes_key": "inputs.market.outcomes_json",
+        "timeout_seconds": 300,
+        "max_steps": 8,
+        "max_tool_calls": 12,
+        "tools": [
+          {
+            "name": "fetch_source",
+            "kind": "builtin",
+            "builtin": "source_fetch",
+            "description": "Fetch a public source URL for current evidence.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.fetch.outcome}}"
+        }
+      }
+    },
+    {
+      "id": "agent_success",
+      "type": "return",
+      "label": "Return Agent Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.agent.outcome}}",
+          "reasoning": "{{results.agent.reasoning}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "Neither the API path nor the agent fallback produced a valid outcome."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "fetch",
+      "to": "success",
+      "condition": "results.fetch.status == 'success' && results.fetch.outcome != ''"
+    },
+    {
+      "from": "fetch",
+      "to": "agent",
+      "condition": "results.fetch.status != 'success' || results.fetch.outcome == ''"
+    },
+    {
+      "from": "agent",
+      "to": "agent_success",
+      "condition": "results.agent.status == 'success' && results.agent.outcome != '' && results.agent.outcome != 'inconclusive'"
+    },
+    {
+      "from": "agent",
+      "to": "cancelled",
+      "condition": "results.agent.status != 'success' || results.agent.outcome == '' || results.agent.outcome == 'inconclusive'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 2400,
+    "max_total_tokens": 140000
+  }
+}

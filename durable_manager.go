@@ -286,16 +286,9 @@ func (m *DurableRunManager) Submit(req RunRequest) (RunResult, error) {
 		m.mu.Unlock()
 		return RunResult{}, &duplicateRunError{RunID: existing.Request.RunID}
 	}
-	if m.maxQueueSize > 0 {
-		queued, err := m.queuedRunCount()
-		if err != nil {
-			m.mu.Unlock()
-			return RunResult{}, err
-		}
-		if queued >= m.maxQueueSize {
-			m.mu.Unlock()
-			return RunResult{}, &queueFullError{MaxQueueSize: m.maxQueueSize}
-		}
+	if m.maxQueueSize > 0 && m.index.QueuedCount() >= m.maxQueueSize {
+		m.mu.Unlock()
+		return RunResult{}, &queueFullError{MaxQueueSize: m.maxQueueSize}
 	}
 	if err := m.persist(record); err != nil {
 		m.mu.Unlock()
@@ -1309,19 +1302,16 @@ func (m *DurableRunManager) outboxLoop() {
 
 func (m *DurableRunManager) deliverCallbacks() error {
 	now := time.Now().UTC()
-	for _, runID := range m.index.PendingCallbackRunIDs() {
+	for _, runID := range m.index.PendingCallbackRunIDs(now.Unix()) {
 		record, err := m.store.loadRun(runID)
 		if err != nil {
 			return err
 		}
+		// Defensive race guard: a concurrent persist could have marked the
+		// callback delivered (or cleared the URL) between the index read
+		// and the loadRun. The index filter already excluded these.
 		if !isTerminalStatus(record.Result.Status) || record.CallbackDelivered || strings.TrimSpace(record.Request.CallbackURL) == "" {
 			continue
-		}
-		if record.NextCallbackAt != "" {
-			next, err := time.Parse(time.RFC3339Nano, record.NextCallbackAt)
-			if err == nil && next.After(now) {
-				continue
-			}
 		}
 		if err := m.postCallback(record.Request.CallbackURL, record.Result); err != nil {
 			record.CallbackAttempts++
@@ -1461,11 +1451,11 @@ func waitingInterruptedByRestartOutputs(owner string) map[string]string {
 }
 
 func (m *DurableRunManager) activeRunForApp(appID int) (*durableRunRecord, bool, error) {
-	runID := m.index.ActiveRunIDForApp(appID)
-	if runID == "" {
+	runIDs := m.index.ActiveRunIDsByApp(appID)
+	if len(runIDs) == 0 {
 		return nil, false, nil
 	}
-	record, err := m.store.loadRun(runID)
+	record, err := m.store.loadRun(runIDs[0])
 	if err != nil {
 		return nil, false, err
 	}
@@ -1475,10 +1465,6 @@ func (m *DurableRunManager) activeRunForApp(appID int) (*durableRunRecord, bool,
 		return nil, false, nil
 	}
 	return record, true, nil
-}
-
-func (m *DurableRunManager) queuedRunCount() (int, error) {
-	return m.index.QueuedCount(), nil
 }
 
 func (m *DurableRunManager) findSignalTarget(req signalRequest) (*durableRunRecord, error) {

@@ -1,0 +1,60 @@
+{
+  "id": "llm-call",
+  "name": "LLM Call Resolution",
+  "description": "Use a single model to determine the winning outcome.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "judge",
+      "type": "llm_call",
+      "label": "LLM Call",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "prompt": "Question: Will Bitcoin (BTC) close above $150,000 at any point before July 2026?\nOutcomes: 0: Yes, 1: No\n\nReturn the correct outcome index as structured JSON.",
+        "allowed_outcomes_key": "inputs.market.outcomes_json",
+        "timeout_seconds": 60
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.judge.outcome}}",
+          "reasoning": "{{results.judge.reasoning}}",
+          "confidence": "{{results.judge.confidence}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "LLM call was inconclusive."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "judge",
+      "to": "success",
+      "condition": "results.judge.status == 'success' && results.judge.outcome != '' && results.judge.outcome != 'inconclusive'"
+    },
+    {
+      "from": "judge",
+      "to": "cancelled",
+      "condition": "results.judge.status != 'success' || results.judge.outcome == '' || results.judge.outcome == 'inconclusive'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 1800,
+    "max_total_tokens": 100000
+  }
+}

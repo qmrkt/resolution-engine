@@ -45,10 +45,8 @@ func (*ReturnExecutor) OutputKeys() []string {
 	return []string{"status"}
 }
 
-// IsTerminal marks ReturnExecutor as a dag.TerminalExecutor so the engine
-// can refuse to report a blueprint as "completed" if a return node was
-// present but never fired. Keeps the terminal-fire contract expressed by
-// the executor instead of by a hardcoded node-type string in the engine.
+// IsTerminal marks ReturnExecutor as a dag.TerminalExecutor: a blueprint
+// containing a return node is required to fire it, else the run fails.
 func (*ReturnExecutor) IsTerminal() bool { return true }
 
 func (e *ReturnExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *dag.Invocation) (dag.ExecutorResult, error) {

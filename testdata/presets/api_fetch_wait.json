@@ -1,0 +1,71 @@
+{
+  "id": "api-fetch-wait",
+  "name": "API Fetch + Wait",
+  "description": "Use a deterministic fetch, delay, then emit the final return payload.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "fetch",
+      "type": "api_fetch",
+      "label": "API Fetch",
+      "config": {
+        "url": "https://api.example.com/market-resolution",
+        "method": "GET",
+        "headers": {},
+        "json_path": "data.outcome",
+        "outcome_mapping": {},
+        "timeout_seconds": 30
+      }
+    },
+    {
+      "id": "wait",
+      "type": "wait",
+      "label": "Wait",
+      "config": {
+        "duration_seconds": 300,
+        "mode": "sleep"
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.fetch.outcome}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "API fetch failed before the wait gate."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "fetch",
+      "to": "wait",
+      "condition": "results.fetch.status == 'success' && results.fetch.outcome != ''"
+    },
+    {
+      "from": "fetch",
+      "to": "cancelled",
+      "condition": "results.fetch.status != 'success' || results.fetch.outcome == ''"
+    },
+    {
+      "from": "wait",
+      "to": "success"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 3600
+  }
+}

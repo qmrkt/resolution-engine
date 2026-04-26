@@ -1,0 +1,64 @@
+{
+  "id": "await-signal",
+  "name": "Await Human Signal",
+  "description": "Pause for a human resolver, then emit a terminal return payload.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "review",
+      "type": "await_signal",
+      "label": "Human Review",
+      "config": {
+        "reason": "Review the market evidence, select the best supported outcome, and include a short reason.",
+        "signal_type": "human_judgment.responded",
+        "correlation_key": "auto",
+        "timeout_seconds": 172800,
+        "required_payload": [
+          "outcome",
+          "reason"
+        ],
+        "timeout_outputs": {
+          "status": "timeout"
+        }
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.review.outcome}}",
+          "reason": "{{results.review.reason}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "Human review was cancelled or timed out."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "review",
+      "to": "success",
+      "condition": "results.review.status == 'responded' && results.review.outcome != ''"
+    },
+    {
+      "from": "review",
+      "to": "cancelled",
+      "condition": "results.review.status == 'cancelled' || results.review.status == 'timeout' || results.review.outcome == ''"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 604800
+  }
+}

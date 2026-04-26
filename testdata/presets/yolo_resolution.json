@@ -1,0 +1,88 @@
+{
+  "id": "yolo-resolution",
+  "name": "Yolo Resolution",
+  "description": "Run an aggressive research-oriented agent loop, then return success or cancellation.",
+  "version": 1,
+  "nodes": [
+    {
+      "id": "agent",
+      "type": "agent_loop",
+      "label": "Yolo Agent",
+      "config": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "system_prompt": "You are resolving a prediction market. Choose the best investigation strategy given the market question, outcomes, deadline, and available tools. Gather the strongest public evidence you can find, prefer primary and recent sources when timing matters, and only return an outcome when the evidence supports it. If the evidence is insufficient, contradictory, or unverifiable, return inconclusive instead of guessing.",
+        "prompt": "Question: Will Bitcoin (BTC) close above $150,000 at any point before July 2026?\nOutcomes: 0: Yes, 1: No\nResolution deadline: 2026-04-24T03:06:40.000Z\n\nInvestigate this market using the best strategy you can devise. Use tools to gather evidence from public sources, follow the strongest leads, compare competing claims, and decide which outcome is best supported.\n\nReturn a structured resolution with:\n- outcome: the winning outcome index\n- reasoning: a concise evidence-based explanation\n- confidence: a 0-1 confidence estimate\n\nIf the market cannot be resolved confidently from available evidence, return inconclusive.\n\nBe proactive. Come up with the best strategy given the market conditions, feel free to search the web via public sources, branch into multiple lines of inquiry if needed, and synthesize the strongest case before choosing an outcome.",
+        "timeout_seconds": 420,
+        "tool_timeout_seconds": 25,
+        "max_steps": 12,
+        "max_tool_calls": 18,
+        "max_tool_result_bytes": 16000,
+        "tool_result_history": 3,
+        "max_history_messages": 32,
+        "max_tokens": 160000,
+        "output_mode": "resolution",
+        "allowed_outcomes_key": "inputs.market.outcomes_json",
+        "tools": [
+          {
+            "name": "fetch_source",
+            "kind": "builtin",
+            "builtin": "source_fetch",
+            "description": "Fetch a public source URL for current evidence.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "success",
+      "type": "return",
+      "label": "Return Success",
+      "config": {
+        "value": {
+          "status": "success",
+          "outcome": "{{results.agent.outcome}}",
+          "reasoning": "{{results.agent.reasoning}}",
+          "confidence": "{{results.agent.confidence}}"
+        }
+      }
+    },
+    {
+      "id": "cancelled",
+      "type": "return",
+      "label": "Return Cancelled",
+      "config": {
+        "value": {
+          "status": "cancelled",
+          "reason": "Yolo resolution was inconclusive."
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "agent",
+      "to": "success",
+      "condition": "results.agent.status == 'success' && results.agent.outcome != '' && results.agent.outcome != 'inconclusive'"
+    },
+    {
+      "from": "agent",
+      "to": "cancelled",
+      "condition": "results.agent.status != 'success' || results.agent.outcome == '' || results.agent.outcome == 'inconclusive'"
+    }
+  ],
+  "budget": {
+    "max_total_time_seconds": 2400,
+    "max_total_tokens": 180000
+  }
+}

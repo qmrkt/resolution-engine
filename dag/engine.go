@@ -821,15 +821,15 @@ func markActivatedPendingNodeStatesSkipped(run *RunState, activated map[string]s
 // BlueprintRequiresTerminalFire reports whether the blueprint contains any
 // node whose registered executor implements TerminalExecutor and declares
 // itself terminal. Runs containing such a node are required to fire it via
-// EarlyReturn; otherwise the engine marks the run failed. Replaces the
-// old `BlueprintHasReturn(bp) { node.Type == "return" }` check, removing
-// the domain-specific node-type string from the generic engine layer.
+// EarlyReturn; otherwise the engine marks the run failed.
 func (e *Engine) BlueprintRequiresTerminalFire(bp Blueprint) bool {
 	if e == nil {
 		return false
 	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	for _, node := range bp.Nodes {
-		exec, ok := e.getExecutor(node.Type)
+		exec, ok := e.executors[node.Type]
 		if !ok {
 			continue
 		}
