@@ -32,10 +32,59 @@ type agentProviderClient struct {
 	provider providerLayerConfig
 }
 
+type agentChatSession interface {
+	chat(ctx context.Context, req agentProviderRequest) (agentProviderResponse, error)
+	close()
+}
+
+type statelessAgentChatSession struct {
+	client *agentProviderClient
+}
+
+func (s *statelessAgentChatSession) chat(ctx context.Context, req agentProviderRequest) (agentProviderResponse, error) {
+	return s.client.chat(ctx, req)
+}
+
+func (s *statelessAgentChatSession) close() {}
+
+type openAIResponsesAgentSession struct {
+	client             *agentProviderClient
+	previousResponseID string
+	sentMessages       int
+}
+
+func (s *openAIResponsesAgentSession) chat(ctx context.Context, req agentProviderRequest) (agentProviderResponse, error) {
+	previousID := s.previousResponseID
+	if previousID != "" && s.sentMessages <= len(req.Messages) {
+		req.Messages = append([]agentMessage(nil), req.Messages[s.sentMessages:]...)
+	} else if previousID != "" {
+		previousID = ""
+		s.previousResponseID = ""
+	}
+	resp, err := s.client.chatOpenAIResponsesWithSession(ctx, req, previousID, true)
+	if err != nil {
+		return resp, err
+	}
+	if strings.TrimSpace(resp.ResponseID) != "" {
+		s.previousResponseID = strings.TrimSpace(resp.ResponseID)
+		s.sentMessages += len(req.Messages) + 1
+	}
+	return resp, nil
+}
+
+func (s *openAIResponsesAgentSession) close() {}
+
 func newAgentProviderClient(cfg LLMCallExecutorConfig) *agentProviderClient {
 	return &agentProviderClient{
 		provider: newProviderLayerConfig(cfg),
 	}
+}
+
+func (c *agentProviderClient) newSession(req agentProviderRequest) agentChatSession {
+	if c != nil && req.Provider == LLMProviderOpenAI && agentOpenAIUsesResponses(req.Model) {
+		return &openAIResponsesAgentSession{client: c}
+	}
+	return &statelessAgentChatSession{client: c}
 }
 
 func (c *agentProviderClient) httpClient() *http.Client {
@@ -113,6 +162,14 @@ func (c *agentProviderClient) chatAnthropic(ctx context.Context, req agentProvid
 	}
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools
+	}
+	if strings.TrimSpace(req.ForceToolName) != "" {
+		body["tool_choice"] = map[string]string{
+			"type": "tool",
+			"name": strings.TrimSpace(req.ForceToolName),
+		}
+	} else if req.RequireTool && len(req.Tools) > 0 {
+		body["tool_choice"] = map[string]string{"type": "any"}
 	}
 
 	endpoint, err := c.provider.endpoint(LLMProviderAnthropic, req.Model)
@@ -261,6 +318,16 @@ func (c *agentProviderClient) chatOpenAICompletions(ctx context.Context, req age
 	if len(req.Tools) == 0 {
 		delete(payload, "tools")
 	}
+	if strings.TrimSpace(req.ForceToolName) != "" {
+		payload["tool_choice"] = map[string]any{
+			"type": "function",
+			"function": map[string]string{
+				"name": strings.TrimSpace(req.ForceToolName),
+			},
+		}
+	} else if req.RequireTool && len(req.Tools) > 0 {
+		payload["tool_choice"] = "required"
+	}
 
 	endpoint, err := c.provider.endpoint(LLMProviderOpenAI, req.Model)
 	if err != nil {
@@ -407,6 +474,10 @@ type openAIResponsesTool struct {
 }
 
 func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agentProviderRequest) (agentProviderResponse, error) {
+	return c.chatOpenAIResponsesWithSession(ctx, req, "", false)
+}
+
+func (c *agentProviderClient) chatOpenAIResponsesWithSession(ctx context.Context, req agentProviderRequest, previousResponseID string, store bool) (agentProviderResponse, error) {
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = DefaultCompletionMaxTokens
@@ -417,10 +488,22 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 		"instructions":      req.System,
 		"tools":             openAIResponsesTools(req.Tools),
 		"max_output_tokens": maxTokens,
-		"store":             false,
+		"store":             store,
+	}
+	if strings.TrimSpace(previousResponseID) != "" {
+		payload["previous_response_id"] = strings.TrimSpace(previousResponseID)
+		payload["store"] = true
 	}
 	if len(req.Tools) == 0 {
 		delete(payload, "tools")
+	}
+	if strings.TrimSpace(req.ForceToolName) != "" {
+		payload["tool_choice"] = map[string]string{
+			"type": "function",
+			"name": strings.TrimSpace(req.ForceToolName),
+		}
+	} else if req.RequireTool && len(req.Tools) > 0 {
+		payload["tool_choice"] = "required"
 	}
 	if strings.TrimSpace(req.System) == "" {
 		delete(payload, "instructions")
@@ -442,6 +525,7 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 	}
 
 	var apiResp struct {
+		ID     string `json:"id"`
 		Output []struct {
 			Type      string `json:"type"`
 			Role      string `json:"role"`
@@ -498,8 +582,9 @@ func (c *agentProviderClient) chatOpenAIResponses(ctx context.Context, req agent
 	}
 
 	return agentProviderResponse{
-		Message: message,
-		Calls:   calls,
+		Message:    message,
+		Calls:      calls,
+		ResponseID: apiResp.ID,
 		Usage: dag.TokenUsage{
 			InputTokens:  apiResp.Usage.InputTokens,
 			OutputTokens: apiResp.Usage.OutputTokens,
@@ -616,6 +701,15 @@ type googleAgentToolDecl struct {
 	FunctionDeclarations []googleAgentFunctionDecl `json:"functionDeclarations"`
 }
 
+type googleAgentToolConfig struct {
+	FunctionCallingConfig googleAgentFunctionCallingConfig `json:"functionCallingConfig"`
+}
+
+type googleAgentFunctionCallingConfig struct {
+	Mode                 string   `json:"mode"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
+}
+
 type googleAgentContent struct {
 	Role  string            `json:"role,omitempty"`
 	Parts []googleAgentPart `json:"parts"`
@@ -665,6 +759,19 @@ func (c *agentProviderClient) chatGoogle(ctx context.Context, req agentProviderR
 			})
 		}
 		payload["tools"] = []googleAgentToolDecl{{FunctionDeclarations: decls}}
+		switch {
+		case strings.TrimSpace(req.ForceToolName) != "":
+			payload["toolConfig"] = googleAgentToolConfig{
+				FunctionCallingConfig: googleAgentFunctionCallingConfig{
+					Mode:                 "ANY",
+					AllowedFunctionNames: []string{strings.TrimSpace(req.ForceToolName)},
+				},
+			}
+		case req.RequireTool:
+			payload["toolConfig"] = googleAgentToolConfig{
+				FunctionCallingConfig: googleAgentFunctionCallingConfig{Mode: "ANY"},
+			}
+		}
 	}
 
 	endpoint, err := c.provider.endpoint(LLMProviderGoogle, req.Model)

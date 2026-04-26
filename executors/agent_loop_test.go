@@ -117,6 +117,358 @@ func TestAgentLoopOpenAIResponsesResolutionWithContextTool(t *testing.T) {
 	}
 }
 
+func TestAgentLoopExplicitEmptyToolsOnlyExposesOutputTool(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("expected /responses endpoint for gpt-5 model, got %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		tools, ok := body["tools"].([]any)
+		if !ok {
+			t.Fatalf("expected tools array, got %+v", body["tools"])
+		}
+		if len(tools) != 1 {
+			encoded, _ := json.Marshal(tools)
+			t.Fatalf("expected only output tool, got %s", encoded)
+		}
+		encoded, _ := json.Marshal(tools[0])
+		if !strings.Contains(string(encoded), defaultAgentOutputToolName) {
+			t.Fatalf("expected output tool, got %s", encoded)
+		}
+		for _, forbidden := range []string{AgentBuiltinContextGet, AgentBuiltinContextList, AgentBuiltinSourceFetch, AgentBuiltinJSONExtract} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("explicit empty tools leaked builtin %q: %s", forbidden, encoded)
+			}
+		}
+		toolChoice, _ := json.Marshal(body["tool_choice"])
+		if !strings.Contains(string(toolChoice), defaultAgentOutputToolName) {
+			t.Fatalf("expected forced output tool choice, got %s", toolChoice)
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"output": []map[string]any{
+				{
+					"type":      "function_call",
+					"call_id":   "call_final",
+					"name":      defaultAgentOutputToolName,
+					"arguments": `{"answer":"ok"}`,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderOpenAI,
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+			"tools": []map[string]any{},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{
+		"market.question": "hidden unless a context tool is explicitly configured",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopStructuredOutputRequiresSchemaFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAgentJSON(t, w, map[string]any{
+			"output": []map[string]any{
+				{
+					"type":      "function_call",
+					"call_id":   "call_final",
+					"name":      defaultAgentOutputToolName,
+					"arguments": `{}`,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderOpenAI,
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":                 "object",
+					"properties":           map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":             []string{"answer"},
+					"additionalProperties": false,
+				},
+			},
+			"tools": []map[string]any{},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "failed" {
+		t.Fatalf("expected failed result, got %+v", result.Outputs)
+	}
+	if !strings.Contains(result.Outputs["error"], `missing required field "answer"`) {
+		t.Fatalf("unexpected error: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopStructuredOutputRequiresToolChoiceWithAdditionalTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if body["tool_choice"] != "required" {
+			t.Fatalf("expected required tool_choice, got %+v", body["tool_choice"])
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"output": []map[string]any{
+				{
+					"type":      "function_call",
+					"call_id":   "call_final",
+					"name":      defaultAgentOutputToolName,
+					"arguments": `{"answer":"ok"}`,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderOpenAI,
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+			"tools": []map[string]any{
+				{"name": AgentBuiltinContextList, "kind": AgentToolKindBuiltin},
+			},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocation(dag.Run{ID: "run-tools"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopAnthropicForcedOutputToolChoice(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		choice, ok := body["tool_choice"].(map[string]any)
+		if !ok || choice["type"] != "tool" || choice["name"] != defaultAgentOutputToolName {
+			t.Fatalf("expected forced Anthropic output tool choice, got %#v", body["tool_choice"])
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"content": []map[string]any{{
+				"type":  "tool_use",
+				"id":    "toolu_final",
+				"name":  defaultAgentOutputToolName,
+				"input": map[string]any{"answer": "ok"},
+			}},
+			"stop_reason": "tool_use",
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		AnthropicAPIKey:  "test-anthropic-key",
+		AnthropicBaseURL: server.URL,
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderAnthropic,
+			"model":       defaultAnthropicModel,
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+			"tools": []map[string]any{},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopAnthropicRequiresAnyToolWithAdditionalTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		choice, ok := body["tool_choice"].(map[string]any)
+		if !ok || choice["type"] != "any" {
+			t.Fatalf("expected Anthropic any-tool choice, got %#v", body["tool_choice"])
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"content": []map[string]any{{
+				"type":  "tool_use",
+				"id":    "toolu_final",
+				"name":  defaultAgentOutputToolName,
+				"input": map[string]any{"answer": "ok"},
+			}},
+			"stop_reason": "tool_use",
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		AnthropicAPIKey:  "test-anthropic-key",
+		AnthropicBaseURL: server.URL,
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderAnthropic,
+			"model":       defaultAnthropicModel,
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+			"tools": []map[string]any{
+				{"name": AgentBuiltinContextList, "kind": AgentToolKindBuiltin},
+			},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocation(dag.Run{ID: "run-anthropic-tools"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopGoogleRequiresAnyToolWithAdditionalTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		toolConfig, ok := body["toolConfig"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected Google toolConfig, got %#v", body["toolConfig"])
+		}
+		fcc, ok := toolConfig["functionCallingConfig"].(map[string]any)
+		if !ok || fcc["mode"] != "ANY" {
+			t.Fatalf("expected Google ANY tool mode, got %#v", toolConfig["functionCallingConfig"])
+		}
+		if _, ok := fcc["allowedFunctionNames"]; ok {
+			t.Fatalf("expected no allowedFunctionNames for any-tool mode, got %#v", fcc["allowedFunctionNames"])
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"candidates": []map[string]any{{
+				"content": map[string]any{
+					"parts": []map[string]any{{
+						"functionCall": map[string]any{
+							"name": defaultAgentOutputToolName,
+							"args": map[string]any{"answer": "ok"},
+						},
+					}},
+				},
+				"finishReason": "STOP",
+			}},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		GoogleAPIKey:  "test-google-key",
+		GoogleBaseURL: server.URL,
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderGoogle,
+			"model":       "gemini-3.1-pro-preview",
+			"prompt":      "Return structured output.",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+			"tools": []map[string]any{
+				{"name": AgentBuiltinContextList, "kind": AgentToolKindBuiltin},
+			},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocation(dag.Run{ID: "run-google-tools"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
 func TestAgentLoopOpenAIChatCompletionsResolutionWithContextTool(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -935,6 +1287,265 @@ func TestAgentLoopDynamicBlueprintTool(t *testing.T) {
 	}
 }
 
+func TestAgentLoopTextModeCompleteTaskFinishes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		toolsJSON, _ := json.Marshal(body["tools"])
+		if !strings.Contains(string(toolsJSON), AgentBuiltinCompleteTask) {
+			t.Fatalf("expected complete_task tool, got %s", toolsJSON)
+		}
+		writeAgentJSON(t, w, map[string]any{
+			"output": []map[string]any{{
+				"type":      "function_call",
+				"call_id":   "call_complete",
+				"name":      AgentBuiltinCompleteTask,
+				"arguments": `{"summary":"done cleanly"}`,
+			}},
+		})
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":         LLMProviderOpenAI,
+			"prompt":           "Do a text-mode task.",
+			"can_complete_key": "results.review.approved",
+		},
+	}
+	inv := dag.NewInvocationFromInputs(nil)
+	inv.Results.SetField("review", "approved", "true")
+	result, err := exec.Execute(context.Background(), node, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["text"] != "done cleanly" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
+func TestAgentLoopCompleteTaskHoldRequestsVerification(t *testing.T) {
+	var requests atomic.Int32
+	inv := dag.NewInvocationFromInputs(nil)
+	inv.Results.SetField("review", "approved", "false")
+	inv.Results.SetField("agent", "completion.feedback", "fix the missing proof")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{{
+					"type":      "function_call",
+					"call_id":   "call_hold",
+					"name":      AgentBuiltinCompleteTask,
+					"arguments": `{"summary":"first try"}`,
+				}},
+			})
+		case 2:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			inputJSON, _ := json.Marshal(body["input"])
+			if !strings.Contains(string(inputJSON), "fix the missing proof") {
+				t.Fatalf("completion hold feedback was not returned to model: %s", inputJSON)
+			}
+			inv.Results.SetField("review", "approved", "true")
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{{
+					"type":      "function_call",
+					"call_id":   "call_done",
+					"name":      AgentBuiltinCompleteTask,
+					"arguments": `{"summary":"fixed and approved"}`,
+				}},
+			})
+		default:
+			t.Fatalf("unexpected extra request")
+		}
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":         LLMProviderOpenAI,
+			"prompt":           "Do a gated task.",
+			"can_complete_key": "results.review.approved",
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["text"] != "fixed and approved" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+	requested, _ := inv.Results.Get("agent", "completion.requested")
+	if requested != "false" {
+		t.Fatalf("completion requested flag = %q, want false", requested)
+	}
+	attempt, _ := inv.Results.Get("agent", "completion.attempt")
+	if attempt != "1" {
+		t.Fatalf("completion attempt = %q, want 1", attempt)
+	}
+}
+
+func TestAgentLoopExplicitYieldContinuesAfterProgressText(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{{
+					"type": "message",
+					"content": []map[string]any{{
+						"type": "output_text",
+						"text": "I'll inspect the inputs.",
+					}},
+				}},
+			})
+		case 2:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			inputJSON, _ := json.Marshal(body["input"])
+			if !strings.Contains(string(inputJSON), AgentBuiltinYieldControl) {
+				t.Fatalf("yield reminder missing from continuation input: %s", inputJSON)
+			}
+			writeAgentJSON(t, w, map[string]any{
+				"output": []map[string]any{{
+					"type":      "function_call",
+					"call_id":   "call_yield",
+					"name":      AgentBuiltinYieldControl,
+					"arguments": `{"summary":"ready for the next agent"}`,
+				}},
+			})
+		default:
+			t.Fatalf("unexpected extra request")
+		}
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":               LLMProviderOpenAI,
+			"prompt":                 "Do an explicit-yield task.",
+			"require_explicit_yield": true,
+			"max_continues":          3,
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["text"] != "ready for the next agent" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestAgentLoopOpenAIResponsesSessionUsesPreviousResponseID(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch requests.Add(1) {
+		case 1:
+			if _, ok := body["previous_response_id"]; ok {
+				t.Fatalf("first request unexpectedly had previous_response_id: %+v", body)
+			}
+			if body["store"] != true {
+				t.Fatalf("session first request should store response, got %#v", body["store"])
+			}
+			writeAgentJSON(t, w, map[string]any{
+				"id": "resp_1",
+				"output": []map[string]any{{
+					"type":      "function_call",
+					"call_id":   "call_context",
+					"name":      AgentBuiltinContextGet,
+					"arguments": `{"keys":["market.question"]}`,
+				}},
+			})
+		case 2:
+			if body["previous_response_id"] != "resp_1" {
+				t.Fatalf("previous_response_id = %#v, want resp_1", body["previous_response_id"])
+			}
+			inputJSON, _ := json.Marshal(body["input"])
+			if strings.Contains(string(inputJSON), "Session question") {
+				t.Fatalf("session continuation resent original prompt: %s", inputJSON)
+			}
+			if !strings.Contains(string(inputJSON), "function_call_output") {
+				t.Fatalf("session continuation did not send tool output: %s", inputJSON)
+			}
+			writeAgentJSON(t, w, map[string]any{
+				"id": "resp_2",
+				"output": []map[string]any{{
+					"type":      "function_call",
+					"call_id":   "call_final",
+					"name":      defaultAgentOutputToolName,
+					"arguments": `{"answer":"session-ok"}`,
+				}},
+			})
+		default:
+			t.Fatalf("unexpected extra request")
+		}
+	}))
+	defer server.Close()
+
+	exec := NewAgentLoopExecutorWithConfig(LLMCallExecutorConfig{
+		OpenAIAPIKey:  "test-openai-key",
+		OpenAIBaseURL: server.URL + "/chat/completions",
+	}, dag.NewEngine(nil))
+	node := dag.NodeDef{
+		ID:   "agent",
+		Type: "agent_loop",
+		Config: map[string]any{
+			"provider":    LLMProviderOpenAI,
+			"prompt":      "Session question",
+			"output_mode": AgentOutputModeStructured,
+			"output_tool": map[string]any{
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"answer": map[string]any{"type": "string"}},
+					"required":   []string{"answer"},
+				},
+			},
+		},
+	}
+	result, err := exec.Execute(context.Background(), node, dag.NewInvocationFromInputs(map[string]string{
+		"market.question": "Session question",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outputs["status"] != "success" || result.Outputs["output.answer"] != "session-ok" {
+		t.Fatalf("unexpected result: %+v", result.Outputs)
+	}
+}
+
 func TestValidateDynamicBlueprintAllowsInlineWaitByDefault(t *testing.T) {
 	bp := dag.Blueprint{
 		ID:      "dynamic-inline-wait",
@@ -971,6 +1582,163 @@ func (e *agentLoopEchoExecutor) Execute(_ context.Context, _ dag.NodeDef, inv *d
 		"status": "success",
 		"value":  fmt.Sprintf("%s-checked", inv.Run.Inputs["input_value"]),
 	}}, nil
+}
+
+func TestCompactAgentMessagesKeepsToolUseResultPairs(t *testing.T) {
+	messages := []agentMessage{
+		textAgentMessage(agentRoleUser, "prompt"),
+		toolUseAgentMessage("call_1", "first"),
+		toolResultAgentMessage("call_1", "first result"),
+		textAgentMessage(agentRoleUser, "middle"),
+		toolUseAgentMessage("call_2", "second"),
+		toolResultAgentMessage("call_2", "second result"),
+		textAgentMessage(agentRoleUser, "latest"),
+	}
+
+	got := compactAgentMessages(messages, 4, 1)
+	if len(got) != 4 {
+		t.Fatalf("len(compacted) = %d, want 4: %#v", len(got), got)
+	}
+	assertNoDanglingToolUses(t, got)
+	if !agentMessageHasToolUseID(got[1], "call_2") || !agentMessageHasToolResultID(got[2], "call_2") {
+		t.Fatalf("expected latest tool pair to be preserved, got %#v", got)
+	}
+	if got[3].Content[0].Text != "latest" {
+		t.Fatalf("expected latest text message, got %#v", got[3])
+	}
+}
+
+func TestCompactAgentMessagesDropsWholePairWhenMessageBudgetTooSmall(t *testing.T) {
+	messages := []agentMessage{
+		textAgentMessage(agentRoleUser, "prompt"),
+		toolUseAgentMessage("call_1", "first"),
+		toolResultAgentMessage("call_1", "first result"),
+		textAgentMessage(agentRoleUser, "latest"),
+	}
+
+	got := compactAgentMessages(messages, 1, 1)
+	if len(got) != 1 {
+		t.Fatalf("len(compacted) = %d, want 1: %#v", len(got), got)
+	}
+	assertNoDanglingToolUses(t, got)
+	if got[0].Content[0].Text != "latest" {
+		t.Fatalf("expected latest message only, got %#v", got)
+	}
+}
+
+func TestCompactAgentMessagesNeverSendsAnthropicDanglingToolUse(t *testing.T) {
+	messages := []agentMessage{
+		textAgentMessage(agentRoleUser, "prompt"),
+		toolUseAgentMessage("toolu_old", "artifact_write"),
+		toolResultAgentMessage("toolu_old", `{"status":"success"}`),
+		toolUseAgentMessage("toolu_new", "artifact_write"),
+		toolResultAgentMessage("toolu_new", `{"status":"success"}`),
+		textAgentMessage(agentRoleUser, "continue"),
+	}
+
+	got := compactAgentMessages(messages, 4, 1)
+	assertNoDanglingToolUses(t, got)
+	anthropic := anthropicMessages(got)
+	for i, msg := range anthropic {
+		for _, part := range msg.Content {
+			if part.Type != contentPartTypeToolUse {
+				continue
+			}
+			if i+1 >= len(anthropic) {
+				t.Fatalf("anthropic transcript ends with dangling tool_use %q: %#v", part.ID, anthropic)
+			}
+			if !anthropicMessageHasToolResultID(anthropic[i+1], part.ID) {
+				t.Fatalf("anthropic transcript has tool_use %q without immediate result: %#v", part.ID, anthropic)
+			}
+		}
+	}
+	for _, msg := range anthropic {
+		if anthropicMessageHasToolUseID(msg, "toolu_old") || anthropicMessageHasToolResultID(msg, "toolu_old") {
+			t.Fatalf("old tool pair should be dropped as a pair, got %#v", anthropic)
+		}
+	}
+	if !anthropicMessageHasToolUseID(anthropic[1], "toolu_new") || !anthropicMessageHasToolResultID(anthropic[2], "toolu_new") {
+		t.Fatalf("new tool pair should remain adjacent, got %#v", anthropic)
+	}
+	if anthropic[3].Content[0].Text != "continue" {
+		t.Fatalf("expected latest text message after tool pair, got %#v", anthropic)
+	}
+}
+
+func textAgentMessage(role, text string) agentMessage {
+	return agentMessage{Role: role, Content: []agentContentPart{{Type: contentPartTypeText, Text: text}}}
+}
+
+func toolUseAgentMessage(id, name string) agentMessage {
+	return agentMessage{
+		Role: "assistant",
+		Content: []agentContentPart{{
+			Type:      contentPartTypeToolUse,
+			ToolUseID: id,
+			ToolName:  name,
+		}},
+	}
+}
+
+func toolResultAgentMessage(id, output string) agentMessage {
+	return agentMessage{
+		Role: agentRoleUser,
+		Content: []agentContentPart{{
+			Type:         contentPartTypeToolResult,
+			ToolResultID: id,
+			ToolOutput:   output,
+		}},
+	}
+}
+
+func assertNoDanglingToolUses(t *testing.T, messages []agentMessage) {
+	t.Helper()
+	for i, msg := range messages {
+		for _, part := range msg.Content {
+			if part.Type != contentPartTypeToolUse {
+				continue
+			}
+			if i+1 >= len(messages) || !agentMessageHasToolResultID(messages[i+1], part.ToolUseID) {
+				t.Fatalf("dangling tool_use %q at index %d in %#v", part.ToolUseID, i, messages)
+			}
+		}
+	}
+}
+
+func agentMessageHasToolUseID(msg agentMessage, id string) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolUse && part.ToolUseID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func agentMessageHasToolResultID(msg agentMessage, id string) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolResult && part.ToolResultID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicMessageHasToolUseID(msg anthropicAgentMessage, id string) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolUse && part.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicMessageHasToolResultID(msg anthropicAgentMessage, id string) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolResult && part.ToolUseID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func writeAgentJSON(t *testing.T, w http.ResponseWriter, value any) {

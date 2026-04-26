@@ -50,6 +50,10 @@ type agentLoopSettings struct {
 	toolTimeout        time.Duration
 	outputMode         string
 	outputToolName     string
+	outputSchema       json.RawMessage
+	autoContinue       bool
+	requireYield       bool
+	maxContinues       int
 }
 
 type agentAsyncCanceller struct {
@@ -71,6 +75,14 @@ type agentResolutionOutput struct {
 	Confidence   json.RawMessage `json:"confidence"`
 	Reasoning    string          `json:"reasoning"`
 	Citations    []string        `json:"citations,omitempty"`
+}
+
+type agentCompletionRuntime struct {
+	approvalKey          string
+	feedbackKey          string
+	requestKey           string
+	attemptKey           string
+	invalidateOnMutation bool
 }
 
 func (o agentResolutionOutput) confidenceString() string {
@@ -245,6 +257,9 @@ func (*AgentLoopExecutor) ConfigSchema() json.RawMessage {
     "model": {"type": "string"},
     "system_prompt": {"type": "string"},
     "prompt": {"type": "string", "description": "User prompt. Supports {{key}} interpolation from the shared context."},
+    "auto_continue": {"type": "boolean", "description": "When true, text-only progress responses are followed by a continuation reminder instead of ending the loop."},
+    "require_explicit_yield": {"type": "boolean", "description": "Require yield_control to end a text-mode agent turn."},
+    "max_continues": {"type": "integer", "minimum": 0},
     "timeout_seconds": {"type": "integer", "minimum": 0},
     "tool_timeout_seconds": {"type": "integer", "minimum": 0},
     "max_steps": {"type": "integer", "minimum": 0},
@@ -266,6 +281,18 @@ func (*AgentLoopExecutor) ConfigSchema() json.RawMessage {
     "tools": {"type": "array", "items": {"type": "object", "description": "AgentToolConfig: name, kind (builtin|blueprint), inline blueprint, builtin id, parameters schema."}},
     "context_allowlist": {"type": "array", "items": {"type": "string"}, "description": "Context keys the agent's tools may read. When empty, defaults to all non-internal keys."},
     "allowed_outcomes_key": {"type": "string"},
+    "can_complete_key": {"type": "string", "description": "Context key that must be truthy before complete_task finishes; otherwise completion is held with feedback."},
+    "completion": {
+      "type": "object",
+      "properties": {
+        "approval_key": {"type": "string"},
+        "feedback_key": {"type": "string"},
+        "request_key": {"type": "string"},
+        "attempt_key": {"type": "string"},
+        "invalidate_on_mutation": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
     "enable_dynamic_blueprints": {"type": "boolean", "description": "Allow the run_blueprint builtin tool. Off by default."},
     "dynamic_blueprint_policy": {"type": "object"},
     "async": {"type": "boolean", "description": "When true, dispatches the chat loop on a goroutine and returns a signal suspension. Only valid under the durable engine."}
@@ -314,7 +341,8 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
-	registry, err := e.buildToolRegistry(cfg, outputSpec, inv)
+	completionRuntime := resolveAgentCompletionRuntime(node.ID, cfg)
+	registry, err := e.buildToolRegistry(cfg, outputSpec, completionRuntime, node.ID, inv)
 	if err != nil {
 		return failureResult(err.Error()), nil
 	}
@@ -325,15 +353,22 @@ func (e *AgentLoopExecutor) Execute(ctx context.Context, node dag.NodeDef, inv *
 	}
 
 	prompt := inv.Interpolate(cfg.Prompt)
-	system := buildAgentSystemPrompt(inv.Interpolate(cfg.SystemPrompt), outputSpec, allowedOutcomes)
+	system := buildAgentSystemPrompt(inv.Interpolate(cfg.SystemPrompt), outputSpec, completionRuntime, cfg.RequireExplicitYield, allowedOutcomes)
 
+	toolDefs := registry.defs()
+	forceToolName := ""
+	if outputSpec.enabled && len(toolDefs) == 1 && toolDefs[0].Name == outputSpec.name {
+		forceToolName = outputSpec.name
+	}
 	req := agentProviderRequest{
-		Provider:  provider,
-		Model:     model,
-		System:    system,
-		Tools:     registry.defs(),
-		MaxTokens: settings.maxTokens,
-		Reasoning: cfg.Reasoning,
+		Provider:      provider,
+		Model:         model,
+		System:        system,
+		Tools:         toolDefs,
+		RequireTool:   outputSpec.enabled && len(toolDefs) > 0,
+		ForceToolName: forceToolName,
+		MaxTokens:     settings.maxTokens,
+		Reasoning:     cfg.Reasoning,
 	}
 
 	if cfg.Async {
@@ -475,6 +510,11 @@ func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutp
 		maxTokens:          cfg.MaxTokens,
 		toolTimeout:        time.Duration(cfg.ToolTimeoutSeconds) * time.Second,
 		outputMode:         outputMode,
+		requireYield:       cfg.RequireExplicitYield,
+		maxContinues:       cfg.MaxContinues,
+	}
+	if cfg.AutoContinue != nil {
+		settings.autoContinue = *cfg.AutoContinue
 	}
 	if settings.maxToolCalls <= 0 {
 		settings.maxToolCalls = defaultAgentMaxToolCalls
@@ -502,6 +542,9 @@ func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutp
 	}
 	if settings.toolResultHistory < 1 {
 		return agentLoopSettings{}, agentOutputSpec{}, fmt.Errorf("tool_result_history must be >= 1")
+	}
+	if settings.maxContinues <= 0 {
+		settings.maxContinues = 3
 	}
 
 	outputSpec := agentOutputSpec{mode: outputMode}
@@ -538,6 +581,7 @@ func resolveAgentLoopSettings(cfg AgentLoopConfig) (agentLoopSettings, agentOutp
 		}
 	}
 	settings.outputToolName = outputSpec.name
+	settings.outputSchema = outputSpec.parameters
 	return settings, outputSpec, nil
 }
 
@@ -545,24 +589,24 @@ func buildResolutionOutputSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"status":{"type":"string","enum":["success","inconclusive"],"description":"Use success when an outcome is determined, otherwise inconclusive."},"outcome_index":{"type":"integer","description":"Zero-based selected outcome index, or -1 when status is inconclusive."},"confidence":{"type":"string","enum":["high","medium","low"]},"reasoning":{"type":"string"},"citations":{"type":"array","items":{"type":"string"}}},"required":["outcome_index","confidence","reasoning"],"additionalProperties":false}`)
 }
 
-func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec agentOutputSpec, inv *dag.Invocation) (*agentToolRegistry, error) {
+func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec agentOutputSpec, completionRuntime *agentCompletionRuntime, nodeID string, inv *dag.Invocation) (*agentToolRegistry, error) {
 	registry := newAgentToolRegistry()
 	access := newContextAccess(inv, cfg.ContextAllowlist)
 
-	if len(cfg.Tools) == 0 {
+	if len(cfg.Tools) == 0 && !cfg.ToolsSpecified {
 		for _, builtin := range []string{
 			AgentBuiltinContextGet,
 			AgentBuiltinContextList,
 			AgentBuiltinSourceFetch,
 			AgentBuiltinJSONExtract,
 		} {
-			if err := registry.register(e.newBuiltinTool(builtin, AgentToolConfig{Name: builtin}, access, cfg, inv)); err != nil {
+			if err := registry.register(e.newBuiltinTool(builtin, AgentToolConfig{Name: builtin}, access, cfg, nodeID, inv)); err != nil {
 				return nil, err
 			}
 		}
 	} else {
 		for _, toolCfg := range cfg.Tools {
-			tool, err := e.newConfiguredTool(toolCfg, access, cfg, inv)
+			tool, err := e.newConfiguredTool(toolCfg, access, cfg, nodeID, inv)
 			if err != nil {
 				return nil, err
 			}
@@ -594,6 +638,20 @@ func (e *AgentLoopExecutor) buildToolRegistry(cfg AgentLoopConfig, outputSpec ag
 			return nil, err
 		}
 	}
+	if shouldInstallCompletionTool(completionRuntime) {
+		if _, exists := registry.get(AgentBuiltinCompleteTask); !exists {
+			if err := registry.register(&completeTaskTool{runtime: completionRuntime, nodeID: nodeID, inv: inv}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if cfg.RequireExplicitYield {
+		if _, exists := registry.get(AgentBuiltinYieldControl); !exists {
+			if err := registry.register(&yieldControlTool{}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return registry, nil
 }
 
@@ -601,6 +659,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 	toolCfg AgentToolConfig,
 	access contextAccess,
 	agentCfg AgentLoopConfig,
+	nodeID string,
 	inv *dag.Invocation,
 ) (agentTool, error) {
 	kind := strings.ToLower(strings.TrimSpace(toolCfg.Kind))
@@ -620,7 +679,7 @@ func (e *AgentLoopExecutor) newConfiguredTool(
 		if builtin == AgentBuiltinRunBlueprint && !agentCfg.EnableDynamicBlueprint {
 			return nil, fmt.Errorf("builtin tool %q requires enable_dynamic_blueprints", builtin)
 		}
-		tool := e.newBuiltinTool(builtin, toolCfg, access, agentCfg, inv)
+		tool := e.newBuiltinTool(builtin, toolCfg, access, agentCfg, nodeID, inv)
 		if missing, ok := tool.(*missingConfiguredTool); ok {
 			return nil, fmt.Errorf("unknown builtin tool %q", missing.builtin)
 		}
@@ -656,6 +715,7 @@ func (e *AgentLoopExecutor) newBuiltinTool(
 	toolCfg AgentToolConfig,
 	access contextAccess,
 	agentCfg AgentLoopConfig,
+	nodeID string,
 	inv *dag.Invocation,
 ) agentTool {
 	var tool agentTool
@@ -674,10 +734,183 @@ func (e *AgentLoopExecutor) newBuiltinTool(
 			parentCtx: inv,
 			policy:    defaultDynamicBlueprintPolicy(agentCfg.DynamicBlueprintPolicy),
 		}
+	case AgentBuiltinCompleteTask:
+		tool = &completeTaskTool{runtime: resolveAgentCompletionRuntime(nodeID, agentCfg), nodeID: nodeID, inv: inv}
+	case AgentBuiltinYieldControl:
+		tool = &yieldControlTool{}
 	default:
 		return &missingConfiguredTool{name: defaultString(strings.TrimSpace(toolCfg.Name), builtin), builtin: builtin}
 	}
 	return maybeAliasAgentTool(tool, toolCfg)
+}
+
+func shouldInstallCompletionTool(runtime *agentCompletionRuntime) bool {
+	return runtime != nil
+}
+
+func resolveAgentCompletionRuntime(nodeID string, cfg AgentLoopConfig) *agentCompletionRuntime {
+	approvalKey := strings.TrimSpace(cfg.CanCompleteKey)
+	feedbackKey := ""
+	requestKey := ""
+	attemptKey := ""
+	invalidate := false
+	if cfg.Completion != nil {
+		if key := strings.TrimSpace(cfg.Completion.ApprovalKey); key != "" {
+			approvalKey = key
+		}
+		feedbackKey = strings.TrimSpace(cfg.Completion.FeedbackKey)
+		requestKey = strings.TrimSpace(cfg.Completion.RequestKey)
+		attemptKey = strings.TrimSpace(cfg.Completion.AttemptKey)
+		if cfg.Completion.InvalidateOnMutation != nil {
+			invalidate = *cfg.Completion.InvalidateOnMutation
+		}
+	}
+	if approvalKey == "" {
+		return nil
+	}
+	if feedbackKey == "" {
+		feedbackKey = nodeID + ".completion.feedback"
+	}
+	if requestKey == "" {
+		requestKey = nodeID + ".completion.requested"
+	}
+	if attemptKey == "" {
+		attemptKey = nodeID + ".completion.attempt"
+	}
+	return &agentCompletionRuntime{
+		approvalKey:          approvalKey,
+		feedbackKey:          feedbackKey,
+		requestKey:           requestKey,
+		attemptKey:           attemptKey,
+		invalidateOnMutation: invalidate,
+	}
+}
+
+type completeTaskTool struct {
+	runtime *agentCompletionRuntime
+	nodeID  string
+	inv     *dag.Invocation
+}
+
+func (t *completeTaskTool) Name() string { return AgentBuiltinCompleteTask }
+func (t *completeTaskTool) Description() string {
+	if t != nil && t.runtime != nil {
+		return "REQUIRED: You MUST call this tool to submit your work. If verification approval is missing, the tool will hold completion and return verifier feedback."
+	}
+	return "REQUIRED: You MUST call this tool to submit your work. The task is NOT complete until you call complete_task. Printing 'done' or 'finished' does nothing — only this tool call submits your work."
+}
+func (t *completeTaskTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string","description":"Brief summary of what was accomplished"}}}`)
+}
+func (t *completeTaskTool) ReadOnly() bool { return false }
+func (t *completeTaskTool) Execute(_ context.Context, args json.RawMessage) (agentToolResult, error) {
+	summary := "Task marked as complete."
+	var payload struct {
+		Summary string `json:"summary"`
+	}
+	if len(args) > 0 && json.Unmarshal(args, &payload) == nil && strings.TrimSpace(payload.Summary) != "" {
+		summary = strings.TrimSpace(payload.Summary)
+	}
+	if t == nil || t.runtime == nil {
+		return agentToolResult{Output: summary, Complete: true, OutputJSON: json.RawMessage(fmt.Sprintf(`{"summary":%q}`, summary))}, nil
+	}
+	if truthyCompletionValue(getAgentContextValue(t.inv, t.runtime.approvalKey)) {
+		setAgentContextValue(t.inv, t.nodeID, t.runtime.requestKey, "false")
+		return agentToolResult{Output: summary, Complete: true, OutputJSON: json.RawMessage(fmt.Sprintf(`{"summary":%q}`, summary))}, nil
+	}
+	setAgentContextValue(t.inv, t.nodeID, t.runtime.requestKey, "true")
+	if t.runtime.attemptKey != "" {
+		attempt, _ := strconv.Atoi(strings.TrimSpace(getAgentContextValue(t.inv, t.runtime.attemptKey)))
+		setAgentContextValue(t.inv, t.nodeID, t.runtime.attemptKey, strconv.Itoa(attempt+1))
+	}
+	feedback := strings.TrimSpace(getAgentContextValue(t.inv, t.runtime.feedbackKey))
+	if feedback == "" {
+		feedback = "HOLD - completion requested. A verifier will review the current state. Address any issues it reports, then call complete_task again."
+	}
+	return agentToolResult{Output: feedback}, nil
+}
+
+type yieldControlTool struct{}
+
+func (t *yieldControlTool) Name() string { return AgentBuiltinYieldControl }
+func (t *yieldControlTool) Description() string {
+	return "Call this tool exactly once when this agent turn is complete. Include a concise summary of the completed work."
+}
+func (t *yieldControlTool) Parameters() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string","description":"Concise final summary for this agent turn."}},"required":["summary"]}`)
+}
+func (t *yieldControlTool) ReadOnly() bool { return false }
+func (t *yieldControlTool) Execute(_ context.Context, args json.RawMessage) (agentToolResult, error) {
+	var payload struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return toolErrorResult("invalid yield_control input: %v", err), nil
+	}
+	summary := strings.TrimSpace(payload.Summary)
+	if summary == "" {
+		return toolErrorResult("yield_control summary is required"), nil
+	}
+	return agentToolResult{Output: summary, Complete: true, OutputJSON: json.RawMessage(fmt.Sprintf(`{"summary":%q}`, summary))}, nil
+}
+
+func truthyCompletionValue(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on", "approved", "pass", "passed", "complete", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func getAgentContextValue(inv *dag.Invocation, key string) string {
+	if inv == nil {
+		return ""
+	}
+	key = strings.TrimSpace(key)
+	switch {
+	case key == "":
+		return ""
+	case strings.HasPrefix(key, "inputs."):
+		return inv.Run.Inputs[strings.TrimPrefix(key, "inputs.")]
+	case strings.HasPrefix(key, "run."):
+		switch strings.TrimPrefix(key, "run.") {
+		case "id":
+			return inv.Run.ID
+		case "blueprint_id":
+			return inv.Run.BlueprintID
+		}
+	case strings.HasPrefix(key, "results."):
+		parts := strings.SplitN(strings.TrimPrefix(key, "results."), ".", 2)
+		if len(parts) == 2 {
+			value, _ := inv.Results.Get(parts[0], parts[1])
+			return value
+		}
+	default:
+		parts := strings.SplitN(key, ".", 2)
+		if len(parts) == 2 {
+			value, _ := inv.Results.Get(parts[0], parts[1])
+			return value
+		}
+	}
+	return ""
+}
+
+func setAgentContextValue(inv *dag.Invocation, defaultNodeID, key, value string) {
+	if inv == nil || inv.Results == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	key = strings.TrimPrefix(key, "results.")
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) == 2 {
+		inv.Results.SetField(parts[0], parts[1], value)
+		return
+	}
+	inv.Results.SetField(defaultNodeID, key, value)
 }
 
 func defaultDynamicBlueprintPolicy(policy *DynamicBlueprintPolicy) DynamicBlueprintPolicy {
@@ -763,7 +996,7 @@ func (t *aliasedAgentTool) CanParallelize(args json.RawMessage) bool {
 	return t.base.ReadOnly()
 }
 
-func buildAgentSystemPrompt(base string, outputSpec agentOutputSpec, allowedOutcomes []string) string {
+func buildAgentSystemPrompt(base string, outputSpec agentOutputSpec, completionRuntime *agentCompletionRuntime, requireYield bool, allowedOutcomes []string) string {
 	parts := make([]string, 0, 8)
 	if strings.TrimSpace(base) != "" {
 		parts = append(parts, strings.TrimSpace(base))
@@ -783,6 +1016,14 @@ func buildAgentSystemPrompt(base string, outputSpec agentOutputSpec, allowedOutc
 		parts = append(parts, fmt.Sprintf("When finished, call the %q tool exactly once with the final JSON output. Do not answer in prose instead of calling this tool.", outputSpec.name))
 	case AgentOutputModeResolution:
 		parts = append(parts, fmt.Sprintf("When finished, call the %q tool exactly once. Use outcome_index as a zero-based outcome index. If the market cannot be resolved, set status to inconclusive and outcome_index to -1.", outputSpec.name))
+	case AgentOutputModeText:
+		if requireYield {
+			parts = append(parts, fmt.Sprintf("When this turn is complete, call %q with a concise final summary. Do not hand control back without calling this tool.", AgentBuiltinYieldControl))
+		} else if completionRuntime != nil {
+			parts = append(parts, fmt.Sprintf("When finished, call %q with a concise summary. If completion is held, address the feedback and call it again.", AgentBuiltinCompleteTask))
+		} else {
+			parts = append(parts, "When finished, respond directly with the final answer.")
+		}
 	default:
 		parts = append(parts, "When finished, respond directly with the final answer.")
 	}
@@ -805,14 +1046,25 @@ func (e *AgentLoopExecutor) runLoop(
 	var usage dag.TokenUsage
 	var steps []agentStepRecord
 	toolCallCount := 0
+	consecutiveTextOnly := 0
+	usedToolWork := false
+	turnReminder := ""
+	session := e.client.newSession(req)
+	defer session.close()
 
 	for step := 1; ; step++ {
 		if settings.maxSteps > 0 && step > settings.maxSteps {
 			return agentFailureResult(fmt.Sprintf("agent_loop reached max_steps %d", settings.maxSteps), usage, steps, messages)
 		}
 		messages = compactAgentMessages(messages, settings.maxHistoryMessages, settings.toolResultHistory)
-		req.Messages = append([]agentMessage(nil), messages...)
-		resp, err := e.client.chat(ctx, req)
+		turnReq := req
+		turnMessages := append([]agentMessage(nil), messages...)
+		if strings.TrimSpace(turnReminder) != "" {
+			turnMessages = append(turnMessages, agentMessage{Role: agentRoleUser, Content: []agentContentPart{{Type: contentPartTypeText, Text: turnReminder}}})
+			turnReq.RequireTool = turnReq.RequireTool || settings.requireYield && usedToolWork
+		}
+		turnReq.Messages = turnMessages
+		resp, err := session.chat(ctx, turnReq)
 		if err != nil {
 			return agentFailureResult(err.Error(), usage, steps, messages)
 		}
@@ -821,8 +1073,24 @@ func (e *AgentLoopExecutor) runLoop(
 		messages = append(messages, resp.Message)
 
 		if len(resp.Calls) == 0 {
-			return finalizeAgentTextResponse(settings.outputMode, resp.Message, usage, steps, messages, allowedOutcomes)
+			if settings.outputMode != AgentOutputModeText {
+				return finalizeAgentTextResponse(settings.outputMode, settings.outputSchema, resp.Message, usage, steps, messages, allowedOutcomes)
+			}
+			if !settings.autoContinue && !settings.requireYield {
+				return finalizeAgentTextResponse(settings.outputMode, settings.outputSchema, resp.Message, usage, steps, messages, allowedOutcomes)
+			}
+			consecutiveTextOnly++
+			if consecutiveTextOnly >= settings.maxContinues {
+				if settings.requireYield {
+					return agentFailureResult(fmt.Sprintf("assistant produced %d text-only responses without calling %s", consecutiveTextOnly, AgentBuiltinYieldControl), usage, steps, messages)
+				}
+				return finalizeAgentTextResponse(settings.outputMode, settings.outputSchema, resp.Message, usage, steps, messages, allowedOutcomes)
+			}
+			turnReminder = continuationReminder(settings.requireYield, usedToolWork, resp.StopReason)
+			continue
 		}
+		consecutiveTextOnly = 0
+		turnReminder = ""
 		if toolCallCount+len(resp.Calls) > settings.maxToolCalls {
 			return agentFailureResult(
 				fmt.Sprintf("agent_loop exceeded max_tool_calls %d", settings.maxToolCalls),
@@ -832,6 +1100,7 @@ func (e *AgentLoopExecutor) runLoop(
 			)
 		}
 		toolCallCount += len(resp.Calls)
+		usedToolWork = usedToolWork || hasNonCompletionToolCall(resp.Calls)
 
 		results := executeAgentToolCalls(ctx, registry, resp.Calls, settings)
 		steps = append(steps, agentStepRecord{Step: step, Calls: scrubAgentToolCalls(resp.Calls), Results: results})
@@ -840,7 +1109,7 @@ func (e *AgentLoopExecutor) runLoop(
 		for idx, result := range results {
 			call := resp.Calls[idx]
 			if result.Complete {
-				return finalizeAgentStructuredResult(settings.outputMode, result.OutputJSON, result.Output, usage, steps, messages, allowedOutcomes)
+				return finalizeAgentStructuredResult(settings.outputMode, settings.outputSchema, result.OutputJSON, result.Output, usage, steps, messages, allowedOutcomes)
 			}
 			resultParts = append(resultParts, agentContentPart{
 				Type:         contentPartTypeToolResult,
@@ -863,66 +1132,106 @@ func compactAgentMessages(messages []agentMessage, maxHistoryMessages int, toolR
 		return messages
 	}
 
-	// Count tool-result messages to decide if any work is needed.
-	toolResultCount := 0
-	for _, msg := range messages {
-		for _, part := range msg.Content {
-			if part.Type == contentPartTypeToolResult {
-				toolResultCount++
-				break
-			}
-		}
-	}
-	if len(messages) <= maxHistoryMessages && toolResultCount <= toolResultHistory {
-		return messages
-	}
-
-	// Build index of which messages contain tool results.
 	trimmed := make([]agentMessage, 0, len(messages))
-	toolResultMessageIndexes := make([]int, 0, toolResultCount)
 	for _, msg := range messages {
 		if len(msg.Content) == 0 {
 			continue
 		}
 		trimmed = append(trimmed, msg)
-		for _, part := range msg.Content {
-			if part.Type == contentPartTypeToolResult {
-				toolResultMessageIndexes = append(toolResultMessageIndexes, len(trimmed)-1)
-				break
-			}
-		}
 	}
-
-	// Strip old tool results beyond the history window.
-	droppedResults := len(toolResultMessageIndexes) > toolResultHistory
-	if droppedResults {
-		dropBefore := len(toolResultMessageIndexes) - toolResultHistory
-		cutoff := toolResultMessageIndexes[dropBefore]
-		for i := 0; i < cutoff; i++ {
-			msg := &trimmed[i]
-			parts := make([]agentContentPart, 0, len(msg.Content))
-			for _, part := range msg.Content {
-				if part.Type != contentPartTypeToolResult {
-					parts = append(parts, part)
-				}
-			}
-			msg.Content = parts
-		}
-
-		// Remove messages that became empty after stripping.
-		compacted := make([]agentMessage, 0, len(trimmed))
-		for _, msg := range trimmed {
-			if len(msg.Content) > 0 {
-				compacted = append(compacted, msg)
-			}
-		}
-		trimmed = compacted
-	}
-
-	if len(trimmed) <= maxHistoryMessages {
+	if len(trimmed) == 0 {
 		return trimmed
 	}
-	return append([]agentMessage(nil), trimmed[len(trimmed)-maxHistoryMessages:]...)
+
+	segments := compactableAgentMessageSegments(trimmed)
+	if len(segments) <= maxHistoryMessages && countToolResultSegments(segments) <= toolResultHistory {
+		return trimmed
+	}
+
+	keep := make([]bool, len(segments))
+	keptSegments := 0
+	keptToolResults := 0
+	for i := len(segments) - 1; i >= 0; i-- {
+		segment := segments[i]
+		segmentLen := segment.end - segment.start
+		hasToolResult := segmentHasToolResult(trimmed[segment.start:segment.end])
+		if keptSegments+segmentLen > maxHistoryMessages {
+			continue
+		}
+		if hasToolResult && keptToolResults >= toolResultHistory {
+			continue
+		}
+		keep[i] = true
+		keptSegments += segmentLen
+		if hasToolResult {
+			keptToolResults++
+		}
+	}
+
+	compacted := make([]agentMessage, 0, keptSegments)
+	for i, segment := range segments {
+		if !keep[i] {
+			continue
+		}
+		compacted = append(compacted, trimmed[segment.start:segment.end]...)
+	}
+	return compacted
+}
+
+type agentMessageSegment struct {
+	start int
+	end   int
+}
+
+func compactableAgentMessageSegments(messages []agentMessage) []agentMessageSegment {
+	segments := make([]agentMessageSegment, 0, len(messages))
+	for i := 0; i < len(messages); {
+		if agentMessageHasToolUse(messages[i]) && i+1 < len(messages) && agentMessageHasToolResult(messages[i+1]) {
+			segments = append(segments, agentMessageSegment{start: i, end: i + 2})
+			i += 2
+			continue
+		}
+		segments = append(segments, agentMessageSegment{start: i, end: i + 1})
+		i++
+	}
+	return segments
+}
+
+func countToolResultSegments(segments []agentMessageSegment) int {
+	count := 0
+	for _, segment := range segments {
+		if segment.end-segment.start > 1 {
+			count++
+		}
+	}
+	return count
+}
+
+func segmentHasToolResult(messages []agentMessage) bool {
+	for _, msg := range messages {
+		if agentMessageHasToolResult(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+func agentMessageHasToolUse(msg agentMessage) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolUse {
+			return true
+		}
+	}
+	return false
+}
+
+func agentMessageHasToolResult(msg agentMessage) bool {
+	for _, part := range msg.Content {
+		if part.Type == contentPartTypeToolResult {
+			return true
+		}
+	}
+	return false
 }
 
 func executeAgentToolCalls(
@@ -951,6 +1260,34 @@ func executeAgentToolCalls(
 		idx++
 	}
 	return results
+}
+
+func hasNonCompletionToolCall(calls []agentToolCall) bool {
+	for _, call := range calls {
+		switch call.Name {
+		case AgentBuiltinCompleteTask, AgentBuiltinYieldControl:
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func continuationReminder(requireYield bool, usedToolWork bool, stopReason string) string {
+	if strings.EqualFold(strings.TrimSpace(stopReason), "max_tokens") {
+		if requireYield {
+			return fmt.Sprintf("Your previous response was truncated by the output limit. Continue where you left off. When the turn is truly finished, provide a concise final summary and call %s.", AgentBuiltinYieldControl)
+		}
+		return "Your previous response was truncated due to the output token limit. Continue where you left off."
+	}
+	if requireYield {
+		if !usedToolWork {
+			return fmt.Sprintf("Do not send another status update. If no tools are needed, answer directly. Otherwise continue using the available tools, and once the work is truly complete, provide a concise final summary and call %s.", AgentBuiltinYieldControl)
+		}
+		return fmt.Sprintf("You have not finished this turn yet. Continue using the available tools, or if the work is complete, provide a concise final summary and call %s. Do not hand control back without calling %s.", AgentBuiltinYieldControl, AgentBuiltinYieldControl)
+	}
+	return "You responded with text but did not use any tools. Continue working on the task by using the available tools. Do not explain what you plan to do - just do it."
 }
 
 func executeAgentToolGroup(
@@ -1018,6 +1355,7 @@ func truncateAgentToolResult(result agentToolResult, maxBytes int) agentToolResu
 
 func finalizeAgentTextResponse(
 	outputMode string,
+	outputSchema json.RawMessage,
 	message agentMessage,
 	usage dag.TokenUsage,
 	steps []agentStepRecord,
@@ -1041,11 +1379,12 @@ func finalizeAgentTextResponse(
 	if !json.Valid([]byte(extracted)) {
 		return agentFailureResult("agent did not call the required output tool or return valid JSON", usage, steps, messages)
 	}
-	return finalizeAgentStructuredResult(outputMode, json.RawMessage(extracted), text, usage, steps, messages, allowedOutcomes)
+	return finalizeAgentStructuredResult(outputMode, outputSchema, json.RawMessage(extracted), text, usage, steps, messages, allowedOutcomes)
 }
 
 func finalizeAgentStructuredResult(
 	outputMode string,
+	outputSchema json.RawMessage,
 	rawJSON json.RawMessage,
 	raw string,
 	usage dag.TokenUsage,
@@ -1060,6 +1399,9 @@ func finalizeAgentStructuredResult(
 	case AgentOutputModeResolution:
 		return finalizeAgentResolution(rawJSON, raw, usage, steps, messages, allowedOutcomes)
 	case AgentOutputModeStructured:
+		if err := validateStructuredOutput(rawJSON, outputSchema); err != nil {
+			return agentFailureResult("structured output did not match schema: "+err.Error(), usage, steps, messages)
+		}
 		outputs := map[string]string{
 			"status":      "success",
 			"output_json": string(rawJSON),
@@ -1152,6 +1494,41 @@ func flattenStructuredOutput(outputs map[string]string, rawJSON json.RawMessage)
 			}
 		}
 	}
+}
+
+func validateStructuredOutput(rawJSON json.RawMessage, schemaJSON json.RawMessage) error {
+	var output map[string]any
+	if err := json.Unmarshal(rawJSON, &output); err != nil {
+		return err
+	}
+	if len(schemaJSON) == 0 {
+		return nil
+	}
+	var schema struct {
+		Required             []string       `json:"required"`
+		Properties           map[string]any `json:"properties"`
+		AdditionalProperties any            `json:"additionalProperties"`
+	}
+	if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+		return fmt.Errorf("invalid schema: %w", err)
+	}
+	for _, key := range schema.Required {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := output[key]; !ok {
+			return fmt.Errorf("missing required field %q", key)
+		}
+	}
+	if allowed, ok := schema.AdditionalProperties.(bool); ok && !allowed && len(schema.Properties) > 0 {
+		for key := range output {
+			if _, ok := schema.Properties[key]; !ok {
+				return fmt.Errorf("unexpected field %q", key)
+			}
+		}
+	}
+	return nil
 }
 
 func agentFailureResult(message string, usage dag.TokenUsage, steps []agentStepRecord, messages []agentMessage) dag.ExecutorResult {

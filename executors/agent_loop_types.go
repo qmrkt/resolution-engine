@@ -19,6 +19,8 @@ const (
 	AgentBuiltinSourceFetch  = "source_fetch"
 	AgentBuiltinJSONExtract  = "json_extract"
 	AgentBuiltinRunBlueprint = "run_blueprint"
+	AgentBuiltinCompleteTask = "complete_task"
+	AgentBuiltinYieldControl = "yield_control"
 
 	defaultAgentMaxToolCalls       = 16
 	defaultAgentToolTimeoutSeconds = 20
@@ -37,6 +39,9 @@ type AgentLoopConfig struct {
 	Model                  string                  `json:"model,omitempty"`
 	SystemPrompt           string                  `json:"system_prompt,omitempty"`
 	Prompt                 string                  `json:"prompt"`
+	AutoContinue           *bool                   `json:"auto_continue,omitempty"`
+	RequireExplicitYield   bool                    `json:"require_explicit_yield,omitempty"`
+	MaxContinues           int                     `json:"max_continues,omitempty"`
 	TimeoutSeconds         int                     `json:"timeout_seconds,omitempty"`
 	ToolTimeoutSeconds     int                     `json:"tool_timeout_seconds,omitempty"`
 	MaxSteps               int                     `json:"max_steps,omitempty"`
@@ -49,8 +54,11 @@ type AgentLoopConfig struct {
 	OutputMode             string                  `json:"output_mode,omitempty"`
 	OutputTool             *AgentOutputToolConfig  `json:"output_tool,omitempty"`
 	Tools                  []AgentToolConfig       `json:"tools,omitempty"`
+	ToolsSpecified         bool                    `json:"-"`
 	ContextAllowlist       []string                `json:"context_allowlist,omitempty"`
 	AllowedOutcomesKey     string                  `json:"allowed_outcomes_key,omitempty"`
+	CanCompleteKey         string                  `json:"can_complete_key,omitempty"`
+	Completion             *AgentCompletionConfig  `json:"completion,omitempty"`
 	EnableDynamicBlueprint bool                    `json:"enable_dynamic_blueprints,omitempty"`
 	DynamicBlueprintPolicy *DynamicBlueprintPolicy `json:"dynamic_blueprint_policy,omitempty"`
 
@@ -60,6 +68,32 @@ type AgentLoopConfig struct {
 	// delivered to the configured AgentSignalFn. Only supported under
 	// durable engines; the in-memory engine rejects the suspension.
 	Async bool `json:"async,omitempty"`
+}
+
+type AgentCompletionConfig struct {
+	ApprovalKey          string `json:"approval_key,omitempty"`
+	FeedbackKey          string `json:"feedback_key,omitempty"`
+	RequestKey           string `json:"request_key,omitempty"`
+	AttemptKey           string `json:"attempt_key,omitempty"`
+	InvalidateOnMutation *bool  `json:"invalidate_on_mutation,omitempty"`
+}
+
+func (c *AgentLoopConfig) UnmarshalJSON(data []byte) error {
+	type alias AgentLoopConfig
+	var raw alias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	raw.ToolsSpecified = false
+	if _, ok := fields["tools"]; ok {
+		raw.ToolsSpecified = true
+	}
+	*c = AgentLoopConfig(raw)
+	return nil
 }
 
 // AgentDoneSignalType is the signal type the async agent goroutine posts
@@ -141,13 +175,15 @@ type agentToolCall struct {
 }
 
 type agentProviderRequest struct {
-	Provider  string
-	Model     string
-	System    string
-	Messages  []agentMessage
-	Tools     []agentToolDef
-	MaxTokens int
-	Reasoning string
+	Provider      string
+	Model         string
+	System        string
+	Messages      []agentMessage
+	Tools         []agentToolDef
+	RequireTool   bool
+	ForceToolName string
+	MaxTokens     int
+	Reasoning     string
 }
 
 type agentProviderResponse struct {
@@ -155,6 +191,7 @@ type agentProviderResponse struct {
 	Calls      []agentToolCall
 	Usage      dag.TokenUsage
 	StopReason string
+	ResponseID string
 	Raw        string
 }
 
